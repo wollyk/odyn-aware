@@ -264,9 +264,15 @@ function Index() {
             <span className="label-mono">Real-Time Intelligence Layer</span>
           </div>
           <div className="flex flex-col items-start gap-2 sm:items-end">
-            <a href="https://auroraview.tech" className="font-mono text-[10px] uppercase tracking-widest text-foreground/80 hover:text-foreground transition-colors">
-              auroraview.tech ·
-            </a>
+            <div className="flex items-center gap-4 font-mono text-[10px] uppercase tracking-widest">
+              <a href="https://auroraview.tech" className="text-foreground/80 hover:text-foreground transition-colors">
+                auroraview.tech
+              </a>
+              <span className="text-muted-foreground/50">·</span>
+              <a href="/admin/login" className="text-muted-foreground hover:text-foreground transition-colors">
+                Admin
+              </a>
+            </div>
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
               © 2026 AuroraView · All Rights Reserved
             </div>
