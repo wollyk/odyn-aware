@@ -11,7 +11,9 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "start:api": "node server/api.mjs",
-    "dev:api": "node --watch server/api.mjs"
+    "dev:api": "node --watch server/api.mjs",
+    "deploy": "node scripts/deploy.mjs",
+    "submissions": "node scripts/submissions.mjs"
   },
   "dependencies": {
     "@cloudflare/vite-plugin": "^1.25.5",

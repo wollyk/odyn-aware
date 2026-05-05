@@ -265,7 +265,7 @@ function Index() {
           </div>
           <div className="flex flex-col items-start gap-2 sm:items-end">
             <a href="https://auroraview.tech" className="font-mono text-[10px] uppercase tracking-widest text-foreground/80 hover:text-foreground transition-colors">
-              auroraview.tech
+              auroraview.tech ·
             </a>
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
               © 2026 AuroraView · All Rights Reserved
