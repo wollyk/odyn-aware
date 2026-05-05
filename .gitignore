@@ -20,6 +20,15 @@ dist-ssr
 .wrangler/
 .dev.vars
 
+# Server runtime
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+api.out.log
+api.err.log
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
