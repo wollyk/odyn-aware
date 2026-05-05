@@ -1,4 +1,4 @@
-// Tiny Node API server for ODYN early-access submissions.
+// Tiny Node API server for AuroraView early-access submissions.
 // - No framework: built-in http + URL.
 // - Validates with Zod, persists to SQLite via better-sqlite3, optional SMTP notify via nodemailer.
 // - Designed to bind 127.0.0.1:3001 behind nginx on the VPS.
@@ -6,7 +6,7 @@
 // Env (all optional except DB_PATH default):
 //   PORT=3001
 //   HOST=127.0.0.1
-//   DB_PATH=/var/www/odyn-aware/data/odyn.db
+//   DB_PATH=/var/www/auroraview/data/auroraview.db
 //   ALLOWED_ORIGINS=https://example.com,https://www.example.com
 //   SMTP_HOST=, SMTP_PORT=587, SMTP_USER=, SMTP_PASS=, SMTP_FROM=, NOTIFY_TO=
 
@@ -43,7 +43,7 @@ async function notifyEmail(payload) {
   await transporter.sendMail({
     from: process.env.SMTP_FROM ?? process.env.SMTP_USER,
     to: process.env.NOTIFY_TO,
-    subject: `[ODYN] Early access request: ${payload.company}`,
+    subject: `[AuroraView] Deployment request: ${payload.company}`,
     text: [
       `Name:        ${payload.name}`,
       `Email:       ${payload.email}`,
@@ -129,12 +129,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[odyn-api] listening on http://${HOST}:${PORT}`);
+  console.log(`[auroraview-api] listening on http://${HOST}:${PORT}`);
 });
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
-    console.log(`[odyn-api] received ${sig}, shutting down`);
+    console.log(`[auroraview-api] received ${sig}, shutting down`);
     server.close(() => process.exit(0));
   });
 }
