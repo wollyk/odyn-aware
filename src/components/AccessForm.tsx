@@ -9,13 +9,17 @@ const schema = z.object({
   message: z.string().trim().max(1000).optional(),
 });
 
+const API_BASE = (import.meta as { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE ?? "";
+
 export function AccessForm() {
-  const [status, setStatus] = useState<"idle" | "ok" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "submitting" | "ok" | "error">("idle");
+  const [serverError, setServerError] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const fd = new FormData(e.currentTarget);
+    const formEl = e.currentTarget;
+    const fd = new FormData(formEl);
     const result = schema.safeParse({
       name: fd.get("name"),
       email: fd.get("email"),
@@ -28,11 +32,28 @@ export function AccessForm() {
       result.error.issues.forEach((i) => { errs[String(i.path[0])] = i.message; });
       setErrors(errs);
       setStatus("error");
+      setServerError(null);
       return;
     }
     setErrors({});
-    setStatus("ok");
-    e.currentTarget.reset();
+    setServerError(null);
+    setStatus("submitting");
+    try {
+      const res = await fetch(`${API_BASE}/api/early-access`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(result.data),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      setStatus("ok");
+      formEl.reset();
+    } catch (err) {
+      setStatus("error");
+      setServerError(err instanceof Error ? err.message : "Submission failed");
+    }
   }
 
   const inputCls = "w-full border border-border bg-background px-3 py-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-foreground focus:outline-none transition-colors";
@@ -74,13 +95,23 @@ export function AccessForm() {
       </div>
 
       <div className="flex flex-col-reverse items-start gap-4 pt-2 sm:flex-row sm:items-center sm:justify-between">
-        {status === "ok" ? (
+        {status === "ok" && (
           <p className="font-mono text-xs tracking-wider text-foreground">
             <span className="text-alert">●</span> REQUEST RECEIVED — We'll follow up with deployment details and next steps.
           </p>
-        ) : <span />}
-        <button type="submit" className="inline-flex items-center gap-3 bg-foreground px-6 py-3 text-xs font-medium uppercase tracking-[0.2em] text-background hover:bg-foreground/90 transition-colors">
-          Request Access
+        )}
+        {status === "error" && serverError && (
+          <p className="font-mono text-xs tracking-wider text-alert">
+            ● Submission failed — {serverError}
+          </p>
+        )}
+        {status !== "ok" && status !== "error" && <span />}
+        <button
+          type="submit"
+          disabled={status === "submitting"}
+          className="inline-flex items-center gap-3 bg-foreground px-6 py-3 text-xs font-medium uppercase tracking-[0.2em] text-background hover:bg-foreground/90 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          {status === "submitting" ? "Submitting…" : "Request Access"}
           <span aria-hidden>→</span>
         </button>
       </div>
