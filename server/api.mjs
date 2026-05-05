@@ -12,7 +12,24 @@
 
 import http from "node:http";
 import { z } from "zod";
-import { openDb, insertEarlyAccess, listEarlyAccess } from "./db.mjs";
+import {
+  openDb,
+  insertEarlyAccess,
+  listEarlyAccess,
+  searchEarlyAccess,
+  getUserByEmail,
+} from "./db.mjs";
+import {
+  verifyPassword,
+  startSession,
+  endSession,
+  getCurrentUser,
+  setSessionCookie,
+  clearSessionCookie,
+  parseCookies,
+  maybeSweepSessions,
+  SESSION_COOKIE_NAME,
+} from "./auth.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -29,7 +46,16 @@ const earlyAccessSchema = z.object({
   message: z.string().trim().max(1000).optional(),
 });
 
+const loginSchema = z.object({
+  email: z.string().trim().email().max(255),
+  password: z.string().min(1).max(200),
+});
+
 const db = openDb();
+
+function clientIp(req) {
+  return (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) || req.socket.remoteAddress || "";
+}
 
 async function notifyEmail(payload) {
   if (!process.env.SMTP_HOST || !process.env.NOTIFY_TO) return;
@@ -60,6 +86,7 @@ function setCors(req, res) {
   if (origin && ALLOWED.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -94,12 +121,18 @@ async function readJson(req, limit = 32 * 1024) {
   });
 }
 
+async function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 const server = http.createServer(async (req, res) => {
   setCors(req, res);
   if (req.method === "OPTIONS") return send(res, 204, "");
   const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
   try {
+    maybeSweepSessions(db);
+
     if (req.method === "GET" && url.pathname === "/api/health") {
       return send(res, 200, { ok: true });
     }
@@ -110,15 +143,66 @@ const server = http.createServer(async (req, res) => {
       if (!parsed.success) {
         return send(res, 400, { error: "validation", issues: parsed.error.issues });
       }
-      const ip = (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) || req.socket.remoteAddress || "";
+      const ip = clientIp(req);
       const ua = req.headers["user-agent"] ?? "";
       insertEarlyAccess(db, { ...parsed.data, ip, user_agent: ua });
       notifyEmail(parsed.data).catch((err) => console.error("[email] notify failed:", err.message));
       return send(res, 201, { ok: true });
     }
 
+    // Legacy admin token endpoint (kept for back-compat with older tooling).
     if (req.method === "GET" && url.pathname === "/api/early-access" && req.headers["x-admin-token"] === process.env.ADMIN_TOKEN) {
       return send(res, 200, { rows: listEarlyAccess(db, 200) });
+    }
+
+    // ----- Auth ----------------------------------------------------------
+    if (req.method === "POST" && url.pathname === "/api/auth/login") {
+      const body = await readJson(req);
+      const parsed = loginSchema.safeParse(body);
+      if (!parsed.success) {
+        await delay(200);
+        return send(res, 400, { error: "validation", issues: parsed.error.issues });
+      }
+      const user = getUserByEmail(db, parsed.data.email);
+      const ok = user && verifyPassword(parsed.data.password, user.password_hash);
+      if (!ok) {
+        await delay(200);
+        return send(res, 401, { error: "invalid_credentials" });
+      }
+      const sid = startSession(db, {
+        user_id: user.id,
+        ip: clientIp(req),
+        user_agent: req.headers["user-agent"] ?? "",
+      });
+      setSessionCookie(res, sid);
+      return send(res, 200, { user: { email: user.email, role: user.role } });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/auth/logout") {
+      const sid = parseCookies(req)[SESSION_COOKIE_NAME];
+      endSession(db, sid);
+      clearSessionCookie(res);
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/auth/me") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      return send(res, 200, { user: { email: me.email, role: me.role } });
+    }
+
+    // ----- Admin ---------------------------------------------------------
+    if (req.method === "GET" && url.pathname === "/api/admin/submissions") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const q = url.searchParams.get("q") ?? "";
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200), 1), 1000);
+      const offset = Math.max(Number(url.searchParams.get("offset") ?? 0), 0);
+      const sort = url.searchParams.get("sort") ?? "id";
+      const order = url.searchParams.get("order") ?? "desc";
+      const result = searchEarlyAccess(db, { q, limit, offset, sort, order });
+      return send(res, 200, result);
     }
 
     return send(res, 404, { error: "not_found" });

@@ -92,17 +92,26 @@ function sshExec(remoteCmd, opts = {}) {
   const localHead = git("rev-parse HEAD");
   process.stdout.write(`    pushed ${localHead.slice(0, 8)}\n`);
 
-  // 4. Remote pull + build + restart
+  // 4. Remote pull + build + restart + record deploy log
   log("4/6", "remote pull, build, restart");
   const remoteScript = [
     "set -e",
     "cd /var/www/odyn-aware/current",
-    `git fetch --depth=1 origin ${cfg.branch}`,
+    "PREV_SHA=$(git rev-parse HEAD)",
+    "echo \"-- prev HEAD --\"; echo $PREV_SHA",
+    `git fetch --depth=50 origin ${cfg.branch}`,
     `git checkout -B ${cfg.branch} origin/${cfg.branch}`,
+    "NEW_SHA=$(git rev-parse HEAD)",
+    "NEW_MSG=$(git --no-pager log -1 --pretty='%s' | sed 's/\"/\\\\\"/g')",
     "echo \"-- HEAD --\"; git --no-pager log -1 --pretty='%h %s'",
     "echo \"-- npm ci --\"; npm ci --no-audit --no-fund --silent",
     "echo \"-- build --\"; npm run build 2>&1 | tail -10",
     `echo "-- restart --"; echo ${cfg.pw} | sudo -S -p '' systemctl restart odyn-api && systemctl --no-pager --lines=0 status odyn-api | head -4`,
+    "TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "LOG=/var/www/odyn-aware/deploy-log.jsonl",
+    "touch $LOG",
+    "echo \"{\\\"ts\\\":\\\"$TS\\\",\\\"action\\\":\\\"deploy\\\",\\\"prev\\\":\\\"$PREV_SHA\\\",\\\"head\\\":\\\"$NEW_SHA\\\",\\\"msg\\\":\\\"$NEW_MSG\\\"}\" >> $LOG",
+    "echo \"-- deploy log --\"; tail -1 $LOG",
   ].join("; ");
   const r = sshExec(remoteScript, { inherit: true });
   if (r.status !== 0) die("remote deploy step failed");
@@ -140,4 +149,5 @@ function sshExec(remoteCmd, opts = {}) {
     process.stdout.write("\n\x1b[33m[deploy] WARN public smoke-test did not confirm cleanly. Build is on the server though; try a hard refresh in your browser (Ctrl+F5).\x1b[0m\n");
   }
   log("done", `${cfg.publicUrl} now serves ${localHead.slice(0, 8)}`);
+  process.stdout.write("    to revert: \x1b[36mnpm run rollback\x1b[0m   (or 'npm run rollback -- list' to see history)\n");
 })().catch((e) => die(e?.stack ?? String(e)));
