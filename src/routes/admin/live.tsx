@@ -64,7 +64,11 @@ function AdminLive() {
 
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [camera, setCamera] = useState<string>("");
-  const [mode, setMode] = useState<StreamMode>("snapshot");
+  // Default to Live MSE: Frigate's latest.jpg (used by snapshot mode) returns a
+  // "No frames have been received" placeholder while detect.enabled=false on the
+  // camera. The MSE stream taps go2rtc's source pipeline directly so it works
+  // regardless. Snapshot mode stays as a manual fallback.
+  const [mode, setMode] = useState<StreamMode>("live");
 
   const cam = useMemo(() => cameras.find((c) => c.name === camera) ?? null, [cameras, camera]);
 
