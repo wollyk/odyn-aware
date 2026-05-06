@@ -30,6 +30,7 @@ import {
   maybeSweepSessions,
   SESSION_COOKIE_NAME,
 } from "./auth.mjs";
+import * as frigate from "./frigate.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -203,6 +204,68 @@ const server = http.createServer(async (req, res) => {
       const order = url.searchParams.get("order") ?? "desc";
       const result = searchEarlyAccess(db, { q, limit, offset, sort, order });
       return send(res, 200, result);
+    }
+
+    // ----- Cameras (admin-gated proxy to Frigate) ------------------------
+    if (req.method === "GET" && url.pathname === "/api/cam/cameras") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      if (!frigate.isConfigured()) {
+        return send(res, 200, { configured: false, cameras: [] });
+      }
+      try {
+        const cameras = await frigate.listCameras();
+        return send(res, 200, { configured: true, cameras });
+      } catch (err) {
+        console.error("[cam] listCameras failed:", err.message);
+        return send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/cam/snapshot/")) {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const camera = decodeURIComponent(url.pathname.slice("/api/cam/snapshot/".length));
+      if (!camera || !/^[A-Za-z0-9_\-]+$/.test(camera)) {
+        return send(res, 400, { error: "invalid_camera" });
+      }
+      if (!frigate.isConfigured()) return send(res, 503, { error: "frigate_not_configured" });
+      const heightParam = url.searchParams.get("h");
+      const height = heightParam ? Math.min(Math.max(Number(heightParam) || 0, 60), 1600) : undefined;
+      try {
+        const snap = await frigate.getSnapshot(camera, { height });
+        res.writeHead(200, {
+          "Content-Type": snap.contentType,
+          "Cache-Control": "no-store",
+          "Last-Modified": snap.lastModified,
+          "X-Camera": camera,
+        });
+        return res.end(snap.body);
+      } catch (err) {
+        console.error("[cam] snapshot failed:", err.message);
+        return send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/cam/events") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      if (!frigate.isConfigured()) return send(res, 200, { events: [] });
+      const camera = url.searchParams.get("camera") ?? undefined;
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 20), 1), 200);
+      const label = url.searchParams.get("label") ?? undefined;
+      const after = url.searchParams.get("after") ?? undefined;
+      const before = url.searchParams.get("before") ?? undefined;
+      try {
+        const events = await frigate.getEvents({ camera, limit, label, after, before });
+        return send(res, 200, { events });
+      } catch (err) {
+        console.error("[cam] events failed:", err.message);
+        return send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      }
     }
 
     return send(res, 404, { error: "not_found" });
