@@ -34,6 +34,7 @@ import {
 } from "./auth.mjs";
 import * as frigate from "./frigate.mjs";
 import { streamChatGpt, analyzeImage, isChatConfigured } from "./agent.mjs";
+import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -367,6 +368,104 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     console.error(err);
     return send(res, 500, { error: "server_error" });
+  }
+});
+
+// ----- WebSocket: live MSE stream proxy ---------------------------------
+// Path: /api/cam/stream/<camera>
+// Auth: same admin session cookie as REST routes (verified in `verifyClient`).
+// Upstream: Frigate's /live/mse/api/ws?src=<camera> (wss, self-signed loopback).
+// We pipe text+binary frames in BOTH directions:
+//   client -> upstream: codec init message ({"type":"mse","value":"..."})
+//   upstream -> client: codec ack + fMP4 init segment + media segments
+//
+// Treads carefully:
+//   - Auth is checked BEFORE the upgrade completes (so unauth attempts get a clean 401).
+//   - Either side closing tears the other down within ~50ms; no zombie sockets.
+//   - All upstream errors are swallowed and logged; api server stays alive.
+const camStreamWss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", async (req, socket, head) => {
+  try {
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    if (!url.pathname.startsWith("/api/cam/stream/")) {
+      socket.destroy();
+      return;
+    }
+
+    // Authenticate using the same session cookie used by REST routes.
+    const me = getCurrentUser(db, req);
+    if (!me || me.role !== "admin") {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const camera = decodeURIComponent(url.pathname.slice("/api/cam/stream/".length));
+    if (!camera || !/^[A-Za-z0-9_\-]+$/.test(camera)) {
+      socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (!frigate.isConfigured()) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    // Open upstream FIRST. If it fails, return 502 without ever upgrading the client.
+    let upstream;
+    try {
+      upstream = await frigate.openMseStream(camera);
+    } catch (err) {
+      console.error("[cam/stream] upstream open failed:", err.message);
+      socket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    // Wait for upstream "open" before completing the client upgrade — that way
+    // if Frigate rejects auth or the camera, we surface 502 cleanly.
+    upstream.once("open", () => {
+      camStreamWss.handleUpgrade(req, socket, head, (client) => {
+        const closeBoth = (reason) => {
+          try { client.close(1011, reason); } catch {}
+          try { upstream.close(); } catch {}
+        };
+
+        // client -> upstream
+        client.on("message", (data, isBinary) => {
+          if (upstream.readyState === upstream.OPEN) upstream.send(data, { binary: isBinary });
+        });
+        client.on("close", () => closeBoth("client_closed"));
+        client.on("error", (err) => {
+          console.error("[cam/stream] client error:", err.message);
+          closeBoth("client_error");
+        });
+
+        // upstream -> client
+        upstream.on("message", (data, isBinary) => {
+          if (client.readyState === client.OPEN) client.send(data, { binary: isBinary });
+        });
+        upstream.on("close", () => closeBoth("upstream_closed"));
+        upstream.on("error", (err) => {
+          console.error("[cam/stream] upstream error:", err.message);
+          closeBoth("upstream_error");
+        });
+
+        console.log(`[cam/stream] proxy open: ${me.email} -> Frigate(${camera})`);
+      });
+    });
+    upstream.once("error", (err) => {
+      console.error("[cam/stream] upstream early error:", err.message);
+      try {
+        socket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+      } catch {}
+      socket.destroy();
+    });
+  } catch (err) {
+    console.error("[cam/stream] upgrade handler error:", err);
+    socket.destroy();
   }
 });
 

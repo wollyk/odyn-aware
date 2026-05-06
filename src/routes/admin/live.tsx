@@ -43,6 +43,17 @@ type ToolEvent =
 
 type AgentStatus = { chat_configured: boolean; frigate_configured: boolean };
 
+type StreamMode = "snapshot" | "live";
+
+type LiveStatus =
+  | "idle"
+  | "connecting"
+  | "negotiating"
+  | "playing"
+  | "stalled"
+  | "error"
+  | "closed";
+
 // ---------- Component ----------
 
 function AdminLive() {
@@ -53,6 +64,7 @@ function AdminLive() {
 
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [camera, setCamera] = useState<string>("");
+  const [mode, setMode] = useState<StreamMode>("snapshot");
 
   const cam = useMemo(() => cameras.find((c) => c.name === camera) ?? null, [cameras, camera]);
 
@@ -182,19 +194,50 @@ function AdminLive() {
               ))}
             </select>
           )}
+          <ModeToggle mode={mode} setMode={setMode} />
           <StatusPill agentStatus={agentStatus} />
         </div>
 
         <div className="grid gap-4 lg:grid-cols-[1fr_420px]">
-          <VideoTile cam={cam} agentStatus={agentStatus} />
+          <VideoTile cam={cam} mode={mode} agentStatus={agentStatus} />
           <ChatPanel cam={cam} agentStatus={agentStatus} />
         </div>
 
         <p className="mt-6 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          Snapshot polling 1Hz · Vision analysis every 5s · Chat tools: list_cameras, rename_camera,
+          {mode === "snapshot"
+            ? "Snapshot polling 1Hz"
+            : "Live MSE stream (go2rtc → Node WS proxy → MediaSource)"}
+          {" · "}Vision analysis every 5s · Chat tools: list_cameras, rename_camera,
           get_recent_events, propose_alert_rule
         </p>
       </main>
+    </div>
+  );
+}
+
+// ---------- Mode toggle (Snapshot | Live) ----------
+
+function ModeToggle({ mode, setMode }: { mode: StreamMode; setMode: (m: StreamMode) => void }) {
+  const opts: { id: StreamMode; label: string }[] = [
+    { id: "snapshot", label: "Snapshot 1Hz" },
+    { id: "live", label: "Live MSE" },
+  ];
+  return (
+    <div className="inline-flex border border-border">
+      {opts.map((o) => (
+        <button
+          key={o.id}
+          type="button"
+          onClick={() => setMode(o.id)}
+          className={`px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest transition-colors ${
+            mode === o.id
+              ? "bg-foreground text-background"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -223,9 +266,177 @@ function StatusPill({ agentStatus }: { agentStatus: AgentStatus | null }) {
   );
 }
 
-// ---------- Video tile (snapshot polling + canvas overlay + HUD chrome) ----------
+// ---------- MSE WebSocket driver ----------
+// Connects to /api/cam/stream/<camera>, drives a <video> via MediaSource.
+//
+// Wire protocol (with our backend proxy):
+//   1. WS opens (admin cookie auto-included for same-origin)
+//   2. Client → server text: {"type":"mse","value":"<wide codec list>"}
+//   3. Server → client text: {"type":"mse","value":"video/mp4; codecs=\"...\""}  (chosen)
+//   4. Server → client binary: fMP4 init segment, then media segments
 
-function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: AgentStatus | null }) {
+function useMseStream(camera: string | null, enabled: boolean) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [status, setStatus] = useState<LiveStatus>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [bitrateKbps, setBitrateKbps] = useState<number>(0);
+
+  useEffect(() => {
+    if (!enabled || !camera) {
+      setStatus("idle");
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+
+    let ws: WebSocket | null = null;
+    let mediaSource: MediaSource | null = null;
+    let sourceBuffer: SourceBuffer | null = null;
+    const queue: ArrayBuffer[] = [];
+    let bytesInWindow = 0;
+    let cancelled = false;
+
+    const flushQueue = () => {
+      if (!sourceBuffer || sourceBuffer.updating) return;
+      if (queue.length === 0) return;
+      try {
+        sourceBuffer.appendBuffer(queue.shift()!);
+      } catch (err) {
+        if (!cancelled) {
+          console.error("[mse] appendBuffer", err);
+          setError(err instanceof Error ? err.message : "appendBuffer failed");
+          setStatus("error");
+        }
+      }
+    };
+
+    const onSourceOpen = () => {
+      if (!mediaSource) return;
+      try {
+        URL.revokeObjectURL(video.src);
+      } catch {
+        // ignore
+      }
+
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/api/cam/stream/${encodeURIComponent(camera)}`;
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+      setStatus("connecting");
+
+      ws.addEventListener("open", () => {
+        if (cancelled || !ws) return;
+        setStatus("negotiating");
+        // Wide-net codec request — Frigate replies with the actual stream codec.
+        const codecs =
+          'video/mp4; codecs="avc1.640029,avc1.4D4029,avc1.4D401E,avc1.64001E,avc1.42E01E,mp4a.40.2"';
+        ws.send(JSON.stringify({ type: "mse", value: codecs }));
+      });
+
+      ws.addEventListener("message", (ev) => {
+        if (cancelled || !mediaSource) return;
+        if (typeof ev.data === "string") {
+          // Server's chosen codec response.
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg && msg.type === "mse" && typeof msg.value === "string" && !sourceBuffer) {
+              if (!MediaSource.isTypeSupported(msg.value)) {
+                setError(`Codec not supported: ${msg.value}`);
+                setStatus("error");
+                ws?.close();
+                return;
+              }
+              sourceBuffer = mediaSource.addSourceBuffer(msg.value);
+              sourceBuffer.mode = "segments";
+              sourceBuffer.addEventListener("updateend", flushQueue);
+            }
+          } catch (err) {
+            console.error("[mse] bad text msg", err);
+          }
+        } else {
+          const buf = ev.data as ArrayBuffer;
+          bytesInWindow += buf.byteLength;
+          queue.push(buf);
+          flushQueue();
+          setStatus((s) => (s === "playing" ? s : "playing"));
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        if (cancelled) return;
+        setStatus("closed");
+      });
+      ws.addEventListener("error", () => {
+        if (cancelled) return;
+        setError("WebSocket error");
+        setStatus("error");
+      });
+    };
+
+    mediaSource = new MediaSource();
+    mediaSource.addEventListener("sourceopen", onSourceOpen);
+    video.src = URL.createObjectURL(mediaSource);
+    void video.play().catch(() => {
+      // autoplay may be blocked; user can click to play
+    });
+
+    // Bitrate sampler (every 1s)
+    const sampler = setInterval(() => {
+      setBitrateKbps(Math.round((bytesInWindow * 8) / 1000));
+      bytesInWindow = 0;
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(sampler);
+      try {
+        ws?.close();
+      } catch {
+        // ignore
+      }
+      try {
+        if (sourceBuffer && mediaSource && mediaSource.readyState === "open") {
+          mediaSource.removeSourceBuffer(sourceBuffer);
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        if (mediaSource && mediaSource.readyState === "open") {
+          mediaSource.endOfStream();
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        URL.revokeObjectURL(video.src);
+      } catch {
+        // ignore
+      }
+      video.removeAttribute("src");
+      try {
+        video.load();
+      } catch {
+        // ignore
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera, enabled]);
+
+  return { videoRef, status, error, bitrateKbps };
+}
+
+// ---------- Video tile (snapshot polling OR live MSE + canvas overlay + HUD chrome) ----------
+
+function VideoTile({
+  cam,
+  mode,
+  agentStatus,
+}: {
+  cam: Camera | null;
+  mode: StreamMode;
+  agentStatus: AgentStatus | null;
+}) {
   const [imgUrl, setImgUrl] = useState<string>("");
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -238,9 +449,11 @@ function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: Agen
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Snapshot polling: 1Hz, cache-busted via ?t=
+  const live = useMseStream(cam?.name ?? null, mode === "live");
+
+  // Snapshot polling: 1Hz, cache-busted via ?t= (only in snapshot mode)
   useEffect(() => {
-    if (!cam) return;
+    if (!cam || mode !== "snapshot") return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const tick = () => {
@@ -266,7 +479,7 @@ function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: Agen
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [cam]);
+  }, [cam, mode]);
 
   // Detection polling: every 5s
   useEffect(() => {
@@ -305,14 +518,14 @@ function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: Agen
     return () => clearInterval(t);
   }, []);
 
-  // Canvas sizing + draw on resize / new detections / new image
+  // Canvas sizing + draw on resize / new detections / new image / new live frame
   useEffect(() => {
     const canvas = canvasRef.current;
-    const img = imgRef.current;
-    if (!canvas || !img) return;
+    const target: HTMLElement | null = mode === "live" ? live.videoRef.current : imgRef.current;
+    if (!canvas || !target) return;
     const draw = () => {
-      const w = img.clientWidth;
-      const h = img.clientHeight;
+      const w = target.clientWidth;
+      const h = target.clientHeight;
       if (!w || !h) return;
       const dpr = window.devicePixelRatio || 1;
       if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
@@ -352,18 +565,33 @@ function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: Agen
     };
     draw();
     const ro = new ResizeObserver(draw);
-    ro.observe(img);
+    ro.observe(target);
     return () => ro.disconnect();
-  }, [detections, imgUrl]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detections, imgUrl, mode, live.status]);
 
   const camLabel = cam ? cam.label : "—";
   const wireName = cam ? cam.name : "";
   const ts = new Date(now).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
 
+  // HUD top-right: latency in snapshot mode, bitrate in live mode.
+  const hudRight =
+    mode === "live"
+      ? `${ts} · ${live.status === "playing" ? `${live.bitrateKbps}kbps` : live.status}`
+      : `${ts} · ${latencyMs != null ? `${latencyMs}ms` : "…"}`;
+
   return (
     <div className="relative" ref={wrapRef}>
       <div className="relative aspect-video overflow-hidden border border-border bg-black">
-        {imgUrl ? (
+        {mode === "live" ? (
+          <video
+            ref={live.videoRef}
+            autoPlay
+            muted
+            playsInline
+            className="h-full w-full object-contain select-none pointer-events-none"
+          />
+        ) : imgUrl ? (
           <img
             ref={imgRef}
             src={imgUrl}
@@ -381,14 +609,37 @@ function VideoTile({ cam, agentStatus }: { cam: Camera | null; agentStatus: Agen
           className="pointer-events-none absolute inset-0 h-full w-full"
         />
 
+        {/* Live-mode overlay for connection states (negotiating/error/closed) */}
+        {mode === "live" && live.status !== "playing" && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="bg-black/70 px-4 py-2 font-mono text-xs uppercase tracking-widest text-foreground/85">
+              {live.status === "error"
+                ? `Live: ${live.error ?? "error"}`
+                : live.status === "closed"
+                  ? "Live: stream closed"
+                  : live.status === "connecting"
+                    ? "Connecting to camera…"
+                    : live.status === "negotiating"
+                      ? "Negotiating codecs…"
+                      : "Idle"}
+            </div>
+          </div>
+        )}
+
         {/* HUD chrome */}
         <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-3">
           <div className="flex items-center gap-2 bg-black/65 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-foreground">
-            <span className="inline-block h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-            LIVE · AURORAVIEW
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                mode === "live" && live.status !== "playing"
+                  ? "bg-amber-400"
+                  : "bg-red-500 animate-pulse"
+              }`}
+            />
+            {mode === "live" ? "LIVE-MSE · AURORAVIEW" : "LIVE · AURORAVIEW"}
           </div>
           <div className="bg-black/65 px-2.5 py-1 font-mono text-[10px] tracking-widest text-foreground/85">
-            {ts} · {latencyMs != null ? `${latencyMs}ms` : "…"}
+            {hudRight}
           </div>
         </div>
 

@@ -23,6 +23,7 @@ dist-ssr
 # Server runtime
 data/
 tmp-test/
+tsconfig.tsbuildinfo
 *.db
 *.db-journal
 *.db-wal

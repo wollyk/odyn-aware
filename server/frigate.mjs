@@ -19,6 +19,7 @@
 import { request } from "node:https";
 import { request as httpRequest } from "node:http";
 import { URL } from "node:url";
+import WebSocket from "ws";
 
 const FRIGATE_BASE = process.env.FRIGATE_BASE ?? "https://127.0.0.1:3000";
 const FRIGATE_USER = process.env.FRIGATE_USER ?? "";
@@ -186,6 +187,33 @@ export async function listCameras() {
 export function invalidateCache() {
   cachedConfig = null;
   cachedConfigAt = 0;
+}
+
+// Open an upstream MSE WebSocket to Frigate's go2rtc.
+//
+// Returns a `ws` WebSocket already authenticated with our cached frigate_token.
+// Bypasses Frigate's detection-disabled latest.jpg placeholder by going straight
+// through go2rtc's stream pipeline.
+//
+// Wire protocol (after upgrade):
+//   client -> server (JSON text): {"type":"mse","value":"<MP4 codec string>"}
+//   server -> client (JSON text): {"type":"mse","value":"<chosen codecs>"}
+//   server -> client (binary):    fragmented MP4 init segment + media segments
+//
+// The caller is responsible for sending the init message and handling errors.
+export async function openMseStream(camera) {
+  const token = await loginIfNeeded();
+  const base = new URL(FRIGATE_BASE);
+  const wsScheme = base.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${wsScheme}//${base.host}/live/mse/api/ws?src=${encodeURIComponent(camera)}`;
+  const ws = new WebSocket(url, {
+    headers: { Cookie: `frigate_token=${token}` },
+    rejectUnauthorized: false,
+    perMessageDeflate: false,
+    handshakeTimeout: 8000,
+    maxPayload: 16 * 1024 * 1024, // 16MB cap per frame; init+media chunks are well under this
+  });
+  return ws;
 }
 
 export const FRIGATE = { FRIGATE_BASE };
