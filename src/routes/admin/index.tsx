@@ -150,6 +150,17 @@ function AdminDashboard() {
             <a href="/" className="font-mono text-sm font-semibold tracking-[0.3em] text-foreground">AURORAVIEW</a>
             <span className="label-mono">/ Admin</span>
           </div>
+          <nav className="flex items-center gap-6">
+            <span className="font-mono text-[10px] uppercase tracking-widest text-foreground border-b border-foreground pb-0.5">
+              Submissions
+            </span>
+            <a
+              href="/admin/live"
+              className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Live View
+            </a>
+          </nav>
           <div className="flex items-center gap-4">
             <span className="hidden sm:inline font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
               {me?.email}
