@@ -45,6 +45,29 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+    -- Camera display labels (set via the live-view chat agent: "rename garage to ...").
+    -- camera = Frigate camera name (the wire name); label = human-friendly display name.
+    CREATE TABLE IF NOT EXISTS cam_labels (
+      camera      TEXT PRIMARY KEY,
+      label       TEXT NOT NULL,
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_by  INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    -- Stub for proposed/active alert rules (chat tool: "alert me when ...").
+    -- We only PERSIST the proposal here; wiring to the actual detection pipeline is later.
+    CREATE TABLE IF NOT EXISTS alert_rules (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      camera       TEXT NOT NULL,
+      description  TEXT NOT NULL,        -- natural-language summary of the rule
+      spec         TEXT NOT NULL,        -- JSON: { trigger, conditions, action }
+      status       TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','active','disabled')),
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alert_rules_camera ON alert_rules(camera);
+    CREATE INDEX IF NOT EXISTS idx_alert_rules_status ON alert_rules(status);
   `);
   return db;
 }
@@ -133,4 +156,53 @@ export function deleteSession(db, id) {
 
 export function purgeExpiredSessions(db) {
   db.prepare(`DELETE FROM sessions WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run();
+}
+
+// Camera label helpers (set via chat agent) ----------------------------------
+
+export function listCamLabels(db) {
+  return db.prepare(`SELECT camera, label, updated_at FROM cam_labels`).all();
+}
+
+export function getCamLabel(db, camera) {
+  return db.prepare(`SELECT camera, label FROM cam_labels WHERE camera = ?`).get(camera);
+}
+
+export function setCamLabel(db, { camera, label, updated_by }) {
+  db.prepare(
+    `INSERT INTO cam_labels (camera, label, updated_by)
+     VALUES (?, ?, ?)
+     ON CONFLICT(camera) DO UPDATE SET
+       label = excluded.label,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+       updated_by = excluded.updated_by`,
+  ).run(camera, label, updated_by ?? null);
+  return { camera, label };
+}
+
+// Alert-rule helpers (proposed via chat agent) -------------------------------
+
+export function insertAlertRule(db, { camera, description, spec, created_by }) {
+  const info = db
+    .prepare(
+      `INSERT INTO alert_rules (camera, description, spec, created_by)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(camera, description, JSON.stringify(spec ?? {}), created_by ?? null);
+  return { id: info.lastInsertRowid, camera, description, status: "proposed" };
+}
+
+export function listAlertRules(db, { camera, status } = {}) {
+  const where = [];
+  const params = {};
+  if (camera) {
+    where.push("camera = @camera");
+    params.camera = camera;
+  }
+  if (status) {
+    where.push("status = @status");
+    params.status = status;
+  }
+  const sql = `SELECT * FROM alert_rules ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY id DESC`;
+  return db.prepare(sql).all(params);
 }

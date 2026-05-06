@@ -18,6 +18,8 @@ import {
   listEarlyAccess,
   searchEarlyAccess,
   getUserByEmail,
+  listCamLabels,
+  getCamLabel,
 } from "./db.mjs";
 import {
   verifyPassword,
@@ -31,6 +33,7 @@ import {
   SESSION_COOKIE_NAME,
 } from "./auth.mjs";
 import * as frigate from "./frigate.mjs";
+import { streamChatGpt, analyzeImage, isChatConfigured } from "./agent.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -266,6 +269,98 @@ const server = http.createServer(async (req, res) => {
         console.error("[cam] events failed:", err.message);
         return send(res, 502, { error: "frigate_unreachable", detail: err.message });
       }
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/cam/labels") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      return send(res, 200, { labels: listCamLabels(db) });
+    }
+
+    // ----- Agent (admin-gated) -------------------------------------------
+    if (req.method === "GET" && url.pathname === "/api/agent/status") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      return send(res, 200, {
+        chat_configured: isChatConfigured(),
+        frigate_configured: frigate.isConfigured(),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/agent/detections") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const camera = url.searchParams.get("camera") ?? "";
+      if (!/^[A-Za-z0-9_\-]+$/.test(camera)) return send(res, 400, { error: "invalid_camera" });
+      if (!frigate.isConfigured()) return send(res, 200, { detections: [], status: "frigate_not_configured" });
+      try {
+        const snap = await frigate.getSnapshot(camera, { height: 480 });
+        const result = await analyzeImage({ imageBuffer: snap.body, camera });
+        return send(res, 200, { camera, ...result });
+      } catch (err) {
+        console.error("[agent] detections failed:", err.message);
+        return send(res, 502, { error: "agent_failed", detail: err.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/agent/chat") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      let body;
+      try {
+        body = await readJson(req);
+      } catch {
+        return send(res, 400, { error: "invalid_json" });
+      }
+      const messages = Array.isArray(body?.messages) ? body.messages.slice(-20) : [];
+      const camera = String(body?.camera ?? "").slice(0, 64) || "Garage";
+      const labelRow = getCamLabel(db, camera);
+      const cameraLabel = labelRow?.label ?? camera;
+      // Validate message shape
+      const cleanMessages = messages
+        .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+      if (cleanMessages.length === 0 || cleanMessages.at(-1).role !== "user") {
+        return send(res, 400, { error: "messages must end with a user turn" });
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-store, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      const writeEvent = (obj) => {
+        try {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        } catch {
+          /* client disconnected */
+        }
+      };
+
+      const ac = new AbortController();
+      req.on("close", () => ac.abort());
+      try {
+        for await (const evt of streamChatGpt({
+          messages: cleanMessages,
+          camera,
+          cameraLabel,
+          db,
+          user: { id: me.user_id, email: me.email, role: me.role },
+          signal: ac.signal,
+        })) {
+          writeEvent(evt);
+          if (evt.type === "done") break;
+        }
+      } catch (err) {
+        writeEvent({ type: "error", message: err.message });
+        writeEvent({ type: "done" });
+      }
+      return res.end();
     }
 
     return send(res, 404, { error: "not_found" });
