@@ -6,9 +6,10 @@
 // frame still visible underneath. Don't surface raw state names.
 
 import { useEffect, useRef, useState } from "react";
-import type { AgentStatus, Camera, DetectionResult, StreamMode } from "./types";
+import type { AgentStatus, Camera, DetectionResult, SceneResult, StreamMode } from "./types";
 import { useMseStream } from "./useMseStream";
 import { useDetections } from "./useDetections";
+import { useScene } from "./useScene";
 
 export function VideoTile({
   cam,
@@ -30,6 +31,7 @@ export function VideoTile({
 
   const live = useMseStream(cam?.name ?? null, mode === "live");
   const det = useDetections(cam);
+  const scene = useScene(cam);
 
   // Snapshot polling: 1Hz, cache-busted via ?t= (only in snapshot mode)
   useEffect(() => {
@@ -202,10 +204,54 @@ export function VideoTile({
             {visionLabel(det.status, det.detections.length)}
           </div>
         </div>
+
+        {/* Tier badge — bottom-left, just above the camera label.
+            Two lit dots = T2+T3, one = T3-only, dashed = no signal yet. */}
+        <div className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-foreground/85">
+          <span
+            className={`inline-block h-1.5 w-1.5 rounded-full ${
+              scene.status === "ok" ? severityDotColor(scene.severity) : "bg-foreground/30"
+            }`}
+            title={`T2 local · ${scene.model ?? "ollama"}`}
+          />
+          <span
+            className={`inline-block h-1.5 w-1.5 rounded-full ${
+              det.status === "ok" ? "bg-emerald-400" : "bg-foreground/30"
+            }`}
+            title="T3 cloud · gpt-4o-mini"
+          />
+          <span className="ml-1 text-foreground/70">
+            {tierChainLabel(scene.status, det.status)}
+          </span>
+        </div>
       </div>
 
+      {/* T2 scene caption — independent local reading. Surfaced even when
+          T3 is unconfigured, so the operator can still see what the local
+          agent thinks is going on. */}
+      {scene.scene && scene.status === "ok" && (
+        <p
+          className={`mt-2 font-mono text-[11px] tracking-wider ${
+            scene.severity === "critical"
+              ? "text-red-400"
+              : scene.severity === "notable"
+              ? "text-amber-300"
+              : "text-foreground/75"
+          }`}
+        >
+          <span className="text-foreground/50 mr-1.5">T2-LOCAL ▸</span>
+          {scene.scene}
+          {scene.alertType && (
+            <span className="ml-2 text-foreground/45">[{scene.alertType}]</span>
+          )}
+          {typeof scene.tookMs === "number" && (
+            <span className="ml-2 text-foreground/35">{scene.tookMs}ms</span>
+          )}
+        </p>
+      )}
+
       {det.summary && det.status === "ok" && (
-        <p className="mt-2 font-mono text-[11px] tracking-wider text-foreground/80">
+        <p className="mt-1 font-mono text-[11px] tracking-wider text-foreground/80">
           <span className="text-alert">▸</span> {det.summary}
         </p>
       )}
@@ -223,4 +269,22 @@ function visionLabel(status: DetectionResult["status"] | null, count: number): s
   if (status === "vision_disabled") return "Vision: key not set";
   if (status === "error") return "Vision: error";
   return "Vision: …";
+}
+
+function severityDotColor(sev: SceneResult["severity"] | null): string {
+  if (sev === "critical") return "bg-red-500 animate-pulse";
+  if (sev === "notable") return "bg-amber-300";
+  return "bg-emerald-400";
+}
+
+function tierChainLabel(
+  t2: SceneResult["status"] | null,
+  t3: DetectionResult["status"] | null,
+): string {
+  const t2On = t2 === "ok";
+  const t3On = t3 === "ok";
+  if (t2On && t3On) return "T2+T3";
+  if (t2On) return "T2-only";
+  if (t3On) return "T3-only";
+  return "—";
 }

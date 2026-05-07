@@ -356,10 +356,17 @@ const server = http.createServer(async (req, res) => {
       if (!me) return send(res, 401, { error: "unauthenticated" });
       if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
       // Augment with harness diagnostics: bus subscribers, telemetry, quotas,
-      // tier3 readiness. The harness internals are still hidden — what we
-      // expose is exactly what the index.mjs facade chooses to publish.
+      // tier3 readiness, AND a live tier2 (Ollama) probe. The harness internals
+      // are still hidden — what we expose is exactly what the index.mjs facade
+      // chooses to publish.
+      // Optional ?probe=async to include the live Ollama tier2 ping. We keep
+      // the default sync to avoid making the page-load /status call
+      // network-dependent on the Ollama box.
+      const wantAsync = url.searchParams.get("probe") === "async";
       let harness_status = null;
-      try { harness_status = harness.status(); } catch { /* harness optional */ }
+      try {
+        harness_status = wantAsync ? await harness.statusAsync() : harness.status();
+      } catch { /* harness optional */ }
       return send(res, 200, {
         chat_configured: isChatConfigured(),
         frigate_configured: frigate.isConfigured(),
@@ -464,10 +471,54 @@ const server = http.createServer(async (req, res) => {
         );
         // Record AFTER success so failed calls don't consume budget.
         harness.recordQuota({ tenant, camera, kind: "t3-vision", dollars: 0.0001 });
-        return send(res, 200, { camera, ...result });
+        return send(res, 200, { camera, ...result, tier: "T3" });
       } catch (err) {
         console.error("[agent] detections failed:", err.message);
         return send(res, 502, { error: "agent_failed", detail: err.message });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/agent/scene") {
+      // Tier 2 (local Ollama VLM) scene description. Cheap, $0 marginal —
+      // gated by per-camera/tenant quota only to protect GPU budget on the
+      // shared Ollama box, not to control dollars.
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const camera = url.searchParams.get("camera") ?? "";
+      if (!/^[A-Za-z0-9_\-]+$/.test(camera)) return send(res, 400, { error: "invalid_camera" });
+      if (!frigate.isConfigured()) return send(res, 200, { status: "frigate_not_configured", tier: "T2" });
+      const tenant = "default";
+      const gate = harness.checkQuota({ tenant, camera, kind: "t2-vision" });
+      if (!gate.allowed) {
+        return send(res, 429, { error: "quota_exceeded", reason: gate.reason });
+      }
+      try {
+        // h=240 is enough for moondream-class scene description and keeps
+        // the prompt token count low (~750 tokens vs ~2000 at h=480).
+        const snap = await frigate.getSnapshot(camera, { height: 240 });
+        const result = await harness.timed("agent.scene", () =>
+          harness.analyzeImageLocal({ imageBuffer: snap.body, camera }),
+        );
+        if (result.ok) {
+          harness.recordQuota({ tenant, camera, kind: "t2-vision", dollars: 0 });
+        }
+        return send(res, 200, {
+          camera,
+          tier: "T2",
+          status: result.ok ? "ok" : "error",
+          scene: result.scene,
+          severity: result.severity,
+          alert_type: result.alert_type,
+          confidence: result.confidence,
+          reason: result.reason,
+          model: result.tier2_meta?.model ?? null,
+          tookMs: result.tier2_meta?.tookMs ?? null,
+          error: result.ok ? null : result.tier2_meta?.errorDetail ?? "unknown",
+        });
+      } catch (err) {
+        console.error("[agent] scene failed:", err.message);
+        return send(res, 502, { error: "scene_failed", detail: err.message, tier: "T2" });
       }
     }
 

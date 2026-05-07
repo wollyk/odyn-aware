@@ -95,6 +95,22 @@ export const ingestSnapshot = tier0.injectManual;
 export const subscribeAlerts = (signal) => subscribeIterator(TOPIC.ALERT, { signal });
 export const subscribeHealth = (signal) => subscribeIterator(TOPIC.HEALTH, { signal });
 
+/**
+ * Run a cheap local (T2) vision call on a single image. No bus side-effects;
+ * intended for direct API endpoints that want a fast scene description
+ * without paying T3 cloud costs.
+ *
+ * @param {{ imageBuffer: Buffer, camera?: string, model?: string }} opts
+ */
+export async function analyzeImageLocal({ imageBuffer, camera = "", model } = {}) {
+  return tier2.analyzeFreeText({ image: imageBuffer, camera, model });
+}
+
+/** Ollama health probe (model availability + reachability). */
+export async function pingTier2() {
+  return tier2.ping();
+}
+
 // Quota + telemetry — exposed so the API layer can gate calls and observe
 // latency without reaching into the harness internals.
 export { observeLatency, increment, timed } from "./telemetry.mjs";
@@ -117,6 +133,10 @@ export function recordQuota({ tenant = "default", camera = null, kind, dollars =
 
 /**
  * One-shot status snapshot for /api/agent/status.
+ *
+ * NOTE: tier2 ping is async (network probe to Ollama); we expose a sync
+ * snapshot here and provide `statusAsync()` for callers that want the live
+ * Ollama check.
  */
 export function status() {
   return {
@@ -127,6 +147,12 @@ export function status() {
     memory: workingMemory.inspect(),
     tier3: tier3.ping(),
   };
+}
+
+/** Status snapshot including a live Ollama probe (slower; hits the network). */
+export async function statusAsync() {
+  const [t2] = await Promise.all([tier2.ping().catch((err) => ({ ok: false, error: err?.message }))]);
+  return { ...status(), tier2: t2 };
 }
 
 export const HARNESS = { router, tier0, tier1, tier2, tier3, TOPIC };

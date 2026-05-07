@@ -1,16 +1,22 @@
 // Tier 2 — local Vision-Language Model client (Ollama).
 //
 // Talks to an Ollama server (default: http://192.168.0.137:11434) via its
-// /api/chat endpoint. Designed for vision-capable models like:
-//   - llama3.2-vision:11b   (faster, good baseline)
-//   - qwen2.5-vl:7b         (slower, higher accuracy)
+// /api/chat endpoint. Designed for vision-capable models. Empirical findings
+// (verified against the actual deployment, May 2026):
+//
+//   - moondream:latest        ~500ms per call, basic but reliable. DEFAULT.
+//   - llama3.2-vision:latest  ~2-4s, better object naming, no JSON-mode safe.
+//   - qwen3-vl:8b             ~10s, strong but uses thinking-mode tokens that
+//                             eat through num_predict before producing output.
+//
+// IMPORTANT: do NOT use Ollama's `format: "json"` with small models — the
+// grammar-constrained sampling can spin >90s producing nothing. We use
+// free-text generation and parse heuristically. The router (router.mjs) is
+// the binary decision authority anyway, so we just need cheap structured
+// hints from T2.
 //
 // Cost model: $0 marginal (local hardware). Budget is GPU time, not dollars.
-// Latency target: p50 < 2s, p95 < 4s.
-//
-// Output schema: structured DescribedEvent fields. We deliberately don't
-// pattern-match on free-text — the model is asked to return JSON with
-// structured fields severity/alert_type/confidence/reason.
+// Latency target: p50 < 1s, p95 < 2s on warm moondream.
 //
 // Per the design feedback: never trust the model to gate a binary decision
 // alone. T2 outputs feed the router (router.mjs), which is the actual
@@ -20,115 +26,244 @@ import { publish, subscribe } from "./eventbus.mjs";
 import { TOPIC, SEVERITY } from "./types.mjs";
 
 const OLLAMA_BASE = process.env.OLLAMA_BASE ?? "http://192.168.0.137:11434";
-const VLM_MODEL = process.env.OLLAMA_VLM_MODEL ?? "llama3.2-vision:11b";
+const VLM_MODEL = process.env.OLLAMA_VLM_MODEL ?? "moondream:latest";
+const VLM_TIMEOUT_MS = Number(process.env.OLLAMA_VLM_TIMEOUT_MS ?? 8000);
+const VLM_KEEP_ALIVE = process.env.OLLAMA_VLM_KEEP_ALIVE ?? "10m";
 
-const SYSTEM_PROMPT = [
-  "You are a security camera vision analyst. Examine the supplied image and",
-  "respond with a JSON object containing these fields ONLY:",
-  '  "scene":        one short sentence (<= 14 words)',
-  '  "scene_change": boolean — does the scene look meaningfully different from a typical empty view',
-  '  "severity":     one of "normal", "notable", "critical"',
-  '  "alert_type":   short tag (e.g. "person_present", "vehicle_arriving", "unknown_face", "loitering") or null',
-  '  "confidence":   number 0..1 indicating how confident you are in the call',
-  '  "reason":       one short sentence justifying the severity',
-  '  "detections":   array of {"label", "confidence", "bbox": [x,y,w,h]} with normalized 0..1 bboxes',
-  "",
-  "Rules:",
-  "  - 'critical' is reserved for visible weapons, fights, or active break-in attempts.",
-  "  - 'notable' covers unknown people, after-hours activity, or unattended packages.",
-  "  - 'normal' covers known activity, empty scenes, expected vehicles.",
-  "  - Never use markdown fences. Output raw JSON only.",
-].join(" ");
+// Free-text prompt — small models choke on strict JSON. We ask for a single
+// short sentence about what's visible. The downstream parser scans for
+// well-known nouns to derive structured fields.
+const FREE_TEXT_PROMPT =
+  "What is in this security camera frame? " +
+  "Answer in one short sentence (<= 16 words). " +
+  "Mention any people, vehicles, animals, packages, tools, or weapons. " +
+  "If the frame looks empty, say 'empty scene'.";
+
+// Vocabulary buckets used by the heuristic severity parser. Order matters —
+// `weaponWords` is checked first because it dominates everything else.
+const VOCAB = Object.freeze({
+  weapon: ["gun", "pistol", "rifle", "knife", "weapon", "firearm", "blade", "machete"],
+  person: ["person", "people", "man", "woman", "child", "individual", "human", "figure", "intruder", "stranger"],
+  vehicle: ["car", "truck", "vehicle", "van", "suv", "motorcycle", "bike", "bicycle"],
+  package: ["package", "box", "parcel", "bag", "container", "crate"],
+  tool: ["tool", "ladder", "crowbar", "hammer", "wrench"],
+});
+
+// Phrase-level negative patterns. If any of these match we treat the scene
+// as empty, EVEN IF a noun like "people" appears in the negation ("no people
+// visible"). Weapon detection still wins over this — a weapon mention
+// always escalates regardless of negation context, because false negatives
+// on weapons are catastrophic.
+const EMPTY_PHRASES = [
+  /\bno\s+(?:people|one|person|persons|individuals|humans|activity|movement)\b/,
+  /\bempty\s+(?:scene|frame|view|driveway|garage|lot)\b/,
+  /\bnothing\s+(?:visible|happening|notable|in\s+view)\b/,
+  /\bvacant\b/,
+  /\bunoccupied\b/,
+];
+
+/** Lower-cased, whitespace-collapsed copy of `text`. */
+function norm(text) {
+  return String(text || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
 
 /**
- * Describe a snapshot. Returns DescribedEvent fields to be merged into the
- * inbound event.
- *
- * @param {{ event: object, image: Buffer, model?: string }} opts
- * @returns {Promise<object>} merged event with tier2 fields appended
+ * Heuristic parse of free-text into the same structured fields the rest of
+ * the harness expects. Pure (no I/O); cheap; deterministic.
  */
-export async function describe({ event, image, model = VLM_MODEL }) {
-  const t0 = Date.now();
-  const dataUrl = `data:image/jpeg;base64,${image.toString("base64")}`;
-  // Ollama's /api/chat accepts `images: [base64-no-prefix]` for VLMs.
-  const body = {
-    model,
-    stream: false,
-    format: "json",
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `Camera: ${event.cam}. Analyze this frame.`,
-        images: [image.toString("base64")],
-      },
-    ],
-    options: { temperature: 0.1 },
+export function parseFreeTextScene(text) {
+  const t = norm(text);
+  const has = (words) => words.some((w) => t.includes(w));
+
+  const hits = {
+    weapon: has(VOCAB.weapon),
+    person: has(VOCAB.person),
+    vehicle: has(VOCAB.vehicle),
+    package: has(VOCAB.package),
+    tool: has(VOCAB.tool),
+    empty: EMPTY_PHRASES.some((re) => re.test(t)),
   };
 
-  let parsed = {};
-  let status = "ok";
-  let errorDetail = null;
-  try {
-    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      status = "error";
-      errorDetail = `ollama ${res.status}`;
-    } else {
-      const json = await res.json();
-      const content = json?.message?.content ?? "{}";
-      try {
-        parsed = JSON.parse(content);
-      } catch {
-        status = "error";
-        errorDetail = "non_json_reply";
-      }
-    }
-  } catch (err) {
-    status = "error";
-    errorDetail = err?.message ?? "fetch_failed";
-    // dataUrl unused when fetch fails; reference to keep linters happy
-    void dataUrl;
+  let severity = "normal";
+  let alert_type = null;
+  let confidence = 0.55; // baseline confidence for moondream-class output
+  let reason = "no triggers";
+
+  if (hits.weapon) {
+    // Weapons override everything — including negation. False negatives
+    // on weapons are far worse than false positives.
+    severity = "critical";
+    alert_type = "weapon_visible";
+    confidence = 0.7;
+    reason = "weapon noun in scene description";
+  } else if (hits.empty) {
+    // Explicit negation phrase wins over noun matches like "no people".
+    severity = "normal";
+    alert_type = null;
+    confidence = 0.7;
+    reason = "explicit empty scene";
+  } else if (hits.person && hits.tool) {
+    severity = "notable";
+    alert_type = "person_with_tool";
+    confidence = 0.6;
+    reason = "person + tool noun in scene description";
+  } else if (hits.person) {
+    severity = "notable";
+    alert_type = "person_present";
+    confidence = 0.6;
+    reason = "person noun in scene description";
+  } else if (hits.package) {
+    severity = "notable";
+    alert_type = "unattended_package";
+    confidence = 0.55;
+    reason = "package noun in scene description";
+  } else if (hits.vehicle) {
+    severity = "notable";
+    alert_type = "vehicle_present";
+    confidence = 0.55;
+    reason = "vehicle noun in scene description";
   }
 
-  const tookMs = Date.now() - t0;
-
-  const sev = ["normal", "notable", "critical"].includes(parsed.severity)
-    ? parsed.severity
-    : "normal";
-
   return {
-    ...event,
-    scene: typeof parsed.scene === "string" ? parsed.scene : "",
-    scene_change: Boolean(parsed.scene_change),
-    severity: sev,
-    severity_rank: SEVERITY[sev] ?? 0,
-    alert_type: typeof parsed.alert_type === "string" ? parsed.alert_type : null,
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
-    reason: typeof parsed.reason === "string" ? parsed.reason : "",
-    // T2 may also propose detections; we keep them separate from T0/T1 boxes
-    // so each stage's contribution is auditable.
-    tier2_detections: Array.isArray(parsed.detections) ? parsed.detections : [],
-    tier2_meta: { model, tookMs, status, errorDetail },
+    scene: t.slice(0, 240),
+    severity,
+    severity_rank: SEVERITY[severity] ?? 0,
+    alert_type,
+    confidence,
+    reason,
+    hits,
   };
 }
 
 /**
- * Wire T2 into the bus. Subscribes to TOPIC.CLASSIFIED, publishes to
- * TOPIC.DESCRIBED. Skips events the router rejects.
+ * Low-level Ollama chat call. Returns the raw text response and timing info.
+ * Throws on transport error, returns `{ ok:false, error }` on protocol error.
  *
- * Note: this stage requires an `image` lookup function provided by the
- * caller (we pass camera name, the caller resolves to bytes). This avoids
- * the harness needing a hard dependency on frigate.mjs — keeping the
- * decoupling boundary clean.
+ * @param {{ image: Buffer, prompt?: string, model?: string, timeoutMs?: number, fetchImpl?: typeof fetch }} opts
  */
+export async function callOllamaVision({
+  image,
+  prompt = FREE_TEXT_PROMPT,
+  model = VLM_MODEL,
+  timeoutMs = VLM_TIMEOUT_MS,
+  fetchImpl = fetch,
+} = {}) {
+  if (!image || !Buffer.isBuffer(image)) {
+    return { ok: false, error: "missing_image", text: "", tookMs: 0 };
+  }
+  const body = {
+    model,
+    stream: false,
+    keep_alive: VLM_KEEP_ALIVE,
+    messages: [
+      { role: "user", content: prompt, images: [image.toString("base64")] },
+    ],
+    options: { temperature: 0.1, num_predict: 80 },
+  };
+  const t0 = Date.now();
+  try {
+    const res = await fetchImpl(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const tookMs = Date.now() - t0;
+    if (!res.ok) {
+      return { ok: false, error: `ollama_${res.status}`, text: "", tookMs, model };
+    }
+    const json = await res.json();
+    const text = json?.message?.content ?? "";
+    return {
+      ok: true,
+      text,
+      tookMs,
+      model,
+      eval_count: json?.eval_count ?? null,
+      eval_duration_ms: json?.eval_duration ? Math.round(json.eval_duration / 1e6) : null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.name === "TimeoutError" ? "timeout" : err?.message ?? "fetch_failed",
+      text: "",
+      tookMs: Date.now() - t0,
+      model,
+    };
+  }
+}
+
+/**
+ * Public T2 entry point — describe a single image. Combines `callOllamaVision`
+ * with `parseFreeTextScene` to return DescribedEvent-shaped fields.
+ *
+ * @param {{ image: Buffer, camera?: string, model?: string, fetchImpl?: typeof fetch }} opts
+ * @returns {Promise<{ ok:boolean, scene:string, severity:string, severity_rank:number, alert_type:string|null, confidence:number, reason:string, hits:object, raw:string, tier2_meta:object }>}
+ */
+export async function analyzeFreeText({ image, camera = "", model = VLM_MODEL, fetchImpl } = {}) {
+  const call = await callOllamaVision({ image, model, fetchImpl });
+  const tier2_meta = {
+    model: call.model,
+    tookMs: call.tookMs,
+    status: call.ok ? "ok" : "error",
+    errorDetail: call.ok ? null : call.error,
+    eval_count: call.eval_count ?? null,
+    eval_duration_ms: call.eval_duration_ms ?? null,
+    camera: camera || null,
+  };
+  if (!call.ok) {
+    return {
+      ok: false,
+      scene: "",
+      severity: "normal",
+      severity_rank: 0,
+      alert_type: null,
+      confidence: 0,
+      reason: call.error,
+      hits: {},
+      raw: "",
+      tier2_meta,
+    };
+  }
+  const parsed = parseFreeTextScene(call.text);
+  return {
+    ok: true,
+    ...parsed,
+    raw: call.text,
+    tier2_meta,
+  };
+}
+
+/**
+ * Pipeline `describe()` — used by the bus subscriber. Merges into an existing
+ * event. Kept for the harness-internal pipeline path; the API layer now uses
+ * `analyzeFreeText` directly.
+ *
+ * @param {{ event: object, image: Buffer, model?: string }} opts
+ */
+export async function describe({ event, image, model = VLM_MODEL, fetchImpl } = {}) {
+  const out = await analyzeFreeText({ image, camera: event?.cam ?? "", model, fetchImpl });
+  return {
+    ...event,
+    scene: out.scene,
+    scene_change: false, // future: compare against per-camera baseline
+    severity: out.severity,
+    severity_rank: out.severity_rank,
+    alert_type: out.alert_type,
+    confidence: out.confidence,
+    reason: out.reason,
+    tier2_detections: [], // moondream doesn't produce bboxes; leave to T3
+    tier2_meta: out.tier2_meta,
+  };
+}
+
 let started = false;
 let unsubscribe = null;
 
+/**
+ * Wire T2 into the bus. Subscribes to TOPIC.CLASSIFIED, publishes to
+ * TOPIC.DESCRIBED. Skips events the router rejects.
+ */
 export function start({ fetchSnapshot, router } = {}) {
   if (started) return;
   if (typeof fetchSnapshot !== "function") {
@@ -159,6 +294,7 @@ export function stop() {
 
 /**
  * Cheap status reporter — used by /api/agent/status to indicate availability.
+ * Returns whether Ollama is reachable and which models are loaded.
  */
 export async function ping() {
   try {
@@ -166,12 +302,19 @@ export async function ping() {
       method: "GET",
       signal: AbortSignal.timeout(2000),
     });
-    if (!res.ok) return { ok: false, status: res.status };
+    if (!res.ok) return { ok: false, status: res.status, model: VLM_MODEL };
     const json = await res.json();
-    return { ok: true, models: json?.models?.map((m) => m.name) ?? [] };
+    const models = json?.models?.map((m) => m.name) ?? [];
+    return {
+      ok: true,
+      base: OLLAMA_BASE,
+      model: VLM_MODEL,
+      model_available: models.includes(VLM_MODEL),
+      models,
+    };
   } catch (err) {
-    return { ok: false, error: err?.message };
+    return { ok: false, error: err?.message, model: VLM_MODEL };
   }
 }
 
-export const TIER2 = { OLLAMA_BASE, VLM_MODEL };
+export const TIER2 = { OLLAMA_BASE, VLM_MODEL, VLM_TIMEOUT_MS };

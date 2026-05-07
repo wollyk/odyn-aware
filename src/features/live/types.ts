@@ -28,6 +28,27 @@ export type DetectionResult = {
   status: "ok" | "vision_disabled" | "error" | "frigate_not_configured";
   model: string | null;
   tookMs: number;
+  tier?: "T2" | "T3";
+};
+
+/**
+ * Result of a Tier-2 (local Ollama VLM) scene description. Cheap, $0
+ * marginal, no bboxes — just a free-text scene summary plus heuristic
+ * severity. Surfaced alongside the DetectionResult so the operator can see
+ * the local agent's independent reading.
+ */
+export type SceneResult = {
+  camera: string;
+  tier: "T2";
+  status: "ok" | "error" | "frigate_not_configured";
+  scene: string;
+  severity: "normal" | "notable" | "critical";
+  alert_type: string | null;
+  confidence: number;
+  reason: string;
+  model: string | null;
+  tookMs: number | null;
+  error: string | null;
 };
 
 export type AgentStatus = {
