@@ -68,6 +68,17 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
     );
     CREATE INDEX IF NOT EXISTS idx_alert_rules_camera ON alert_rules(camera);
     CREATE INDEX IF NOT EXISTS idx_alert_rules_status ON alert_rules(status);
+
+    -- Stale-while-revalidate cache used by the resilience layer.
+    -- Survives server restarts so the API can serve last-known-good data even
+    -- when the upstream (Frigate, Ollama, etc.) has never come up this boot.
+    -- Caller decides what counts as "stale" via fresh_at.
+    CREATE TABLE IF NOT EXISTS kv_cache (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,                                    -- JSON
+      fresh_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      stale_at   TEXT                                              -- optional hard expiry
+    );
   `);
   return db;
 }
@@ -205,4 +216,43 @@ export function listAlertRules(db, { camera, status } = {}) {
   }
   const sql = `SELECT * FROM alert_rules ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY id DESC`;
   return db.prepare(sql).all(params);
+}
+
+// kv_cache helpers (stale-while-revalidate persistence) ----------------------
+//
+// Usage:
+//   kvSet(db, "frigate:cameras", { cameras: [...] });
+//   const hit = kvGet(db, "frigate:cameras");
+//   // hit = { value, fresh_at: ISO, stale_at: ISO|null, age_ms }
+//
+// Callers decide what counts as fresh vs stale based on their own TTL.
+
+export function kvSet(db, key, value, { stale_at = null } = {}) {
+  const json = JSON.stringify(value);
+  db.prepare(
+    `INSERT INTO kv_cache (key, value, fresh_at, stale_at)
+     VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       fresh_at = excluded.fresh_at,
+       stale_at = excluded.stale_at`,
+  ).run(key, json, stale_at);
+  return { key, fresh_at: new Date().toISOString(), stale_at };
+}
+
+export function kvGet(db, key) {
+  const row = db.prepare(`SELECT value, fresh_at, stale_at FROM kv_cache WHERE key = ?`).get(key);
+  if (!row) return null;
+  let value;
+  try {
+    value = JSON.parse(row.value);
+  } catch {
+    return null;
+  }
+  const age_ms = Date.now() - new Date(row.fresh_at).getTime();
+  return { value, fresh_at: row.fresh_at, stale_at: row.stale_at, age_ms };
+}
+
+export function kvDelete(db, key) {
+  db.prepare(`DELETE FROM kv_cache WHERE key = ?`).run(key);
 }

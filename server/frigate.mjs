@@ -154,18 +154,49 @@ export async function getProfile() {
   return JSON.parse(res.body.toString("utf8"));
 }
 
-async function getRawConfig() {
+// Stale-while-revalidate config fetch.
+//
+// Behavior:
+//   - If we have a cache hit younger than CONFIG_TTL_MS, serve it (fast, fresh).
+//   - Otherwise try a live fetch from Frigate.
+//   - If the live fetch FAILS but we have ANY prior cached value, return that
+//     cached value rather than throwing. The caller can decide what to do with
+//     "old data".
+//   - Only if we have no cache AND the fetch fails do we propagate the error.
+//
+// This is the resilience contract: once we've ever successfully read Frigate's
+// config, our /api/cam/cameras endpoint will keep working through restart
+// loops, network blips, and Frigate auth failures.
+const CONFIG_TTL_MS = 5 * 60 * 1000;
+
+async function getRawConfig({ allowStale = true } = {}) {
   const now = Date.now();
-  if (cachedConfig && now - cachedConfigAt < 5 * 60 * 1000) return cachedConfig;
-  const res = await frigateFetch(`/api/config`);
-  if (res.status !== 200) throw new Error(`frigate config failed: ${res.status}`);
-  cachedConfig = JSON.parse(res.body.toString("utf8"));
-  cachedConfigAt = now;
-  return cachedConfig;
+  if (cachedConfig && now - cachedConfigAt < CONFIG_TTL_MS) return cachedConfig;
+  try {
+    const res = await frigateFetch(`/api/config`);
+    if (res.status !== 200) throw new Error(`frigate config failed: ${res.status}`);
+    cachedConfig = JSON.parse(res.body.toString("utf8"));
+    cachedConfigAt = now;
+    return cachedConfig;
+  } catch (err) {
+    if (allowStale && cachedConfig) {
+      // Frigate is unhappy but we have prior data. Serve it.
+      return cachedConfig;
+    }
+    throw err;
+  }
 }
 
-export async function listCameras() {
-  const cfg = await getRawConfig();
+// Returns { cameras, freshness, fetched_at }
+//
+//   freshness: "fresh" (live this call), "stale-mem" (in-process cache hit),
+//              or "stale-from-disk" (caller hydrated us from kv_cache earlier).
+//
+// The disk-fallback path is owned by the caller (api.mjs), which sees an
+// exception from this function and consults kvGet("frigate:cameras"). We do
+// it that way to keep frigate.mjs free of any DB dependency — important
+// for the "decouple later" goal.
+function shapeCameras(cfg) {
   const cams = cfg.cameras ?? {};
   return Object.entries(cams).map(([name, c]) => {
     const detect = c.detect ?? {};
@@ -181,6 +212,49 @@ export async function listCameras() {
       zones: Object.keys(c.zones ?? {}),
     };
   });
+}
+
+export async function listCameras() {
+  const cfg = await getRawConfig();
+  return shapeCameras(cfg);
+}
+
+// listCamerasWithFreshness() distinguishes "live result" from "served from
+// stale memory cache". Use this in the API layer so the frontend can show
+// a soft staleness indicator without ever blanking the dropdown.
+export async function listCamerasWithFreshness() {
+  const beforeAt = cachedConfigAt;
+  let cfg;
+  try {
+    cfg = await getRawConfig();
+  } catch (err) {
+    // No cache, no live: caller is responsible for disk fallback.
+    throw err;
+  }
+  const freshness = cachedConfigAt === beforeAt ? "stale-mem" : "fresh";
+  return {
+    cameras: shapeCameras(cfg),
+    freshness,
+    fetched_at: new Date(cachedConfigAt || Date.now()).toISOString(),
+  };
+}
+
+// Hydrate the in-process cache from a previously persisted snapshot (e.g.
+// SQLite kv_cache). Lets the API serve cameras immediately on cold boot even
+// if Frigate hasn't come up yet.
+export function hydrateConfigCache(cfg) {
+  if (!cfg || typeof cfg !== "object") return false;
+  cachedConfig = cfg;
+  // We hydrate as "ancient" so the next call still tries a live fetch, but
+  // we'll fall back to this cache if that fetch fails.
+  cachedConfigAt = 1;
+  return true;
+}
+
+// Snapshot accessor for the API layer to persist to kv_cache after a fresh
+// live fetch. Returns null if we've never seen a config.
+export function getCachedRawConfig() {
+  return cachedConfig;
 }
 
 // Convenience: invalidate the config cache (use after rename or future config edits).

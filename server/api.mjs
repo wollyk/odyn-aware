@@ -20,6 +20,8 @@ import {
   getUserByEmail,
   listCamLabels,
   getCamLabel,
+  kvGet,
+  kvSet,
 } from "./db.mjs";
 import {
   verifyPassword,
@@ -34,6 +36,7 @@ import {
 } from "./auth.mjs";
 import * as frigate from "./frigate.mjs";
 import { streamChatGpt, analyzeImage, isChatConfigured } from "./agent.mjs";
+import * as harness from "./harness/index.mjs";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -57,6 +60,32 @@ const loginSchema = z.object({
 });
 
 const db = openDb();
+
+// Resilience: hydrate the in-process Frigate config cache from kv_cache on
+// boot, so /api/cam/cameras serves last-known-good immediately even if Frigate
+// is mid-restart at startup.
+const KV_FRIGATE_CONFIG = "frigate:rawConfig";
+try {
+  const persisted = kvGet(db, KV_FRIGATE_CONFIG);
+  if (persisted?.value && frigate.hydrateConfigCache) {
+    frigate.hydrateConfigCache(persisted.value);
+    console.log(`[boot] hydrated frigate config cache from kv_cache (age=${Math.round(persisted.age_ms / 1000)}s)`);
+  }
+} catch (err) {
+  console.warn("[boot] failed to hydrate frigate cache:", err.message);
+}
+
+// Boot the agent harness (event bus + tier wiring + health probes).
+// This is the ONLY place api.mjs reaches into server/harness/* — all further
+// interaction goes through the surface defined in harness/index.mjs. Keeping
+// this boundary tight is what makes the harness extractable to a separate
+// process/repo later without touching api.mjs again.
+try {
+  harness.start({ db, frigate });
+  console.log("[boot] agent harness started");
+} catch (err) {
+  console.warn("[boot] harness start failed (non-fatal):", err.message);
+}
 
 function clientIp(req) {
   return (req.headers["x-forwarded-for"]?.toString().split(",")[0].trim()) || req.socket.remoteAddress || "";
@@ -211,18 +240,58 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- Cameras (admin-gated proxy to Frigate) ------------------------
+    //
+    // Resilience contract:
+    //   1. Try a live fetch from Frigate.
+    //   2. If that fails but we have an in-process cache, serve cached + freshness="stale-mem".
+    //   3. If the in-process cache is empty too, fall back to kv_cache on disk.
+    //   4. Only return 502 if we have NEVER seen a Frigate config (cold + Frigate down).
+    //
+    // On every successful live fetch, persist the raw config to kv_cache so a
+    // future cold boot can serve last-known-good before Frigate is reachable.
     if (req.method === "GET" && url.pathname === "/api/cam/cameras") {
       const me = getCurrentUser(db, req);
       if (!me) return send(res, 401, { error: "unauthenticated" });
       if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
       if (!frigate.isConfigured()) {
-        return send(res, 200, { configured: false, cameras: [] });
+        return send(res, 200, { configured: false, cameras: [], freshness: "n/a" });
       }
       try {
-        const cameras = await frigate.listCameras();
-        return send(res, 200, { configured: true, cameras });
+        const result = await frigate.listCamerasWithFreshness();
+        // Persist raw cache on fresh fetches so cold-boot has data.
+        if (result.freshness === "fresh" && frigate.getCachedRawConfig) {
+          const raw = frigate.getCachedRawConfig();
+          if (raw) {
+            try { kvSet(db, KV_FRIGATE_CONFIG, raw); } catch { /* non-fatal */ }
+          }
+        }
+        return send(res, 200, {
+          configured: true,
+          cameras: result.cameras,
+          freshness: result.freshness,
+          fetched_at: result.fetched_at,
+        });
       } catch (err) {
-        console.error("[cam] listCameras failed:", err.message);
+        // Live + in-process cache both unavailable. Try disk fallback.
+        const persisted = kvGet(db, KV_FRIGATE_CONFIG);
+        if (persisted?.value?.cameras) {
+          // Re-shape from raw config using frigate.mjs's own logic by
+          // hydrating + retrying once.
+          frigate.hydrateConfigCache(persisted.value);
+          try {
+            const result = await frigate.listCamerasWithFreshness();
+            return send(res, 200, {
+              configured: true,
+              cameras: result.cameras,
+              freshness: "stale-from-disk",
+              fetched_at: persisted.fresh_at,
+              age_ms: persisted.age_ms,
+            });
+          } catch {
+            // fall through to 502
+          }
+        }
+        console.error("[cam] listCameras failed (no cache):", err.message);
         return send(res, 502, { error: "frigate_unreachable", detail: err.message });
       }
     }
@@ -284,10 +353,52 @@ const server = http.createServer(async (req, res) => {
       const me = getCurrentUser(db, req);
       if (!me) return send(res, 401, { error: "unauthenticated" });
       if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      // Augment with harness diagnostics: bus subscribers, telemetry, quotas,
+      // tier3 readiness. The harness internals are still hidden — what we
+      // expose is exactly what the index.mjs facade chooses to publish.
+      let harness_status = null;
+      try { harness_status = harness.status(); } catch { /* harness optional */ }
       return send(res, 200, {
         chat_configured: isChatConfigured(),
         frigate_configured: frigate.isConfigured(),
+        harness: harness_status,
       });
+    }
+
+    // SSE health channel — backed by the harness's TOPIC.HEALTH stream.
+    // Wire format: each `data: {...}` line is a JSON snapshot from the
+    // 60-second probe (Frigate reachability, Ollama reachability). The
+    // frontend can use this to softly indicate stream-source health without
+    // needing a "reconnect now" button.
+    //
+    // Cost: 0. Probes are local-only and cheap. Per the design rule, any
+    // narrative summarization on top is routed through the LOCAL Gemma model
+    // (server/harness/health.mjs::summarize), never GPT.
+    if (req.method === "GET" && url.pathname === "/api/health/cameras") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no", // disable nginx buffering for SSE
+      });
+      res.write(`: ok\n\n`); // keep-alive comment so the connection opens immediately
+      const ac = new AbortController();
+      req.on("close", () => ac.abort());
+      (async () => {
+        try {
+          for await (const ev of harness.subscribeHealth(ac.signal)) {
+            res.write(`data: ${JSON.stringify(ev)}\n\n`);
+          }
+        } catch {
+          // swallow — connection close is normal
+        } finally {
+          try { res.end(); } catch { /* ignore */ }
+        }
+      })();
+      return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/agent/detections") {
