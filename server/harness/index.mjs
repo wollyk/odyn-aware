@@ -219,11 +219,15 @@ export async function analyzeImageRouted({
   }
 
   // Step 4: assemble the unified response.
-  const cacheAfter = _getCachedT3(camera, _now);
+  // Re-read cache with the *current* timestamp (the t3 call may have just
+  // finished, mutating the cache; using `_now` from start-of-call yields
+  // negative ages on the live-T3 tick).
+  const responseNow = Date.now();
+  const cacheAfter = _getCachedT3(camera, responseNow);
   const detections = t3Live?.detections ?? cacheAfter?.detections ?? [];
   const summary = t3Live?.summary ?? cacheAfter?.summary ?? (t2Result?.scene ?? "");
   const t3Model = t3Live?.model ?? cacheAfter?.model ?? null;
-  const t3AgeMs = cacheAfter ? _now - cacheAfter.ts : null;
+  const t3AgeMs = cacheAfter ? Math.max(0, responseNow - cacheAfter.ts) : null;
 
   let tier;
   let source;
