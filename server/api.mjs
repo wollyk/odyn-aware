@@ -24,6 +24,12 @@ import {
   kvSet,
   listEvents,
   getEventTimeline,
+  createPerson,
+  findPersonByName,
+  listPeople,
+  archivePerson,
+  insertFaceEmbedding,
+  listRecentFaceMatches,
 } from "./db.mjs";
 import {
   verifyPassword,
@@ -445,6 +451,210 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { event_id, timeline });
       } catch (err) {
         return send(res, 500, { error: "timeline_failed", detail: err.message });
+      }
+    }
+
+    // ---- Phase 4: Face DB endpoints ---------------------------------------
+    //
+    // Auth: all face endpoints require an admin session. Faces are PII —
+    // even a list of names without photos is a security-relevant surface.
+    //
+    // Storage policy (matches the design doc): we keep the embedding in
+    // SQLite by default and DROP the original photo. This is the
+    // privacy-default. If we later add an "enable photo retention" flag we
+    // can plumb it through here without touching the embedder.
+
+    // List known people (active, with embedding counts).
+    if (req.method === "GET" && url.pathname === "/api/agent/faces/people") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      try {
+        const status = url.searchParams.get("status") === "archived" ? "archived" : "active";
+        const rows = listPeople(db, { status });
+        return send(res, 200, { rows, count: rows.length });
+      } catch (err) {
+        return send(res, 500, { error: "list_failed", detail: err.message });
+      }
+    }
+
+    // Soft-delete (archive) a known person. Embeddings cascade; face_matches
+    // keep their person_id NULL'd so audit history survives.
+    if (req.method === "DELETE" && url.pathname.startsWith("/api/agent/faces/people/")) {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const id = Number(url.pathname.slice("/api/agent/faces/people/".length));
+      if (!Number.isInteger(id) || id <= 0) return send(res, 400, { error: "invalid_id" });
+      try {
+        const r = archivePerson(db, id);
+        harness.invalidateFaceCache();
+        return send(res, 200, { ok: true, archived: r.changes });
+      } catch (err) {
+        return send(res, 500, { error: "archive_failed", detail: err.message });
+      }
+    }
+
+    // Enroll a new face. Body: { name, notes?, image_base64, source_camera? }.
+    // The base64 ceiling here is ~10MB, comfortably above any phone-grade JPEG.
+    if (req.method === "POST" && url.pathname === "/api/agent/faces/enroll") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+
+      let body;
+      try {
+        body = await readJson(req, 10 * 1024 * 1024);
+      } catch (err) {
+        return send(res, 400, { error: "bad_body", detail: err.message });
+      }
+      const enrollSchema = z.object({
+        name: z.string().trim().min(1).max(100),
+        notes: z.string().trim().max(500).optional(),
+        image_base64: z.string().min(64),
+        source_camera: z.string().optional(),
+      });
+      const parsed = enrollSchema.safeParse(body);
+      if (!parsed.success) {
+        return send(res, 400, { error: "invalid_input", detail: parsed.error.issues });
+      }
+      const { name, notes, image_base64 } = parsed.data;
+
+      let imageBuffer;
+      try {
+        // Tolerate "data:image/jpeg;base64," prefix from frontend FileReader.
+        const stripped = image_base64.replace(/^data:image\/[^;]+;base64,/, "");
+        imageBuffer = Buffer.from(stripped, "base64");
+        if (imageBuffer.length < 200) throw new Error("decoded image too small");
+      } catch (err) {
+        return send(res, 400, { error: "bad_image", detail: err.message });
+      }
+
+      let embedded;
+      try {
+        embedded = await harness.recognizeFaces({
+          imageBuffer,
+          camera: parsed.data.source_camera ?? "",
+          recordMatch: false, // enrollment isn't a "match event"
+        });
+      } catch (err) {
+        return send(res, 502, { error: "embedder_unreachable", detail: err.message });
+      }
+      if (!embedded?.faces?.length) {
+        return send(res, 422, {
+          error: "no_face_detected",
+          known_count: embedded?.known_count ?? 0,
+        });
+      }
+      // Use the highest-quality face. Multi-face enrollment frames are an
+      // operator error — we surface the best one and tell them.
+      const sorted = [...embedded.faces].sort((a, b) => b.quality - a.quality);
+      const best = sorted[0];
+      if (best.quality < 0.4) {
+        return send(res, 422, {
+          error: "face_too_low_quality",
+          quality: best.quality,
+          hint: "Re-shoot with better light, ~1m from camera, looking forward.",
+        });
+      }
+
+      // Get-or-create the person. Adds another embedding if name already exists.
+      let person = findPersonByName(db, { name });
+      if (!person) {
+        person = createPerson(db, { name, notes: notes ?? null, created_by: me.user_id });
+      }
+
+      // Re-embed via the sidecar to get the raw 512-d vector (recognize()
+      // already has it, but we don't expose it on its return shape).
+      // Pull it from the embedder directly to keep storage exact.
+      let rawEmbed;
+      try {
+        rawEmbed = await harness.embedFace({ imageBuffer });
+      } catch (err) {
+        return send(res, 502, { error: "embedder_unreachable_on_store", detail: err.message });
+      }
+      const bestRaw = rawEmbed?.faces?.length
+        ? [...rawEmbed.faces].sort((a, b) => b.quality - a.quality)[0]
+        : null;
+      if (!bestRaw) {
+        return send(res, 500, { error: "embedder_inconsistent", detail: "second-pass embed returned no face" });
+      }
+
+      const embedding = Float32Array.from(bestRaw.embedding);
+      const embedding_id = insertFaceEmbedding(db, {
+        person_id: person.id,
+        model: harness.FACE_CONFIG.model_tag,
+        vec: embedding,
+        quality: bestRaw.quality,
+        source: "enrollment",
+        photo_path: null,
+        created_by: me.user_id,
+      });
+      harness.invalidateFaceCache();
+
+      return send(res, 200, {
+        ok: true,
+        person: {
+          id: person.id,
+          name: person.name,
+          notes: person.notes,
+        },
+        embedding: {
+          id: embedding_id,
+          quality: bestRaw.quality,
+          vec_dim: embedding.length,
+          model: harness.FACE_CONFIG.model_tag,
+        },
+        face_count_in_frame: embedded.faces.length,
+      });
+    }
+
+    // Run recognition against a live snapshot — operator's "test recognition"
+    // button. Doesn't write to face_matches by default so it doesn't pollute
+    // history (caller can pass record=true).
+    if (req.method === "POST" && url.pathname === "/api/agent/faces/recognize-now") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      let body;
+      try { body = await readJson(req); } catch (err) { return send(res, 400, { error: "bad_body", detail: err.message }); }
+      const camera = String(body?.camera ?? "").trim();
+      if (!camera) return send(res, 400, { error: "camera_required" });
+      let snap;
+      try {
+        snap = await frigate.getSnapshot(camera, { height: 720 });
+      } catch (err) {
+        return send(res, 502, { error: "snapshot_failed", detail: err.message });
+      }
+      try {
+        const r = await harness.recognizeFaces({
+          imageBuffer: snap.body,
+          camera,
+          recordMatch: Boolean(body?.record),
+        });
+        return send(res, 200, r);
+      } catch (err) {
+        return send(res, 502, { error: "embedder_unreachable", detail: err.message });
+      }
+    }
+
+    // Recent face_matches log (for chat tool + admin UI).
+    if (req.method === "GET" && url.pathname === "/api/agent/faces/matches") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const camera = url.searchParams.get("camera") || null;
+      const personRaw = url.searchParams.get("person_id");
+      const person_id =
+        personRaw === "unknown" ? "unknown" :
+        personRaw ? Number(personRaw) :
+        null;
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 500);
+      try {
+        const rows = listRecentFaceMatches(db, { camera, person_id, limit });
+        return send(res, 200, { rows, count: rows.length });
+      } catch (err) {
+        return send(res, 500, { error: "matches_failed", detail: err.message });
       }
     }
 

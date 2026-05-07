@@ -30,6 +30,8 @@ import {
   listCamLabels,
   insertAlertRule,
   listEvents as listHarnessEvents,
+  listPeople,
+  listRecentFaceMatches,
 } from "./db.mjs";
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY ?? "";
@@ -127,6 +129,47 @@ const TOOLS = [
         "telemetry latencies, and the Tier-0 ingestor's view of Frigate. Useful " +
         "for answering 'how expensive is this running' and 'is the system healthy'.",
       parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_known_people",
+      description:
+        "List the people who have been enrolled in the face DB for this " +
+        "tenant. Returns names, embedding counts, and last-enrolled times. " +
+        "Does NOT include photos or embeddings (PII-safe). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: { type: "string", enum: ["active", "archived"], default: "active" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_face_matches_recent",
+      description:
+        "Return recent face-match log entries (every face the recognizer " +
+        "has scored over the last polling window). Filters by camera and " +
+        "by person; pass person_id='unknown' to find only unrecognized " +
+        "faces. Useful for 'has anyone been at the front door today' / " +
+        "'show me unknown people seen this morning'. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          camera: { type: "string" },
+          person_id: {
+            description: "Numeric id of a known person, OR the literal string 'unknown'",
+            oneOf: [{ type: "integer" }, { type: "string", enum: ["unknown"] }],
+          },
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+        },
+        required: [],
+      },
     },
   },
   {
@@ -313,6 +356,49 @@ async function runTool(name, args, ctx) {
         tier0: s.tier0,
         quota_cameras: cameraQuotas,
         latencies: s.telemetry?.latencies ?? {},
+      };
+    }
+    if (name === "list_known_people") {
+      const status = args?.status === "archived" ? "archived" : "active";
+      const rows = listPeople(ctx.db, { status });
+      return {
+        ok: true,
+        count: rows.length,
+        people: rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          notes: r.notes,
+          embedding_count: r.embedding_count,
+          last_embedded_at: r.last_embedded_at,
+          status: r.status,
+          created_at: r.created_at,
+        })),
+      };
+    }
+    if (name === "get_face_matches_recent") {
+      const camera = args?.camera || null;
+      const personRaw = args?.person_id;
+      const person_id =
+        personRaw === "unknown" ? "unknown" :
+        Number.isInteger(personRaw) ? personRaw :
+        null;
+      const limit = Math.min(Math.max(Number(args?.limit ?? 25), 1), 100);
+      const rows = listRecentFaceMatches(ctx.db, { camera, person_id, limit });
+      return {
+        ok: true,
+        count: rows.length,
+        // Trim heavy fields (bbox JSON) — chat doesn't usually need pixel coords.
+        matches: rows.map((r) => ({
+          id: r.id,
+          created_at: r.created_at,
+          camera: r.camera,
+          person_id: r.person_id,
+          person_name: r.person_name ?? "(unknown)",
+          similarity: Number(r.similarity?.toFixed?.(3) ?? r.similarity),
+          quality: r.quality,
+          model: r.model,
+          event_id: r.event_id,
+        })),
       };
     }
     if (name === "propose_alert_rule") {

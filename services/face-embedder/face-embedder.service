@@ -1,0 +1,40 @@
+[Unit]
+Description=AuroraView face embedder (InsightFace buffalo_l)
+After=network.target
+# Don't take the api server down with us — they're independent.
+Wants=odyn-api.service
+
+[Service]
+Type=simple
+User=kamal
+Group=kamal
+WorkingDirectory=/var/www/odyn-aware/current/services/face-embedder
+Environment=FACE_EMBEDDER_HOST=127.0.0.1
+Environment=FACE_EMBEDDER_PORT=8765
+# InsightFace caches its model pack under ~/.insightface — make sure this
+# dir is writable and persists across restarts so we don't redownload 256MB.
+Environment=HOME=/var/lib/auroraview-face-embedder
+ExecStart=/var/www/odyn-aware/current/services/face-embedder/.venv/bin/uvicorn app:api --host 127.0.0.1 --port 8765 --log-level info
+Restart=on-failure
+RestartSec=5
+# Generous startup timeout: first-ever boot downloads the model pack
+# (~256MB), which can take a minute on a slow link.
+TimeoutStartSec=180
+# Graceful stop: SIGTERM, then SIGKILL after 15s. Uvicorn drains in <1s.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Security hardening — sidecar is a single-purpose HTTP service, no need
+# for any privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auroraview-face-embedder
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

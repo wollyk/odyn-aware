@@ -118,6 +118,71 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
     );
     CREATE INDEX IF NOT EXISTS idx_quota_tenant_kind_ts ON quota_ledger(tenant_id, kind, ts);
     CREATE INDEX IF NOT EXISTS idx_quota_camera_kind_ts ON quota_ledger(tenant_id, camera, kind, ts);
+
+    -- Phase 4: Face recognition.
+    --
+    -- people: one row per known person an operator has enrolled.
+    --   - tenant_id scopes per-deployment so a future multi-tenant world doesn't
+    --     leak identities across customers.
+    --   - status='active'|'archived' lets us soft-delete without losing audit.
+    --
+    -- face_embeddings: many embeddings per person (one per enrollment photo).
+    --   - vec_dim + vec_blob: embedding stored as raw float32 little-endian.
+    --     We keep dim explicit so we can swap embedder models in the future
+    --     without misreading old vectors.
+    --   - source: 'enrollment' (operator uploaded) | 'auto' (captured from a
+    --     confirmed match later, used for continuous training).
+    --   - quality: 0..1, used to weight match confidence and to prune low-quality
+    --     captures.
+    --   - photo_path: optional disk path to the original JPEG. NULL means we
+    --     stored only the embedding (privacy-default).
+    --
+    -- face_matches: per-snapshot recognition log. Used by the chat tool
+    -- get_face_matches_recent and by the unknown-face escalation path.
+    CREATE TABLE IF NOT EXISTS people (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id       TEXT NOT NULL DEFAULT 'default',
+      name            TEXT NOT NULL,
+      notes           TEXT,
+      status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      created_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_people_tenant_status ON people(tenant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_people_name ON people(name);
+
+    CREATE TABLE IF NOT EXISTS face_embeddings (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      person_id       INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      tenant_id       TEXT NOT NULL DEFAULT 'default',
+      model           TEXT NOT NULL,                       -- e.g. 'insightface-buffalo_l-512'
+      vec_dim         INTEGER NOT NULL,                    -- 512 for ArcFace; future-proof
+      vec_blob        BLOB NOT NULL,                       -- float32 LE, vec_dim * 4 bytes
+      quality         REAL NOT NULL DEFAULT 1.0,           -- 0..1, embedder-reported det/quality score
+      source          TEXT NOT NULL DEFAULT 'enrollment' CHECK (source IN ('enrollment','auto')),
+      photo_path      TEXT,                                -- optional, NULL when privacy-default
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      created_by      INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_face_emb_person ON face_embeddings(person_id);
+    CREATE INDEX IF NOT EXISTS idx_face_emb_tenant_model ON face_embeddings(tenant_id, model);
+
+    CREATE TABLE IF NOT EXISTS face_matches (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id       TEXT NOT NULL DEFAULT 'default',
+      camera          TEXT NOT NULL,
+      event_id        TEXT,                                -- optional link into events table
+      person_id       INTEGER REFERENCES people(id) ON DELETE SET NULL,  -- NULL = unknown face
+      similarity      REAL NOT NULL,                       -- best cosine similarity 0..1
+      bbox_json       TEXT,                                -- {x,y,w,h} normalized
+      quality         REAL,                                -- detector quality of the live face
+      model           TEXT NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_face_matches_camera_created ON face_matches(camera, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_face_matches_person ON face_matches(person_id);
+    CREATE INDEX IF NOT EXISTS idx_face_matches_event ON face_matches(event_id);
   `);
   return db;
 }
@@ -452,4 +517,221 @@ export function countQuota(db, { tenant_id, camera, kind, scope, since_ms }) {
 /** Drop ledger rows older than the cutoff. */
 export function pruneQuota(db, older_than_ms) {
   return db.prepare(`DELETE FROM quota_ledger WHERE ts < ?`).run(older_than_ms);
+}
+
+// Face DB helpers ------------------------------------------------------------
+//
+// Embeddings are stored as raw float32 little-endian. We don't use SQLite
+// vector extensions because (a) better-sqlite3 ships without them and (b)
+// we expect to support O(100) people per tenant where a full table scan
+// against an in-memory matrix is faster than any index trickery.
+
+/** Insert a new known person, return the inserted row. */
+export function createPerson(db, { tenant_id = "default", name, notes = null, created_by = null } = {}) {
+  if (!name || typeof name !== "string") throw new Error("name required");
+  const info = db
+    .prepare(
+      `INSERT INTO people (tenant_id, name, notes, created_by)
+       VALUES (@tenant_id, @name, @notes, @created_by)`,
+    )
+    .run({ tenant_id, name: name.trim(), notes, created_by });
+  return getPerson(db, info.lastInsertRowid);
+}
+
+export function getPerson(db, id) {
+  return db.prepare(`SELECT * FROM people WHERE id = ?`).get(id);
+}
+
+export function findPersonByName(db, { tenant_id = "default", name } = {}) {
+  return db
+    .prepare(`SELECT * FROM people WHERE tenant_id = ? AND name = ? COLLATE NOCASE`)
+    .get(tenant_id, name);
+}
+
+export function listPeople(db, { tenant_id = "default", status = "active", limit = 200 } = {}) {
+  return db
+    .prepare(
+      `SELECT p.*,
+              (SELECT COUNT(*) FROM face_embeddings fe WHERE fe.person_id = p.id) AS embedding_count,
+              (SELECT MAX(created_at) FROM face_embeddings fe WHERE fe.person_id = p.id) AS last_embedded_at
+         FROM people p
+        WHERE p.tenant_id = ? AND p.status = ?
+        ORDER BY p.name COLLATE NOCASE ASC
+        LIMIT ?`,
+    )
+    .all(tenant_id, status, Math.min(Math.max(Number(limit) || 200, 1), 1000));
+}
+
+export function archivePerson(db, id) {
+  return db
+    .prepare(
+      `UPDATE people
+          SET status = 'archived',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`,
+    )
+    .run(id);
+}
+
+export function deletePerson(db, id) {
+  // Cascades to face_embeddings via FK; face_matches.person_id is SET NULL.
+  return db.prepare(`DELETE FROM people WHERE id = ?`).run(id);
+}
+
+/**
+ * Convert a Float32Array (or number[]) into a Buffer for SQLite blob storage.
+ * Vector storage format: little-endian float32, vec_dim * 4 bytes total.
+ */
+export function vecToBlob(vec) {
+  if (vec instanceof Buffer) return vec;
+  const arr = vec instanceof Float32Array ? vec : Float32Array.from(vec);
+  return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+
+/** Inverse of vecToBlob — reconstruct a Float32Array view over a stored blob. */
+export function blobToVec(blob) {
+  if (!blob) return new Float32Array(0);
+  // Copy out so the returned Float32Array isn't tied to SQLite's internal buffer.
+  const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob);
+  const out = new Float32Array(buf.byteLength / 4);
+  for (let i = 0; i < out.length; i++) out[i] = buf.readFloatLE(i * 4);
+  return out;
+}
+
+export function insertFaceEmbedding(
+  db,
+  {
+    person_id,
+    tenant_id = "default",
+    model,
+    vec,
+    quality = 1.0,
+    source = "enrollment",
+    photo_path = null,
+    created_by = null,
+  } = {},
+) {
+  if (!person_id || !model || !vec) throw new Error("person_id, model, vec required");
+  const blob = vecToBlob(vec);
+  const dim = blob.byteLength / 4;
+  const info = db
+    .prepare(
+      `INSERT INTO face_embeddings
+            (person_id, tenant_id, model, vec_dim, vec_blob, quality, source, photo_path, created_by)
+       VALUES (@person_id, @tenant_id, @model, @vec_dim, @vec_blob, @quality, @source, @photo_path, @created_by)`,
+    )
+    .run({
+      person_id,
+      tenant_id,
+      model,
+      vec_dim: dim,
+      vec_blob: blob,
+      quality,
+      source,
+      photo_path,
+      created_by,
+    });
+  return info.lastInsertRowid;
+}
+
+export function deleteFaceEmbedding(db, id) {
+  return db.prepare(`DELETE FROM face_embeddings WHERE id = ?`).run(id);
+}
+
+/**
+ * Load every embedding for the given tenant + model into memory. The
+ * recognizer expects to do an in-memory cosine-similarity scan because we
+ * intentionally keep the people table small (O(100) per tenant).
+ *
+ * Returns rows shaped { id, person_id, person_name, quality, vec: Float32Array }.
+ */
+export function loadEmbeddingsForRecognition(db, { tenant_id = "default", model } = {}) {
+  const rows = db
+    .prepare(
+      `SELECT fe.id        AS embedding_id,
+              fe.person_id  AS person_id,
+              fe.vec_dim    AS vec_dim,
+              fe.vec_blob   AS vec_blob,
+              fe.quality    AS quality,
+              p.name        AS person_name
+         FROM face_embeddings fe
+         JOIN people p ON p.id = fe.person_id
+        WHERE fe.tenant_id = ? AND fe.model = ? AND p.status = 'active'`,
+    )
+    .all(tenant_id, model);
+  return rows.map((r) => ({
+    embedding_id: r.embedding_id,
+    person_id: r.person_id,
+    person_name: r.person_name,
+    quality: r.quality,
+    vec: blobToVec(r.vec_blob),
+  }));
+}
+
+export function recordFaceMatch(
+  db,
+  {
+    tenant_id = "default",
+    camera,
+    event_id = null,
+    person_id = null,        // NULL = unknown face
+    similarity,
+    bbox = null,
+    quality = null,
+    model,
+  } = {},
+) {
+  return db
+    .prepare(
+      `INSERT INTO face_matches
+              (tenant_id, camera, event_id, person_id, similarity, bbox_json, quality, model)
+       VALUES (@tenant_id, @camera, @event_id, @person_id, @similarity, @bbox_json, @quality, @model)`,
+    )
+    .run({
+      tenant_id,
+      camera,
+      event_id,
+      person_id,
+      similarity,
+      bbox_json: bbox ? JSON.stringify(bbox) : null,
+      quality,
+      model,
+    });
+}
+
+export function listRecentFaceMatches(
+  db,
+  { tenant_id = "default", camera = null, person_id = null, since_ms = null, limit = 50 } = {},
+) {
+  const where = ["fm.tenant_id = @tenant_id"];
+  const params = { tenant_id };
+  if (camera) {
+    where.push("fm.camera = @camera");
+    params.camera = camera;
+  }
+  if (person_id !== null && person_id !== undefined) {
+    if (person_id === "unknown") {
+      where.push("fm.person_id IS NULL");
+    } else {
+      where.push("fm.person_id = @person_id");
+      params.person_id = Number(person_id);
+    }
+  }
+  if (since_ms) {
+    where.push("fm.created_at >= @since_iso");
+    params.since_iso = new Date(since_ms).toISOString();
+  }
+  params.limit = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return db
+    .prepare(
+      `SELECT fm.id, fm.created_at, fm.camera, fm.event_id, fm.person_id,
+              fm.similarity, fm.quality, fm.bbox_json, fm.model,
+              p.name AS person_name
+         FROM face_matches fm
+    LEFT JOIN people p ON p.id = fm.person_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY fm.id DESC
+        LIMIT @limit`,
+    )
+    .all(params);
 }

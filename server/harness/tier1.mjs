@@ -16,6 +16,7 @@
 
 import { publish, subscribe } from "./eventbus.mjs";
 import { TOPIC } from "./types.mjs";
+import * as face from "./face.mjs";
 
 /** @type {(opts: { event: object }) => Promise<object>} */
 export async function classify({ event }) {
@@ -53,12 +54,20 @@ export function stop() {
 // ---- Stubbed primitives (replace with real impls in v1) --------------------
 
 /**
- * Face recognition. Returns matches against the face_db.
- * @param {{ cam: string, image: Buffer }} _input
- * @returns {Promise<object[]>}
+ * Face recognition. Embeds the live frame via the InsightFace sidecar and
+ * scores against db.face_embeddings. Returns the same shape as
+ * face.recognize() so callers don't have to know about the indirection.
+ *
+ * @param {{ cam: string, image: Buffer, event_id?: string|null }} input
  */
-export async function faceRecognize(_input) {
-  return []; // v0 stub
+export async function faceRecognize({ cam, image, event_id = null } = {}) {
+  if (!image) return { ok: false, error: "missing_image", faces: [] };
+  return face.recognize(image, { camera: cam, event_id });
+}
+
+/** Quick check that the sidecar is reachable. */
+export async function faceEmbedderHealth() {
+  return face.ping();
 }
 
 /**

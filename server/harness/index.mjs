@@ -31,6 +31,7 @@ import * as tier0 from "./tier0.mjs";
 import * as tier1 from "./tier1.mjs";
 import * as tier2 from "./tier2.mjs";
 import * as tier3 from "./tier3.mjs";
+import * as face from "./face.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
 import { quotaGate } from "./quota.mjs";
@@ -68,6 +69,11 @@ export function start(deps) {
     fetchSnapshot: async (cam) => (await deps.frigate.getSnapshot(cam)).body,
     router,
   });
+
+  // Face DB recognizer — needs a db handle for the in-memory embeddings
+  // matrix. Sidecar reachability is opportunistic; it fails open until
+  // the InsightFace service is installed (services/face-embedder).
+  face.init({ db: deps.db });
 
   // Health probes — uses local Ollama for upstream checks (cost-free).
   health.startProbes({
@@ -115,6 +121,43 @@ export async function analyzeImageLocal({ imageBuffer, camera = "", model } = {}
 export async function pingTier2() {
   return tier2.ping();
 }
+
+// ---- Phase 4: face recognition --------------------------------------------
+
+/**
+ * Run the face recognizer over a single frame. Logs every detected face
+ * to db.face_matches for chat history / audit. Returns:
+ *   { ok, model, embedder_took_ms, known_count, threshold, faces: [...] }
+ *
+ * @param {{ imageBuffer: Buffer, camera?: string, event_id?: string|null, recordMatch?: boolean }} opts
+ */
+export async function recognizeFaces({ imageBuffer, camera = "", event_id = null, recordMatch = true } = {}) {
+  return face.recognize(imageBuffer, { camera, event_id, recordMatch });
+}
+
+/** Health probe for the InsightFace sidecar. Returns {ok, model, vec_dim, ...}. */
+export async function pingFaceEmbedder() {
+  return face.ping();
+}
+
+/**
+ * Raw embed call — used by the enroll endpoint, which needs the actual
+ * 512-d vector (recognize() doesn't expose it on its return shape because
+ * the operator UI never needs to see embeddings directly).
+ *
+ * @param {{ imageBuffer: Buffer }} opts
+ * @returns {Promise<{ ok, model, vec_dim, took_ms, faces: Array<{bbox, quality, embedding: number[]}> }>}
+ */
+export async function embedFace({ imageBuffer } = {}) {
+  return face.embed(imageBuffer);
+}
+
+/** Drop the in-memory face cache. Call after enroll/delete from the API layer. */
+export function invalidateFaceCache() {
+  face.invalidate();
+}
+
+export const FACE_CONFIG = face.FACE_CONFIG;
 
 // ---- Phase 3: routed (cost-controlled) detection ---------------------------
 //

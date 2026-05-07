@@ -1,0 +1,14 @@
+# Pinned to versions known to install cleanly on Ubuntu 24.04 with system
+# Python 3.12, no GPU. onnxruntime supplies the CPU runtime; insightface
+# pulls a 256MB buffalo_l pack on first load and caches it under
+# ~/.insightface/.
+#
+# CRITICAL: leave numpy < 2.0 — InsightFace 0.7.x's compiled extensions
+# break against numpy 2.x. If we upgrade insightface later this can move.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+numpy==1.26.4
+pillow==11.0.0
+onnxruntime==1.20.1
+insightface==0.7.3
