@@ -22,6 +22,8 @@ import {
   getCamLabel,
   kvGet,
   kvSet,
+  listEvents,
+  getEventTimeline,
 } from "./db.mjs";
 import {
   verifyPassword,
@@ -401,6 +403,44 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Read recent harness events (admin-gated). Filter by camera, severity,
+    // since (ms epoch). Returns rows newest-first. Used by the future
+    // operator review UI and by the chat agent's `get_recent_events` tool.
+    if (req.method === "GET" && url.pathname === "/api/agent/events") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const camera = url.searchParams.get("camera") || undefined;
+      const severity = url.searchParams.get("severity") || undefined;
+      const since_ms = url.searchParams.get("since_ms")
+        ? Number(url.searchParams.get("since_ms"))
+        : undefined;
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 500);
+      try {
+        const rows = listEvents(db, { camera, severity, since_ms, limit });
+        return send(res, 200, { rows, count: rows.length });
+      } catch (err) {
+        return send(res, 500, { error: "events_failed", detail: err.message });
+      }
+    }
+
+    // Reconstruct the full life of one event by id (all stages).
+    if (req.method === "GET" && url.pathname.startsWith("/api/agent/events/")) {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      const event_id = decodeURIComponent(url.pathname.slice("/api/agent/events/".length));
+      if (!/^[A-Za-z0-9_\-]+$/.test(event_id)) {
+        return send(res, 400, { error: "invalid_event_id" });
+      }
+      try {
+        const timeline = getEventTimeline(db, event_id);
+        return send(res, 200, { event_id, timeline });
+      } catch (err) {
+        return send(res, 500, { error: "timeline_failed", detail: err.message });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/api/agent/detections") {
       const me = getCurrentUser(db, req);
       if (!me) return send(res, 401, { error: "unauthenticated" });
@@ -408,9 +448,22 @@ const server = http.createServer(async (req, res) => {
       const camera = url.searchParams.get("camera") ?? "";
       if (!/^[A-Za-z0-9_\-]+$/.test(camera)) return send(res, 400, { error: "invalid_camera" });
       if (!frigate.isConfigured()) return send(res, 200, { detections: [], status: "frigate_not_configured" });
+      // Quota gate before doing any work. Each detection call is one
+      // GPT-4o-mini vision call (~$0.0001) — gate it per camera so a single
+      // tab can't burn the daily budget if the user leaves it open for
+      // hours and the visibility heuristic fails.
+      const tenant = "default"; // multi-tenant: replace with me.tenant_id later
+      const gate = harness.checkQuota({ tenant, camera, kind: "t3-vision" });
+      if (!gate.allowed) {
+        return send(res, 429, { error: "quota_exceeded", reason: gate.reason });
+      }
       try {
         const snap = await frigate.getSnapshot(camera, { height: 480 });
-        const result = await analyzeImage({ imageBuffer: snap.body, camera });
+        const result = await harness.timed("agent.detections", () =>
+          analyzeImage({ imageBuffer: snap.body, camera }),
+        );
+        // Record AFTER success so failed calls don't consume budget.
+        harness.recordQuota({ tenant, camera, kind: "t3-vision", dollars: 0.0001 });
         return send(res, 200, { camera, ...result });
       } catch (err) {
         console.error("[agent] detections failed:", err.message);
@@ -432,12 +485,19 @@ const server = http.createServer(async (req, res) => {
       const camera = String(body?.camera ?? "").slice(0, 64) || "Garage";
       const labelRow = getCamLabel(db, camera);
       const cameraLabel = labelRow?.label ?? camera;
-      // Validate message shape
       const cleanMessages = messages
         .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
         .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
       if (cleanMessages.length === 0 || cleanMessages.at(-1).role !== "user") {
         return send(res, 400, { error: "messages must end with a user turn" });
+      }
+
+      // Quota gate. Chat is per-tenant only (camera not gated for chat
+      // because it's user-driven, not stream-driven).
+      const tenant = "default";
+      const gate = harness.checkQuota({ tenant, kind: "t3-chat" });
+      if (!gate.allowed) {
+        return send(res, 429, { error: "quota_exceeded", reason: gate.reason });
       }
 
       res.writeHead(200, {
@@ -456,6 +516,8 @@ const server = http.createServer(async (req, res) => {
 
       const ac = new AbortController();
       req.on("close", () => ac.abort());
+      const t0 = Date.now();
+      let chatErrored = false;
       try {
         for await (const evt of streamChatGpt({
           messages: cleanMessages,
@@ -467,10 +529,19 @@ const server = http.createServer(async (req, res) => {
         })) {
           writeEvent(evt);
           if (evt.type === "done") break;
+          if (evt.type === "error") chatErrored = true;
         }
       } catch (err) {
+        chatErrored = true;
         writeEvent({ type: "error", message: err.message });
         writeEvent({ type: "done" });
+      } finally {
+        // Telemetry + quota record happen at end-of-stream regardless of
+        // success/failure so we always know what happened.
+        harness.observeLatency(chatErrored ? "agent.chat.error" : "agent.chat", Date.now() - t0);
+        if (!chatErrored) {
+          harness.recordQuota({ tenant, kind: "t3-chat" });
+        }
       }
       return res.end();
     }

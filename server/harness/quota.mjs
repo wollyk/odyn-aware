@@ -5,16 +5,17 @@
 //   2. Per-camera vision-call budget (prevents one noisy camera from
 //      consuming everything).
 //
-// Storage: in-memory rolling window (1 minute, 1 hour, 1 day buckets).
-// Persisted to SQLite (kv_cache or a dedicated table later) so restarts
-// don't reset the budget.
+// Storage: in-memory rolling window for fast `allow()` checks (sub-ms),
+// write-through to SQLite `quota_ledger` for durability across restarts.
+// On hydrate, we re-load the last 24h of consumption from the DB so the
+// rolling window is accurate after a restart.
 //
 // Usage:
-//   const gate = quotaGate({ db });
-//   if (!gate.allow({ tenant, camera, kind: "t3-vision", cost: 1 })) {
+//   const gate = quotaGate({ db });        // db is optional — without it, in-memory only
+//   if (!gate.allow({ tenant, camera, kind: "t3-vision" }).allowed) {
 //     return 429 too_many_requests;
 //   }
-//   gate.record({ tenant, camera, kind: "t3-vision", cost: 1, dollars: 0.0001 });
+//   gate.record({ tenant, camera, kind: "t3-vision", dollars: 0.0001 });
 //
 // Independent test surface: pass an injected clock for deterministic windowing.
 
@@ -34,6 +35,31 @@ const DEFAULT_LIMITS = Object.freeze({
 export function quotaGate({ db = null, now = () => Date.now(), limits = DEFAULT_LIMITS } = {}) {
   // Map<key, number[]> — sorted ascending list of timestamp ms.
   const ledger = new Map();
+
+  // Hydrate from the DB if provided. We pull the last 24h since that covers
+  // every rolling window we care about (minute / hour / day).
+  if (db) {
+    try {
+      const since_ms = now() - 86_400_000;
+      // Lazy import to keep this module dep-free when used without a db.
+      const rows = db
+        .prepare(`SELECT tenant_id, camera, kind, scope, ts FROM quota_ledger WHERE ts >= ? ORDER BY ts ASC`)
+        .all(since_ms);
+      for (const r of rows) {
+        const key = r.scope === "camera"
+          ? `cam:${r.tenant_id}:${r.camera}:${r.kind}-cam`
+          : `tenant:${r.tenant_id}:${r.kind}`;
+        const arr = ledger.get(key) ?? [];
+        arr.push(r.ts);
+        ledger.set(key, arr);
+      }
+      if (rows.length > 0) {
+        console.log(`[quota] hydrated ${rows.length} rows from quota_ledger (last 24h)`);
+      }
+    } catch (err) {
+      console.warn("[quota] hydrate failed:", err?.message);
+    }
+  }
 
   function pruneAndCount(key, windowMs) {
     const arr = ledger.get(key);
@@ -79,7 +105,7 @@ export function quotaGate({ db = null, now = () => Date.now(), limits = DEFAULT_
      * after the upstream call succeeded (or unconditionally if you want a
      * "tried" budget rather than a "succeeded" budget — pick one and stick).
      */
-    record({ tenant, camera, kind /* dollars */ }) {
+    record({ tenant, camera, kind, dollars = null, cost = 1 }) {
       const t = now();
       const tk = `tenant:${tenant}:${kind}`;
       const arr1 = ledger.get(tk) ?? [];
@@ -91,8 +117,21 @@ export function quotaGate({ db = null, now = () => Date.now(), limits = DEFAULT_
         arr2.push(t);
         ledger.set(ck, arr2);
       }
-      // TODO(phase-1.5): persist to SQLite quota_ledger table for cross-restart durability.
-      void db;
+      // Write-through to SQLite. Failures are logged but never rejected
+      // upstream — the in-memory ledger is the source of truth for the
+      // current process, persistence is best-effort durability.
+      if (db) {
+        try {
+          const stmt = db.prepare(
+            `INSERT INTO quota_ledger (tenant_id, camera, kind, scope, cost, dollars, ts)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          );
+          stmt.run(tenant, null, kind, "tenant", cost, dollars, t);
+          if (camera) stmt.run(tenant, camera, kind, "camera", cost, dollars, t);
+        } catch (err) {
+          console.warn("[quota] persist failed:", err?.message);
+        }
+      }
     },
 
     /** Diagnostic snapshot for /api/agent/status. */

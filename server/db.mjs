@@ -79,6 +79,45 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
       fresh_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       stale_at   TEXT                                              -- optional hard expiry
     );
+
+    -- Event log for the harness pipeline. ONE ROW PER STAGE APPEND, all
+    -- linked by event_id so we can reconstruct the full life of an event:
+    -- detection → classified → described → alert → operator_action.
+    --
+    -- Schema is intentionally append-only: stages don't UPDATE earlier rows,
+    -- they INSERT a new row with the same event_id and a new stage label.
+    -- That makes the log replayable, debuggable, and trivially exportable.
+    CREATE TABLE IF NOT EXISTS events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id    TEXT NOT NULL,                       -- UUID, links rows in one event's life
+      stage       TEXT NOT NULL,                       -- "detection" | "classified" | "described" | "alert"
+      tenant_id   TEXT NOT NULL DEFAULT 'default',
+      camera      TEXT NOT NULL,
+      origin      TEXT,                                -- motion | object_detected | manual_query | ...
+      severity    TEXT,                                -- normal | notable | critical (set by T2)
+      payload     TEXT NOT NULL,                       -- full JSON snapshot of the event at this stage
+      created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id);
+    CREATE INDEX IF NOT EXISTS idx_events_camera_created ON events(camera, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_tenant_created ON events(tenant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity);
+
+    -- Quota ledger for cost control. ONE ROW PER CONSUMPTION (lightweight,
+    -- pruned by the harness periodically). Per-tenant + per-camera in the
+    -- same table, distinguished by scope: 'tenant' or 'camera'.
+    CREATE TABLE IF NOT EXISTS quota_ledger (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id   TEXT NOT NULL,
+      camera      TEXT,                                -- NULL for tenant-scoped rows
+      kind        TEXT NOT NULL,                       -- t3-chat | t3-vision | t2-vision | ...
+      scope       TEXT NOT NULL CHECK (scope IN ('tenant','camera')),
+      cost        REAL NOT NULL DEFAULT 1,             -- abstract cost (1 = one call)
+      dollars     REAL,                                -- optional explicit dollar attribution
+      ts          INTEGER NOT NULL                     -- ms epoch (faster than ISO for windowing)
+    );
+    CREATE INDEX IF NOT EXISTS idx_quota_tenant_kind_ts ON quota_ledger(tenant_id, kind, ts);
+    CREATE INDEX IF NOT EXISTS idx_quota_camera_kind_ts ON quota_ledger(tenant_id, camera, kind, ts);
   `);
   return db;
 }
@@ -255,4 +294,151 @@ export function kvGet(db, key) {
 
 export function kvDelete(db, key) {
   db.prepare(`DELETE FROM kv_cache WHERE key = ?`).run(key);
+}
+
+// Event log helpers (append-only) -------------------------------------------
+//
+// The harness writes one row per stage append. The shape of `payload` is
+// the FULL event object at that stage — readers reconstruct timelines by
+// grouping on `event_id`.
+
+/**
+ * Append a single event-stage row to the log.
+ * @param {object} db better-sqlite3 handle
+ * @param {{ event_id: string, stage: string, tenant_id?: string, camera: string,
+ *           origin?: string, severity?: string, payload: object }} row
+ */
+export function appendEvent(db, row) {
+  const stmt = db.prepare(
+    `INSERT INTO events (event_id, stage, tenant_id, camera, origin, severity, payload)
+     VALUES (@event_id, @stage, @tenant_id, @camera, @origin, @severity, @payload)`,
+  );
+  return stmt.run({
+    event_id: row.event_id,
+    stage: row.stage,
+    tenant_id: row.tenant_id ?? "default",
+    camera: row.camera,
+    origin: row.origin ?? null,
+    severity: row.severity ?? null,
+    payload: JSON.stringify(row.payload ?? {}),
+  });
+}
+
+/**
+ * Read recent events. Filter by camera / tenant / severity / since (ms epoch).
+ * Default ordering: newest first.
+ *
+ * @param {object} db
+ * @param {{ camera?: string, tenant_id?: string, severity?: string, since_ms?: number, limit?: number }} [filter]
+ */
+export function listEvents(db, { camera, tenant_id, severity, since_ms, limit = 100 } = {}) {
+  const where = [];
+  const params = {};
+  if (camera) {
+    where.push("camera = @camera");
+    params.camera = camera;
+  }
+  if (tenant_id) {
+    where.push("tenant_id = @tenant_id");
+    params.tenant_id = tenant_id;
+  }
+  if (severity) {
+    where.push("severity = @severity");
+    params.severity = severity;
+  }
+  if (since_ms) {
+    // SQLite ISO timestamps compare correctly as strings; convert ms to ISO.
+    where.push("created_at >= @since_iso");
+    params.since_iso = new Date(since_ms).toISOString();
+  }
+  const sql = `
+    SELECT id, event_id, stage, tenant_id, camera, origin, severity, payload, created_at
+      FROM events
+     ${where.length ? "WHERE " + where.join(" AND ") : ""}
+     ORDER BY id DESC
+     LIMIT @limit
+  `;
+  params.limit = Math.min(Math.max(Number(limit) || 100, 1), 1000);
+  const rows = db.prepare(sql).all(params);
+  // Eagerly parse the JSON payload so callers don't need to.
+  return rows.map((r) => ({ ...r, payload: safeParse(r.payload) }));
+}
+
+/**
+ * Reconstruct the full life of one event (all stages, oldest first).
+ * @param {object} db
+ * @param {string} event_id
+ */
+export function getEventTimeline(db, event_id) {
+  const rows = db
+    .prepare(
+      `SELECT stage, payload, created_at FROM events
+        WHERE event_id = ? ORDER BY id ASC`,
+    )
+    .all(event_id);
+  return rows.map((r) => ({ ...r, payload: safeParse(r.payload) }));
+}
+
+/**
+ * Prune events older than `older_than_ms` epoch. Called periodically by the
+ * harness to keep the log bounded.
+ */
+export function pruneEvents(db, older_than_ms) {
+  const cutoff = new Date(older_than_ms).toISOString();
+  return db.prepare(`DELETE FROM events WHERE created_at < ?`).run(cutoff);
+}
+
+function safeParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+// Quota ledger helpers (cost control) ----------------------------------------
+//
+// We persist every consumption with its timestamp so a process restart
+// rebuilds an accurate rolling-window view. Pruning is the caller's
+// responsibility (the harness runs it on a debounced timer).
+
+/**
+ * Record a single consumption. Returns nothing.
+ * @param {object} db
+ * @param {{ tenant_id: string, camera?: string|null, kind: string, scope: 'tenant'|'camera', cost?: number, dollars?: number|null, ts?: number }} row
+ */
+export function recordQuota(db, row) {
+  db.prepare(
+    `INSERT INTO quota_ledger (tenant_id, camera, kind, scope, cost, dollars, ts)
+     VALUES (@tenant_id, @camera, @kind, @scope, @cost, @dollars, @ts)`,
+  ).run({
+    tenant_id: row.tenant_id,
+    camera: row.camera ?? null,
+    kind: row.kind,
+    scope: row.scope,
+    cost: row.cost ?? 1,
+    dollars: row.dollars ?? null,
+    ts: row.ts ?? Date.now(),
+  });
+}
+
+/**
+ * Count consumptions in a window. Returns total cost (NOT row count — these
+ * are the same when cost=1 but differ for variable-cost ops like big chats).
+ * @param {object} db
+ * @param {{ tenant_id: string, camera?: string|null, kind: string, scope: 'tenant'|'camera', since_ms: number }} q
+ */
+export function countQuota(db, { tenant_id, camera, kind, scope, since_ms }) {
+  let sql, params;
+  if (scope === "camera") {
+    sql = `SELECT COALESCE(SUM(cost), 0) AS total FROM quota_ledger
+            WHERE tenant_id = @tenant_id AND camera = @camera AND kind = @kind AND scope = 'camera' AND ts >= @since_ms`;
+    params = { tenant_id, camera, kind, since_ms };
+  } else {
+    sql = `SELECT COALESCE(SUM(cost), 0) AS total FROM quota_ledger
+            WHERE tenant_id = @tenant_id AND kind = @kind AND scope = 'tenant' AND ts >= @since_ms`;
+    params = { tenant_id, kind, since_ms };
+  }
+  return db.prepare(sql).get(params).total;
+}
+
+/** Drop ledger rows older than the cutoff. */
+export function pruneQuota(db, older_than_ms) {
+  return db.prepare(`DELETE FROM quota_ledger WHERE ts < ?`).run(older_than_ms);
 }

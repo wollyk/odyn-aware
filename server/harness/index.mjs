@@ -32,6 +32,7 @@ import * as tier1 from "./tier1.mjs";
 import * as tier2 from "./tier2.mjs";
 import * as tier3 from "./tier3.mjs";
 import * as health from "./health.mjs";
+import * as eventlog from "./eventlog.mjs";
 import { quotaGate } from "./quota.mjs";
 import { snapshot as telemetrySnapshot } from "./telemetry.mjs";
 import { workingMemory } from "./memory.mjs";
@@ -57,6 +58,10 @@ export function start(deps) {
   _deps = deps;
   _gate = quotaGate({ db: deps.db });
 
+  // Persistence subscriber — must start BEFORE any tier so we don't miss
+  // the first events emitted at boot. Tiers publish, eventlog records.
+  eventlog.start({ db: deps.db });
+
   // Stages that need wiring to the bus.
   tier1.start();
   tier2.start({
@@ -78,6 +83,7 @@ export function stop() {
   if (!started) return;
   tier1.stop();
   tier2.stop();
+  eventlog.stop();
   health.stopProbes();
   started = false;
 }
@@ -88,6 +94,26 @@ export { streamChatGpt as chat, analyzeImage } from "./tier3.mjs";
 export const ingestSnapshot = tier0.injectManual;
 export const subscribeAlerts = (signal) => subscribeIterator(TOPIC.ALERT, { signal });
 export const subscribeHealth = (signal) => subscribeIterator(TOPIC.HEALTH, { signal });
+
+// Quota + telemetry — exposed so the API layer can gate calls and observe
+// latency without reaching into the harness internals.
+export { observeLatency, increment, timed } from "./telemetry.mjs";
+
+/**
+ * Returns a quota decision for the given call. SAFE TO CALL even before
+ * harness.start() — falls open (allow) but logs a warning, so an unwired
+ * harness never blocks user traffic.
+ */
+export function checkQuota({ tenant = "default", camera = null, kind }) {
+  if (!_gate) return { allowed: true, reason: "no_gate" };
+  return _gate.allow({ tenant, camera, kind });
+}
+
+/** Record consumption against the quota ledger. Same fall-open semantics. */
+export function recordQuota({ tenant = "default", camera = null, kind, dollars = null, cost = 1 }) {
+  if (!_gate) return;
+  _gate.record({ tenant, camera, kind, dollars, cost });
+}
 
 /**
  * One-shot status snapshot for /api/agent/status.
