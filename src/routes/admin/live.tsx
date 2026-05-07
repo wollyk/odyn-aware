@@ -51,6 +51,7 @@ type LiveStatus =
   | "negotiating"
   | "playing"
   | "stalled"
+  | "reconnecting"
   | "error"
   | "closed";
 
@@ -284,150 +285,210 @@ function useMseStream(camera: string | null, enabled: boolean) {
   const [status, setStatus] = useState<LiveStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [bitrateKbps, setBitrateKbps] = useState<number>(0);
+  const [retryAttempt, setRetryAttempt] = useState<number>(0);
+  const [nextRetryMs, setNextRetryMs] = useState<number>(0);
 
   useEffect(() => {
     if (!enabled || !camera) {
       setStatus("idle");
+      setRetryAttempt(0);
+      setNextRetryMs(0);
       return;
     }
     const video = videoRef.current;
     if (!video) return;
 
-    let ws: WebSocket | null = null;
-    let mediaSource: MediaSource | null = null;
-    let sourceBuffer: SourceBuffer | null = null;
-    const queue: ArrayBuffer[] = [];
-    let bytesInWindow = 0;
+    // -------- Per-effect lifecycle state --------
+    // We hold all per-attempt state in local variables. Reconnects rebuild
+    // the WebSocket + MediaSource pair from scratch each time.
     let cancelled = false;
+    let attempts = 0;                 // number of consecutive failed attempts
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let bytesInWindow = 0;
+    let lastFrameAt = 0;              // ms epoch of most recent binary frame
+
+    // Each attempt gets fresh resources. We capture them in this object so
+    // teardown can find them regardless of which attempt is running.
+    const conn: {
+      ws: WebSocket | null;
+      mediaSource: MediaSource | null;
+      sourceBuffer: SourceBuffer | null;
+      queue: ArrayBuffer[];
+    } = { ws: null, mediaSource: null, sourceBuffer: null, queue: [] };
 
     const flushQueue = () => {
-      if (!sourceBuffer || sourceBuffer.updating) return;
-      if (queue.length === 0) return;
+      const sb = conn.sourceBuffer;
+      if (!sb || sb.updating) return;
+      if (conn.queue.length === 0) return;
       try {
-        sourceBuffer.appendBuffer(queue.shift()!);
+        sb.appendBuffer(conn.queue.shift()!);
       } catch (err) {
-        if (!cancelled) {
-          console.error("[mse] appendBuffer", err);
-          setError(err instanceof Error ? err.message : "appendBuffer failed");
-          setStatus("error");
-        }
+        if (cancelled) return;
+        console.error("[mse] appendBuffer", err);
+        setError(err instanceof Error ? err.message : "appendBuffer failed");
+        // appendBuffer errors are usually fatal for this MediaSource — force
+        // a full reconnect rather than leaving the buffer wedged.
+        scheduleReconnect("append-error");
       }
     };
 
-    const onSourceOpen = () => {
-      if (!mediaSource) return;
+    const teardownConn = () => {
+      const { ws, mediaSource, sourceBuffer } = conn;
+      try { ws?.close(); } catch { /* ignore */ }
       try {
-        URL.revokeObjectURL(video.src);
-      } catch {
-        // ignore
-      }
-
-      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${proto}//${window.location.host}/api/cam/stream/${encodeURIComponent(camera)}`;
-      ws = new WebSocket(wsUrl);
-      ws.binaryType = "arraybuffer";
-      setStatus("connecting");
-
-      ws.addEventListener("open", () => {
-        if (cancelled || !ws) return;
-        setStatus("negotiating");
-        // Wide-net codec request — Frigate replies with the actual stream codec.
-        const codecs =
-          'video/mp4; codecs="avc1.640029,avc1.4D4029,avc1.4D401E,avc1.64001E,avc1.42E01E,mp4a.40.2"';
-        ws.send(JSON.stringify({ type: "mse", value: codecs }));
-      });
-
-      ws.addEventListener("message", (ev) => {
-        if (cancelled || !mediaSource) return;
-        if (typeof ev.data === "string") {
-          // Server's chosen codec response.
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg && msg.type === "mse" && typeof msg.value === "string" && !sourceBuffer) {
-              if (!MediaSource.isTypeSupported(msg.value)) {
-                setError(`Codec not supported: ${msg.value}`);
-                setStatus("error");
-                ws?.close();
-                return;
-              }
-              sourceBuffer = mediaSource.addSourceBuffer(msg.value);
-              sourceBuffer.mode = "segments";
-              sourceBuffer.addEventListener("updateend", flushQueue);
-            }
-          } catch (err) {
-            console.error("[mse] bad text msg", err);
-          }
-        } else {
-          const buf = ev.data as ArrayBuffer;
-          bytesInWindow += buf.byteLength;
-          queue.push(buf);
-          flushQueue();
-          setStatus((s) => (s === "playing" ? s : "playing"));
+        if (sourceBuffer && mediaSource && mediaSource.readyState === "open") {
+          mediaSource.removeSourceBuffer(sourceBuffer);
         }
+      } catch { /* ignore */ }
+      try {
+        if (mediaSource && mediaSource.readyState === "open") {
+          mediaSource.endOfStream();
+        }
+      } catch { /* ignore */ }
+      try { URL.revokeObjectURL(video.src); } catch { /* ignore */ }
+      conn.ws = null;
+      conn.mediaSource = null;
+      conn.sourceBuffer = null;
+      conn.queue = [];
+    };
+
+    const scheduleReconnect = (reason: string) => {
+      if (cancelled) return;
+      if (reconnectTimer) return; // already scheduled
+      teardownConn();
+      attempts += 1;
+      setRetryAttempt(attempts);
+      // Exponential backoff: 1s, 2s, 4s, 8s, 10s (capped). Reset on success.
+      const delay = Math.min(10_000, 1000 * 2 ** Math.max(0, attempts - 1));
+      setNextRetryMs(delay);
+      setStatus("reconnecting");
+      console.log(`[mse] reconnect scheduled in ${delay}ms (attempt #${attempts}, reason=${reason})`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (cancelled) return;
+        connectOnce();
+      }, delay);
+    };
+
+    const connectOnce = () => {
+      if (cancelled) return;
+      // Reset per-attempt MediaSource. Reusing a closed MS is unreliable across
+      // browsers, so we recreate it every time we reconnect.
+      const ms = new MediaSource();
+      conn.mediaSource = ms;
+      conn.sourceBuffer = null;
+      conn.queue = [];
+
+      ms.addEventListener("sourceopen", () => {
+        if (cancelled || conn.mediaSource !== ms) return;
+
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${proto}//${window.location.host}/api/cam/stream/${encodeURIComponent(camera)}`;
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+        conn.ws = ws;
+        setStatus("connecting");
+
+        ws.addEventListener("open", () => {
+          if (cancelled || conn.ws !== ws) return;
+          setStatus("negotiating");
+          // Wide-net codec request — Frigate replies with the actual stream codec.
+          const codecs =
+            'video/mp4; codecs="avc1.640029,avc1.4D4029,avc1.4D401E,avc1.64001E,avc1.42E01E,mp4a.40.2"';
+          ws.send(JSON.stringify({ type: "mse", value: codecs }));
+        });
+
+        ws.addEventListener("message", (ev) => {
+          if (cancelled || conn.ws !== ws) return;
+          if (typeof ev.data === "string") {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg && msg.type === "mse" && typeof msg.value === "string" && !conn.sourceBuffer) {
+                if (!MediaSource.isTypeSupported(msg.value)) {
+                  setError(`Codec not supported: ${msg.value}`);
+                  setStatus("error");
+                  try { ws.close(); } catch { /* ignore */ }
+                  return;
+                }
+                const sb = ms.addSourceBuffer(msg.value);
+                sb.mode = "segments";
+                sb.addEventListener("updateend", flushQueue);
+                conn.sourceBuffer = sb;
+              }
+            } catch (err) {
+              console.error("[mse] bad text msg", err);
+            }
+          } else {
+            const buf = ev.data as ArrayBuffer;
+            bytesInWindow += buf.byteLength;
+            lastFrameAt = Date.now();
+            conn.queue.push(buf);
+            flushQueue();
+            // First binary frame after (re)connect → success: reset backoff.
+            if (attempts !== 0) {
+              attempts = 0;
+              setRetryAttempt(0);
+              setNextRetryMs(0);
+              setError(null);
+            }
+            setStatus((s) => (s === "playing" ? s : "playing"));
+          }
+        });
+
+        ws.addEventListener("close", () => {
+          if (cancelled || conn.ws !== ws) return;
+          scheduleReconnect("ws-close");
+        });
+        ws.addEventListener("error", () => {
+          if (cancelled || conn.ws !== ws) return;
+          setError("WebSocket error");
+          scheduleReconnect("ws-error");
+        });
       });
 
-      ws.addEventListener("close", () => {
-        if (cancelled) return;
-        setStatus("closed");
-      });
-      ws.addEventListener("error", () => {
-        if (cancelled) return;
-        setError("WebSocket error");
-        setStatus("error");
+      // Attach the MediaSource to the <video> element. This kicks off "sourceopen".
+      try {
+        video.src = URL.createObjectURL(ms);
+      } catch (err) {
+        console.error("[mse] createObjectURL", err);
+        scheduleReconnect("createobjecturl-error");
+        return;
+      }
+      void video.play().catch(() => {
+        // autoplay may be blocked on first interaction; harmless after a click.
       });
     };
 
-    mediaSource = new MediaSource();
-    mediaSource.addEventListener("sourceopen", onSourceOpen);
-    video.src = URL.createObjectURL(mediaSource);
-    void video.play().catch(() => {
-      // autoplay may be blocked; user can click to play
-    });
+    // Kick off the first attempt.
+    connectOnce();
 
-    // Bitrate sampler (every 1s)
+    // Bitrate sampler (every 1s). Also detects "no frames for 8s" → force reconnect.
     const sampler = setInterval(() => {
       setBitrateKbps(Math.round((bytesInWindow * 8) / 1000));
       bytesInWindow = 0;
+      // Stall watchdog: once we've been "playing", if no frame for 8s, kick a reconnect.
+      if (lastFrameAt && Date.now() - lastFrameAt > 8000 && !reconnectTimer) {
+        console.log("[mse] no frames for >8s, reconnecting");
+        lastFrameAt = 0;
+        scheduleReconnect("stall-watchdog");
+      }
     }, 1000);
 
     return () => {
       cancelled = true;
       clearInterval(sampler);
-      try {
-        ws?.close();
-      } catch {
-        // ignore
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-      try {
-        if (sourceBuffer && mediaSource && mediaSource.readyState === "open") {
-          mediaSource.removeSourceBuffer(sourceBuffer);
-        }
-      } catch {
-        // ignore
-      }
-      try {
-        if (mediaSource && mediaSource.readyState === "open") {
-          mediaSource.endOfStream();
-        }
-      } catch {
-        // ignore
-      }
-      try {
-        URL.revokeObjectURL(video.src);
-      } catch {
-        // ignore
-      }
+      teardownConn();
       video.removeAttribute("src");
-      try {
-        video.load();
-      } catch {
-        // ignore
-      }
+      try { video.load(); } catch { /* ignore */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, enabled]);
 
-  return { videoRef, status, error, bitrateKbps };
+  return { videoRef, status, error, bitrateKbps, retryAttempt, nextRetryMs };
 }
 
 // ---------- Video tile (snapshot polling OR live MSE + canvas overlay + HUD chrome) ----------
@@ -485,12 +546,23 @@ function VideoTile({
     };
   }, [cam, mode]);
 
-  // Detection polling: every 5s
+  // Detection polling: every 5s while the tab is visible.
+  //
+  // Cost guard: each tick is one GPT-4o-mini vision call (~$0.0001). At 5s
+  // cadence that's ~$1.40/day if the tab is left open. We pause when
+  // document.visibilityState !== "visible" so a backgrounded tab costs $0.
   useEffect(() => {
     if (!cam) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+
     const tick = async () => {
+      if (cancelled) return;
+      // Skip the call entirely if the tab isn't visible. Re-check in 5s.
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        timer = setTimeout(tick, 5000);
+        return;
+      }
       try {
         const res = await fetch(
           `/api/agent/detections?camera=${encodeURIComponent(cam.name)}`,
@@ -509,10 +581,22 @@ function VideoTile({
         if (!cancelled) timer = setTimeout(tick, 5000);
       }
     };
+
+    // Resume immediately when the tab comes back to the foreground.
+    const onVis = () => {
+      if (cancelled) return;
+      if (document.visibilityState === "visible") {
+        if (timer) clearTimeout(timer);
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+
     tick();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [cam]);
 
@@ -617,15 +701,17 @@ function VideoTile({
         {mode === "live" && live.status !== "playing" && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
             <div className="bg-black/70 px-4 py-2 font-mono text-xs uppercase tracking-widest text-foreground/85">
-              {live.status === "error"
-                ? `Live: ${live.error ?? "error"}`
-                : live.status === "closed"
-                  ? "Live: stream closed"
-                  : live.status === "connecting"
-                    ? "Connecting to camera…"
-                    : live.status === "negotiating"
-                      ? "Negotiating codecs…"
-                      : "Idle"}
+              {live.status === "reconnecting"
+                ? `Reconnecting in ${Math.round(live.nextRetryMs / 1000)}s (attempt ${live.retryAttempt})…`
+                : live.status === "error"
+                  ? `Live: ${live.error ?? "error"}`
+                  : live.status === "closed"
+                    ? "Live: stream closed"
+                    : live.status === "connecting"
+                      ? "Connecting to camera…"
+                      : live.status === "negotiating"
+                        ? "Negotiating codecs…"
+                        : "Idle"}
             </div>
           </div>
         )}
