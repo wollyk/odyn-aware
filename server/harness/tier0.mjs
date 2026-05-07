@@ -31,6 +31,15 @@ let frigateClient = null;
 // status TRANSITIONS — heartbeats every 10s would otherwise flood the bus.
 const cameraStatus = new Map(); // camera -> { detect: "online"|"offline", record: ..., ts }
 
+// Per-camera+channel debounce. Some sources flap every ~10s (public webcams,
+// flaky RTSP) and would otherwise produce hundreds of meaningless rows per
+// hour. We require the new state to STAY for at least DEBOUNCE_MS before we
+// publish, and we drop any transition that's already noisy enough that the
+// flap rate is under FLAP_FLOOR_MS apart.
+const STATUS_DEBOUNCE_MS = 30_000;
+const FLAP_FLOOR_MS = 20_000;
+const pendingStatus = new Map(); // "<cam>|<channel>" -> { value, scheduledAt, timer }
+
 // Track per-camera last summary digest so we only emit on real hourly change.
 const lastSummaryDigest = new Map(); // camera -> "<json digest>"
 
@@ -92,6 +101,8 @@ export function stop() {
     clearInterval(summaryTimer);
     summaryTimer = null;
   }
+  for (const { timer } of pendingStatus.values()) clearTimeout(timer);
+  pendingStatus.clear();
   cameraStatus.clear();
   lastSummaryDigest.clear();
 }
@@ -148,33 +159,91 @@ function handleWsMessage(msg) {
     const cam = parts[0];
     const channel = parts[2]; // detect | audio | record
     const value = String(msg.payload ?? "").toLowerCase(); // online | offline
-    const slot = cameraStatus.get(cam) ?? {};
-    const prev = slot[channel];
-    if (prev !== value) {
-      slot[channel] = value;
-      slot.ts = Date.now();
-      cameraStatus.set(cam, slot);
-      // Only publish on transitions (skip the very first observation per
-      // boot — we don't want to pretend a status change happened).
-      if (typeof prev === "string") {
-        publish(
-          TOPIC.DETECTION,
-          newDetectionEvent({
-            origin: value === "online" ? "status_online" : "status_offline",
-            cam,
-            motion: false,
-            objects: [],
-            // Stash the channel so downstream can distinguish detect vs record vs audio.
-            tier0_meta: { source: "frigate-ws", channel, prev, next: value },
-          }),
-        );
-      }
-    }
+    onStatusObservation(cam, channel, value);
     return;
   }
 
   // Future: "stats" topic could feed a system-health event here. Skipping
   // for now — health.mjs already polls /api/version and Ollama on a 60s tick.
+}
+
+// Debounced status emitter.
+//
+// Behavior:
+//   - First observation per boot: silent (we don't pretend a transition
+//     happened just because the WS reconnected).
+//   - Different value: stash with a STATUS_DEBOUNCE_MS timer. If the value
+//     hasn't been re-flipped during that window, publish.
+//   - If a flap re-flips before the timer expires, cancel the timer; the
+//     current published state is still the previous one, so this counts
+//     as "no real change happened".
+//   - If the previous publish-or-observation was less than FLAP_FLOOR_MS
+//     ago, we treat the source as flapping and drop the new value entirely
+//     (its corresponding return-to-prior would also be dropped).
+function onStatusObservation(cam, channel, value) {
+  const slot = cameraStatus.get(cam) ?? {};
+  const prev = slot[channel];
+  // First observation: just remember it. No publish.
+  if (typeof prev !== "string") {
+    slot[channel] = value;
+    slot.ts = Date.now();
+    cameraStatus.set(cam, slot);
+    return;
+  }
+  // No change vs published value → cancel any pending revert and bail.
+  if (prev === value) {
+    const key = `${cam}|${channel}`;
+    const pending = pendingStatus.get(key);
+    if (pending && pending.value !== value) {
+      clearTimeout(pending.timer);
+      pendingStatus.delete(key);
+    }
+    return;
+  }
+  // Flap floor — if the last publish for this channel was very recent,
+  // assume the source is flapping and silently drop. The pendingStatus
+  // timer will eventually catch a stable value.
+  const sinceLast = Date.now() - (slot.ts ?? 0);
+  if (sinceLast < FLAP_FLOOR_MS) {
+    // Still arm a debounce so a "long stable" value can take effect.
+    schedulePendingStatus(cam, channel, value);
+    return;
+  }
+  schedulePendingStatus(cam, channel, value);
+}
+
+function schedulePendingStatus(cam, channel, value) {
+  const key = `${cam}|${channel}`;
+  const existing = pendingStatus.get(key);
+  if (existing) {
+    if (existing.value === value) return; // already armed for this value
+    clearTimeout(existing.timer);
+  }
+  const timer = setTimeout(() => commitPendingStatus(cam, channel, value), STATUS_DEBOUNCE_MS);
+  // Allow node to exit cleanly during shutdown.
+  if (typeof timer.unref === "function") timer.unref();
+  pendingStatus.set(key, { value, scheduledAt: Date.now(), timer });
+}
+
+function commitPendingStatus(cam, channel, value) {
+  const key = `${cam}|${channel}`;
+  pendingStatus.delete(key);
+  const slot = cameraStatus.get(cam) ?? {};
+  const prev = slot[channel];
+  if (prev === value) return; // pre-empted by something
+  slot[channel] = value;
+  slot.ts = Date.now();
+  cameraStatus.set(cam, slot);
+  publish(
+    TOPIC.DETECTION,
+    newDetectionEvent({
+      origin: value === "online" ? "status_online" : "status_offline",
+      cam,
+      motion: false,
+      objects: [],
+      tier0_meta: { source: "frigate-ws", channel, prev, next: value, debounced: true },
+    }),
+  );
 }
 
 // ---- Recordings summary poller --------------------------------------------
@@ -227,6 +296,8 @@ export function inspect() {
     ws_connected: Boolean(ws && ws.readyState === 1 /* OPEN */),
     cameras_tracked: cameraStatus.size,
     summary_cache_keys: lastSummaryDigest.size,
+    pending_status_count: pendingStatus.size,
+    debounce_ms: STATUS_DEBOUNCE_MS,
     status_by_cam: Object.fromEntries(
       [...cameraStatus.entries()].map(([k, v]) => [k, { ...v }]),
     ),
