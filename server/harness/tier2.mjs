@@ -30,14 +30,17 @@ const VLM_MODEL = process.env.OLLAMA_VLM_MODEL ?? "moondream:latest";
 const VLM_TIMEOUT_MS = Number(process.env.OLLAMA_VLM_TIMEOUT_MS ?? 8000);
 const VLM_KEEP_ALIVE = process.env.OLLAMA_VLM_KEEP_ALIVE ?? "10m";
 
-// Free-text prompt — small models choke on strict JSON. We ask for a single
-// short sentence about what's visible. The downstream parser scans for
-// well-known nouns to derive structured fields.
-const FREE_TEXT_PROMPT =
-  "What is in this security camera frame? " +
-  "Answer in one short sentence (<= 16 words). " +
-  "Mention any people, vehicles, animals, packages, tools, or weapons. " +
-  "If the frame looks empty, say 'empty scene'.";
+// Free-text prompt — small VL models like moondream are exquisitely
+// sensitive to prompt complexity. Empirically, ANY mention of safety nouns
+// ("weapons"), compound directives, or word-count ceilings triggers an
+// immediate EOS token (eval_count=1, content=""). The single-sentence
+// "Describe this" prompt is the only stable shape we've found that gets
+// reliable output.
+//
+// We rely on the downstream parseFreeTextScene heuristic to scan whatever
+// nouns the model produces (person, truck, knife, package, etc.) — we do
+// not steer the model toward any particular vocabulary.
+const FREE_TEXT_PROMPT = "Describe this in one sentence.";
 
 // Vocabulary buckets used by the heuristic severity parser. Order matters —
 // `weaponWords` is checked first because it dominates everything else.
