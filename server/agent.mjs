@@ -15,14 +15,22 @@
 //
 // Tools available to the chat:
 //   - list_cameras
-//   - rename_camera({camera,label})           writes to cam_labels
-//   - get_recent_events({camera,limit})       reads Frigate events
+//   - rename_camera({camera,label})            writes to cam_labels
+//   - get_recent_events({camera,limit,source}) — reads our harness events
+//                                                table by default, opt into Frigate
 //   - propose_alert_rule({camera,description,spec})  writes to alert_rules
+//   - get_current_scene({camera})              T2 local VLM scene-now
+//   - get_router_status()                      router mode + recent tier breakdown
 //
 // We do ONE tool round (model → tool calls → results → model) and stop. No loops.
 
 import * as frigate from "./frigate.mjs";
-import { setCamLabel, listCamLabels, insertAlertRule, listAlertRules } from "./db.mjs";
+import {
+  setCamLabel,
+  listCamLabels,
+  insertAlertRule,
+  listEvents as listHarnessEvents,
+} from "./db.mjs";
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY ?? "";
 const OPENAI_BASE = process.env.OPENAI_BASE ?? "https://api.openai.com/v1";
@@ -68,15 +76,57 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_recent_events",
-      description: "Return the most recent Frigate events for a camera (or all cameras).",
+      description:
+        "Return the most recent events from the AuroraView agent harness. " +
+        "By default reads from our internal event log (covers status changes, " +
+        "T2/T3 vision calls, motion summaries). Pass source='frigate' to read " +
+        "Frigate's own event store instead (object detections — empty when " +
+        "Frigate's detector is off). Supports optional severity / origin filters.",
       parameters: {
         type: "object",
         properties: {
           camera: { type: "string" },
           limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+          source: {
+            type: "string",
+            enum: ["harness", "frigate"],
+            default: "harness",
+            description: "Which event store to read from",
+          },
+          severity: { type: "string", enum: ["normal", "notable", "critical"] },
+          origin: { type: "string", description: "e.g. 'motion', 'status_online', 'manual_query'" },
         },
         required: [],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_current_scene",
+      description:
+        "Get the local vision agent's (T2 / Ollama) most recent free-text " +
+        "description of what it sees on a camera. Cheap call, no cloud cost. " +
+        "Use this when the user asks 'what do you see right now', 'is anything " +
+        "happening', or wants a fast read on scene state before paying for T3.",
+      parameters: {
+        type: "object",
+        properties: {
+          camera: { type: "string", description: "Frigate camera wire name" },
+        },
+        required: ["camera"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_router_status",
+      description:
+        "Inspect the cost-control router: current mode, T2/T3 ratios, recent " +
+        "telemetry latencies, and the Tier-0 ingestor's view of Frigate. Useful " +
+        "for answering 'how expensive is this running' and 'is the system healthy'.",
+      parameters: { type: "object", properties: {}, required: [] },
     },
   },
   {
@@ -103,6 +153,30 @@ const TOOLS = [
 ];
 
 // ---- Tool execution ---------------------------------------------------------
+
+// Pull the most operator-relevant fields out of an event row's JSON payload.
+// The full payload is heavy (full T3 detections, etc.) — we don't want to
+// stuff that into the LLM's context for every event.
+function summarizeEventPayload(row) {
+  // listEvents already parses payload — but be defensive in case the caller
+  // passes a raw string.
+  let p = row.payload;
+  if (typeof p === "string") {
+    try { p = JSON.parse(p); } catch { p = {}; }
+  }
+  if (!p || typeof p !== "object") p = {};
+  const out = {};
+  if (p.scene) out.scene = String(p.scene).slice(0, 120);
+  if (p.alert_type) out.alert_type = p.alert_type;
+  if (p.severity) out.severity = p.severity;
+  if (p.confidence != null) out.confidence = p.confidence;
+  if (p.tier0_meta?.channel) out.channel = p.tier0_meta.channel;
+  if (p.tier0_meta?.next) out.status_next = p.tier0_meta.next;
+  if (Array.isArray(p.objects) && p.objects.length) {
+    out.objects = p.objects.slice(0, 5).map((o) => o.label ?? "?");
+  }
+  return out;
+}
 
 async function runTool(name, args, ctx) {
   try {
@@ -139,18 +213,106 @@ async function runTool(name, args, ctx) {
     if (name === "get_recent_events") {
       const camera = args?.camera || undefined;
       const limit = Math.min(Math.max(Number(args?.limit ?? 10), 1), 50);
-      const events = await frigate.getEvents({ camera, limit });
+      const source = args?.source === "frigate" ? "frigate" : "harness";
+      if (source === "frigate") {
+        const events = await frigate.getEvents({ camera, limit });
+        return {
+          ok: true,
+          source: "frigate",
+          count: events.length,
+          note:
+            events.length === 0
+              ? "Frigate's detector is currently disabled, so its event store is empty. Try source='harness' for our own ingest."
+              : undefined,
+          events: events.map((e) => ({
+            id: e.id,
+            camera: e.camera,
+            label: e.label,
+            start_time: e.start_time,
+            end_time: e.end_time,
+            score: e.data?.score ?? e.top_score ?? null,
+          })),
+        };
+      }
+      // source === "harness" — read our own event log.
+      const rows = listHarnessEvents(ctx.db, {
+        camera,
+        limit,
+        severity: typeof args?.severity === "string" ? args.severity : undefined,
+        origin: typeof args?.origin === "string" ? args.origin : undefined,
+      });
       return {
         ok: true,
-        count: events.length,
-        events: events.map((e) => ({
-          id: e.id,
-          camera: e.camera,
-          label: e.label,
-          start_time: e.start_time,
-          end_time: e.end_time,
-          score: e.data?.score ?? e.top_score ?? null,
+        source: "harness",
+        count: rows.length,
+        events: rows.map((r) => ({
+          event_id: r.event_id,
+          stage: r.stage,
+          camera: r.camera,
+          origin: r.origin,
+          severity: r.severity,
+          created_at: r.created_at,
+          // Trim payload — full record is available via /api/agent/events/:event_id
+          payload_summary: summarizeEventPayload(r),
         })),
+      };
+    }
+    if (name === "get_current_scene") {
+      if (!ctx?.harness?.analyzeImageLocal) {
+        return { ok: false, error: "harness_not_available" };
+      }
+      const camera = String(args?.camera ?? "").trim();
+      if (!camera) return { ok: false, error: "camera required" };
+      const cams = await frigate.listCameras();
+      if (!cams.find((c) => c.name === camera)) {
+        return {
+          ok: false,
+          error: `unknown camera '${camera}'`,
+          available: cams.map((c) => c.name),
+        };
+      }
+      try {
+        const snap = await frigate.getSnapshot(camera, { height: 480 });
+        const result = await ctx.harness.analyzeImageLocal({
+          imageBuffer: snap.body,
+          camera,
+        });
+        return {
+          ok: true,
+          camera,
+          tier: "T2",
+          model: result.tier2_meta?.model ?? null,
+          tookMs: result.tier2_meta?.tookMs ?? null,
+          scene: result.scene ?? "",
+          severity: result.severity ?? "normal",
+          alert_type: result.alert_type ?? null,
+          confidence: result.confidence ?? 0,
+          status: result.ok ? "ok" : "error",
+        };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+    if (name === "get_router_status") {
+      if (!ctx?.harness?.status) {
+        return { ok: false, error: "harness_not_available" };
+      }
+      const s = ctx.harness.status();
+      // Slim it down to the operator-relevant pieces; full status is at /api/agent/status.
+      const cameraQuotas = {};
+      for (const [key, counts] of Object.entries(s.quota ?? {})) {
+        if (!key.startsWith("cam:")) continue;
+        cameraQuotas[key] = counts;
+      }
+      return {
+        ok: true,
+        router_mode: process.env.DETECTION_ROUTER_MODE ?? "t2-gates-t3 (default)",
+        t3_refresh_ms: Number(process.env.DETECTION_T3_REFRESH_MS ?? 15_000),
+        t3_cache_ttl_ms: Number(process.env.DETECTION_T3_CACHE_TTL_MS ?? 30_000),
+        tier3: s.tier3,
+        tier0: s.tier0,
+        quota_cameras: cameraQuotas,
+        latencies: s.telemetry?.latencies ?? {},
       };
     }
     if (name === "propose_alert_rule") {
@@ -229,7 +391,7 @@ async function* streamSseFromOpenAI(res) {
   }
 }
 
-export async function* streamChatGpt({ messages, camera, cameraLabel, db, user, signal }) {
+export async function* streamChatGpt({ messages, camera, cameraLabel, db, user, harness, signal }) {
   if (!isChatConfigured()) {
     yield {
       type: "text",
@@ -304,7 +466,7 @@ export async function* streamChatGpt({ messages, camera, cameraLabel, db, user, 
       parsed = { _raw: acc.argsBuf };
     }
     yield { type: "tool", name: acc.name, args: parsed };
-    const result = await runTool(acc.name, parsed, { db, user });
+    const result = await runTool(acc.name, parsed, { db, user, harness });
     yield { type: "tool_result", name: acc.name, result };
     toolCalls.push({
       id: acc.id,

@@ -76,11 +76,16 @@ export function start(deps) {
     intervalMs: 60_000,
   });
 
+  // T0 ingestor — Frigate WS for status transitions + recordings/summary
+  // poll for hourly motion totals. See tier0.mjs for what's captured today.
+  tier0.startFrigateIngestor({ frigate: deps.frigate });
+
   started = true;
 }
 
 export function stop() {
   if (!started) return;
+  tier0.stop();
   tier1.stop();
   tier2.stop();
   eventlog.stop();
@@ -295,6 +300,7 @@ export function status() {
     quota: _gate?.snapshot?.() ?? {},
     telemetry: telemetrySnapshot(),
     memory: workingMemory.inspect(),
+    tier0: tier0.inspect(),
     tier3: tier3.ping(),
   };
 }

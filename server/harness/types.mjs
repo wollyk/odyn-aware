@@ -34,7 +34,7 @@
 // the frontend mirrors this in src/features/live/types.ts.
 
 /**
- * @typedef {"motion"|"object_detected"|"audio_event"|"manual_query"} EventOrigin
+ * @typedef {"motion"|"object_detected"|"audio_event"|"manual_query"|"status_online"|"status_offline"|"motion_summary"} EventOrigin
  *
  * @typedef {{label: string, score: number, bbox: [number,number,number,number]}} BBoxDetection
  *   Bbox is normalized [x, y, w, h] in 0..1.
@@ -145,5 +145,9 @@ export function newDetectionEvent(fields) {
     objects: Array.isArray(fields.objects) ? fields.objects : [],
     snapshot_url: fields.snapshot_url,
     meta: fields.meta ?? {},
+    // Optional per-stage metadata. tier0_meta lets the ingestor stash the
+    // upstream source (frigate-ws, recordings-summary, manual-poll) without
+    // colliding with stage-1+ fields that get appended later in the pipeline.
+    tier0_meta: fields.tier0_meta,
   };
 }

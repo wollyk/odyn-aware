@@ -595,6 +595,9 @@ const server = http.createServer(async (req, res) => {
           cameraLabel,
           db,
           user: { id: me.user_id, email: me.email, role: me.role },
+          // Inject the harness public surface so chat tools can read T2 scene,
+          // router status, etc. without agent.mjs ever importing harness/*.
+          harness,
           signal: ac.signal,
         })) {
           writeEvent(evt);
@@ -636,6 +639,11 @@ const server = http.createServer(async (req, res) => {
 //   - Either side closing tears the other down within ~50ms; no zombie sockets.
 //   - All upstream errors are swallowed and logged; api server stays alive.
 const camStreamWss = new WebSocketServer({ noServer: true });
+
+// Set of every open (client, upstream) WS pair. Lets us drain cleanly on
+// SIGTERM instead of waiting 90s for systemd to kill us. Each entry is a
+// `() => void` that closes both sides and removes itself from the set.
+const openStreamCloseFns = new Set();
 
 server.on("upgrade", async (req, socket, head) => {
   try {
@@ -680,10 +688,15 @@ server.on("upgrade", async (req, socket, head) => {
     // if Frigate rejects auth or the camera, we surface 502 cleanly.
     upstream.once("open", () => {
       camStreamWss.handleUpgrade(req, socket, head, (client) => {
+        let closer;
         const closeBoth = (reason) => {
           try { client.close(1011, reason); } catch {}
           try { upstream.close(); } catch {}
+          if (closer) openStreamCloseFns.delete(closer);
         };
+        // Register for graceful-shutdown drain.
+        closer = () => closeBoth("server_shutdown");
+        openStreamCloseFns.add(closer);
 
         // client -> upstream
         client.on("message", (data, isBinary) => {
@@ -725,9 +738,36 @@ server.listen(PORT, HOST, () => {
   console.log(`[auroraview-api] listening on http://${HOST}:${PORT}`);
 });
 
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    console.log(`[auroraview-api] received ${sig}, shutting down`);
-    server.close(() => process.exit(0));
+// Graceful shutdown — without explicit draining of long-lived WebSockets,
+// `server.close()` waits forever and systemd kills us at the 90s timeout.
+// We:
+//   1. Stop accepting new HTTP connections.
+//   2. Close every open MSE proxy pair (clients reconnect on restart).
+//   3. Stop the harness (which closes its own WS to Frigate + cancels timers).
+//   4. Wait up to 5s for the http server to drain, then exit.
+let shuttingDown = false;
+function gracefulShutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[auroraview-api] received ${sig}, shutting down`);
+  server.close(() => {
+    console.log("[auroraview-api] server.close completed");
   });
+  // Drain MSE pairs.
+  const n = openStreamCloseFns.size;
+  for (const fn of [...openStreamCloseFns]) {
+    try { fn(); } catch (err) { console.warn("[shutdown] close fn threw:", err?.message); }
+  }
+  openStreamCloseFns.clear();
+  console.log(`[auroraview-api] closed ${n} MSE stream(s)`);
+  // Stop the harness (T0 ws, T1, eventlog, health timers).
+  try { harness.stop(); } catch (err) { console.warn("[shutdown] harness.stop threw:", err?.message); }
+  // Hard-cap the wait: if anything still holds the loop open, force-exit.
+  setTimeout(() => {
+    console.log("[auroraview-api] forced exit after drain timeout");
+    process.exit(0);
+  }, 5000).unref();
+}
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => gracefulShutdown(sig));
 }

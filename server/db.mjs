@@ -331,7 +331,10 @@ export function appendEvent(db, row) {
  * @param {object} db
  * @param {{ camera?: string, tenant_id?: string, severity?: string, since_ms?: number, limit?: number }} [filter]
  */
-export function listEvents(db, { camera, tenant_id, severity, since_ms, limit = 100 } = {}) {
+export function listEvents(
+  db,
+  { camera, tenant_id, severity, origin, stage, since_ms, limit = 100 } = {},
+) {
   const where = [];
   const params = {};
   if (camera) {
@@ -345,6 +348,14 @@ export function listEvents(db, { camera, tenant_id, severity, since_ms, limit = 
   if (severity) {
     where.push("severity = @severity");
     params.severity = severity;
+  }
+  if (origin) {
+    where.push("origin = @origin");
+    params.origin = origin;
+  }
+  if (stage) {
+    where.push("stage = @stage");
+    params.stage = stage;
   }
   if (since_ms) {
     // SQLite ISO timestamps compare correctly as strings; convert ms to ISO.

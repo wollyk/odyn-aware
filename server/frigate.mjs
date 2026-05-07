@@ -263,6 +263,48 @@ export function invalidateCache() {
   cachedConfigAt = 0;
 }
 
+// Open Frigate's general events WebSocket at /ws.
+//
+// What this WS actually emits (verified empirically on v0.17.1 with
+// detect.enabled=false):
+//   - "<cam>/status/detect"  : "online" — heartbeat (~10s cadence)
+//   - "<cam>/status/audio"   : "online"
+//   - "<cam>/status/record"  : "online"
+//   - "stats"                : full stats payload (~30s cadence)
+//
+// What it does NOT emit in this configuration:
+//   - "<cam>/motion"     — needs MQTT broker configured in Frigate
+//   - "<cam>/<label>"    — needs detect.enabled=true (we have it off)
+//   - "events"           — same, needs detector
+//
+// So the ingestor we build on top of this WS is more of a "Frigate is
+// alive" channel than a "things are happening" channel. For real motion
+// data we either need MQTT plumbing or per-camera snapshot diffs (later).
+export async function openEventsWs() {
+  const token = await loginIfNeeded();
+  const base = new URL(FRIGATE_BASE);
+  const wsScheme = base.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${wsScheme}//${base.host}/ws`;
+  const ws = new WebSocket(url, {
+    headers: { Cookie: `frigate_token=${token}` },
+    rejectUnauthorized: false,
+    perMessageDeflate: false,
+    handshakeTimeout: 8000,
+  });
+  return ws;
+}
+
+// Per-camera motion summary — buckets of motion-frame-count by hour for
+// the last 24 hours. Useful for daily summaries and "how much was happening
+// at 2pm" queries.
+export async function getRecordingsSummary(camera) {
+  const res = await frigateFetch(`/api/${encodeURIComponent(camera)}/recordings/summary`);
+  if (res.status !== 200) {
+    throw new Error(`frigate recordings summary failed: ${camera} ${res.status}`);
+  }
+  return JSON.parse(res.body.toString("utf8"));
+}
+
 // Open an upstream MSE WebSocket to Frigate's go2rtc.
 //
 // Returns a `ws` WebSocket already authenticated with our cached frigate_token.
