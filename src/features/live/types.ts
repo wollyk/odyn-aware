@@ -28,7 +28,29 @@ export type DetectionResult = {
   status: "ok" | "vision_disabled" | "error" | "frigate_not_configured";
   model: string | null;
   tookMs: number;
-  tier?: "T2" | "T3";
+  /** Phase-3 router result. "T2-then-T3" = fresh paid call this tick.
+   *  "T2-cached-T3" = paid call from <30s ago is being reused.
+   *  "T2-only" = T2 ran, router gated T3.
+   *  "T3-only" = always-t3 mode (Phase-2 compat). */
+  tier?:
+    | "T2"
+    | "T3"
+    | "T2-only"
+    | "T2-then-T3"
+    | "T2-cached-T3"
+    | "T3-only"
+    | "none";
+  /** T2 free-text scene description (Phase 3 sidecar). */
+  local_scene?: string;
+  severity?: "normal" | "notable" | "critical";
+  alert_type?: string | null;
+  confidence?: number;
+  escalation?: {
+    ran: boolean;
+    reason: string;
+    source: "live" | "cache" | "none";
+  };
+  t3_age_ms?: number | null;
 };
 
 /**

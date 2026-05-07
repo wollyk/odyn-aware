@@ -111,6 +111,152 @@ export async function pingTier2() {
   return tier2.ping();
 }
 
+// ---- Phase 3: routed (cost-controlled) detection ---------------------------
+//
+// Per-camera in-memory cache of the last T3 call's bboxes + summary. This
+// is what the operator sees while T2 keeps watch and T3 only refreshes
+// every T3_REFRESH_MS or when something actually changes.
+//
+// Bounded: one entry per camera. Memory is O(cameras * (detections + ~200B)).
+const _t3Cache = new Map(); // camera -> { detections, summary, model, tookMs, ts }
+const T3_CACHE_TTL_MS = Number(process.env.DETECTION_T3_CACHE_TTL_MS ?? 30_000);
+const T3_REFRESH_MS = Number(process.env.DETECTION_T3_REFRESH_MS ?? 15_000);
+const ROUTER_MODE_DEFAULT = process.env.DETECTION_ROUTER_MODE ?? "t2-gates-t3";
+
+function _getCachedT3(camera, now) {
+  const e = _t3Cache.get(camera);
+  if (!e) return null;
+  if (now - e.ts > T3_CACHE_TTL_MS) return null;
+  return e;
+}
+
+/**
+ * Phase 3 orchestrator. Always runs T2 (cheap), conditionally runs T3 (paid),
+ * and returns a unified shape that the live UI can render with one poll.
+ *
+ * Cost-control invariants this function upholds:
+ *   - T3 is rate-limited per-camera (router decides).
+ *   - When T2 says "normal", T3 is skipped entirely.
+ *   - When T2 fails, T3 falls open as a safety net (never zero coverage).
+ *   - Cached T3 bboxes are returned for staleness <= T3_CACHE_TTL_MS.
+ *
+ * @param {{
+ *   imageBuffer: Buffer,
+ *   camera?: string,
+ *   mode?: "always-t3"|"t2-gates-t3"|"t2-only"|"off",
+ *   t3?: { call: ({ imageBuffer: Buffer, camera: string }) => Promise<object> }, // injected for tests
+ *   now?: number,
+ * }} opts
+ * @returns {Promise<{
+ *   tier: "T2-only"|"T2-then-T3"|"T2-cached-T3"|"T3-only"|"none",
+ *   detections: Array,
+ *   summary: string,
+ *   status: string,
+ *   model: string|null,
+ *   tookMs: number,
+ *   local_scene: string,
+ *   severity: "normal"|"notable"|"critical",
+ *   alert_type: string|null,
+ *   confidence: number,
+ *   escalation: { ran: boolean, reason: string, source: "live"|"cache"|"none" },
+ *   t3_age_ms: number|null,
+ * }>}
+ */
+export async function analyzeImageRouted({
+  imageBuffer,
+  camera = "",
+  mode = ROUTER_MODE_DEFAULT,
+  t2,
+  t3,
+  now,
+} = {}) {
+  const wallStart = Date.now();
+  const _now = typeof now === "number" ? now : Date.now();
+  const t2Caller = t2?.call ?? (({ imageBuffer: ib, camera: c }) =>
+    tier2.analyzeFreeText({ image: ib, camera: c })
+  );
+  const t3Caller = t3?.call ?? (({ imageBuffer: ib, camera: c }) =>
+    // Default: real T3 (GPT-4o-mini) via tier3 facade. Lazy-resolved so tests
+    // can override without touching network.
+    tier3.analyzeImage({ imageBuffer: ib, camera: c })
+  );
+
+  // Step 1: T2 always — except when explicitly off.
+  let t2Result = null;
+  if (mode !== "off" && mode !== "always-t3") {
+    t2Result = await t2Caller({ imageBuffer, camera });
+  } else if (mode === "always-t3") {
+    // Skip T2 in always-t3 mode for parity with old behavior (no extra cost).
+    t2Result = { ok: false, severity: "normal", scene: "", alert_type: null, confidence: 0, hits: {} };
+  }
+
+  // Step 2: ask the router whether T3 should run.
+  const cached = _getCachedT3(camera, _now);
+  const decision = router.shouldRunT3FromT2({
+    t2: t2Result,
+    lastT3Ts: cached?.ts ?? null,
+    now: _now,
+    mode,
+    refreshMs: T3_REFRESH_MS,
+  });
+
+  // Step 3: optionally call T3.
+  let t3Live = null;
+  let t3Error = null;
+  if (decision.runT3) {
+    try {
+      t3Live = await t3Caller({ imageBuffer, camera });
+      _t3Cache.set(camera, {
+        detections: t3Live.detections ?? [],
+        summary: t3Live.summary ?? "",
+        model: t3Live.model ?? null,
+        tookMs: t3Live.tookMs ?? null,
+        ts: Date.now(),
+      });
+    } catch (err) {
+      t3Error = err?.message ?? "t3_failed";
+    }
+  }
+
+  // Step 4: assemble the unified response.
+  const cacheAfter = _getCachedT3(camera, _now);
+  const detections = t3Live?.detections ?? cacheAfter?.detections ?? [];
+  const summary = t3Live?.summary ?? cacheAfter?.summary ?? (t2Result?.scene ?? "");
+  const t3Model = t3Live?.model ?? cacheAfter?.model ?? null;
+  const t3AgeMs = cacheAfter ? _now - cacheAfter.ts : null;
+
+  let tier;
+  let source;
+  if (mode === "off") { tier = "none"; source = "none"; }
+  else if (mode === "t2-only") { tier = "T2-only"; source = "none"; }
+  else if (mode === "always-t3") { tier = "T3-only"; source = t3Live ? "live" : "cache"; }
+  else if (t3Live) { tier = "T2-then-T3"; source = "live"; }
+  else if (cacheAfter) { tier = "T2-cached-T3"; source = "cache"; }
+  else { tier = "T2-only"; source = "none"; }
+
+  return {
+    tier,
+    detections,
+    summary,
+    status: t3Error ? "error" : "ok",
+    model: t3Model,
+    tookMs: Date.now() - wallStart,
+    local_scene: t2Result?.scene ?? "",
+    severity: t2Result?.severity ?? "normal",
+    alert_type: t2Result?.alert_type ?? null,
+    confidence: t2Result?.confidence ?? 0,
+    escalation: { ran: Boolean(t3Live), reason: decision.reason, source },
+    t3_age_ms: t3AgeMs,
+    t3_error: t3Error,
+  };
+}
+
+/** Test/diagnostics: clear all cached T3 results (or one camera). */
+export function clearT3Cache(camera = null) {
+  if (camera) _t3Cache.delete(camera);
+  else _t3Cache.clear();
+}
+
 // Quota + telemetry — exposed so the API layer can gate calls and observe
 // latency without reaching into the harness internals.
 export { observeLatency, increment, timed } from "./telemetry.mjs";

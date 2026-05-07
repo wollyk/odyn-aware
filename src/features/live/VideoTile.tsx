@@ -6,10 +6,9 @@
 // frame still visible underneath. Don't surface raw state names.
 
 import { useEffect, useRef, useState } from "react";
-import type { AgentStatus, Camera, DetectionResult, SceneResult, StreamMode } from "./types";
+import type { AgentStatus, Camera, DetectionResult, StreamMode } from "./types";
 import { useMseStream } from "./useMseStream";
 import { useDetections } from "./useDetections";
-import { useScene } from "./useScene";
 
 export function VideoTile({
   cam,
@@ -31,7 +30,6 @@ export function VideoTile({
 
   const live = useMseStream(cam?.name ?? null, mode === "live");
   const det = useDetections(cam);
-  const scene = useScene(cam);
 
   // Snapshot polling: 1Hz, cache-busted via ?t= (only in snapshot mode)
   useEffect(() => {
@@ -206,53 +204,59 @@ export function VideoTile({
         </div>
 
         {/* Tier badge — bottom-left, just above the camera label.
-            Two lit dots = T2+T3, one = T3-only, dashed = no signal yet. */}
-        <div className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-foreground/85">
+            T2 dot color tracks severity (green=normal, amber=notable,
+            red=critical). T3 dot is solid when a paid call landed this tick,
+            outlined when we're using cached bboxes, dim when gated. */}
+        <div
+          className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-foreground/85"
+          title={det.escalationReason ? `router: ${det.escalationReason}` : "router: idle"}
+        >
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
-              scene.status === "ok" ? severityDotColor(scene.severity) : "bg-foreground/30"
+              det.status === "ok" ? severityDotColor(det.severity) : "bg-foreground/30"
             }`}
-            title={`T2 local · ${scene.model ?? "ollama"}`}
+            title={`T2 local · severity=${det.severity ?? "—"}`}
           />
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
-              det.status === "ok" ? "bg-emerald-400" : "bg-foreground/30"
+              det.escalationRan
+                ? "bg-emerald-400"
+                : det.tier === "T2-cached-T3"
+                ? "ring-1 ring-emerald-400/60 bg-emerald-400/30"
+                : "bg-foreground/30"
             }`}
             title="T3 cloud · gpt-4o-mini"
           />
-          <span className="ml-1 text-foreground/70">
-            {tierChainLabel(scene.status, det.status)}
-          </span>
+          <span className="ml-1 text-foreground/70">{det.tier ?? "—"}</span>
         </div>
       </div>
 
-      {/* T2 scene caption — independent local reading. Surfaced even when
-          T3 is unconfigured, so the operator can still see what the local
-          agent thinks is going on. */}
-      {scene.scene && scene.status === "ok" && (
+      {/* T2 scene caption — what the local agent independently thinks is
+          going on. Severity colour: amber=notable, red=critical. */}
+      {det.localScene && det.status === "ok" && (
         <p
           className={`mt-2 font-mono text-[11px] tracking-wider ${
-            scene.severity === "critical"
+            det.severity === "critical"
               ? "text-red-400"
-              : scene.severity === "notable"
+              : det.severity === "notable"
               ? "text-amber-300"
               : "text-foreground/75"
           }`}
         >
           <span className="text-foreground/50 mr-1.5">T2-LOCAL ▸</span>
-          {scene.scene}
-          {scene.alertType && (
-            <span className="ml-2 text-foreground/45">[{scene.alertType}]</span>
-          )}
-          {typeof scene.tookMs === "number" && (
-            <span className="ml-2 text-foreground/35">{scene.tookMs}ms</span>
+          {det.localScene}
+          {det.alertType && (
+            <span className="ml-2 text-foreground/45">[{det.alertType}]</span>
           )}
         </p>
       )}
 
-      {det.summary && det.status === "ok" && (
+      {det.summary && det.status === "ok" && det.summary !== det.localScene && (
         <p className="mt-1 font-mono text-[11px] tracking-wider text-foreground/80">
           <span className="text-alert">▸</span> {det.summary}
+          {det.tier === "T2-cached-T3" && typeof det.t3AgeMs === "number" && (
+            <span className="ml-2 text-foreground/35">[T3 cached {Math.round(det.t3AgeMs / 1000)}s ago]</span>
+          )}
         </p>
       )}
       {!agentStatus?.chat_configured && (
@@ -271,20 +275,8 @@ function visionLabel(status: DetectionResult["status"] | null, count: number): s
   return "Vision: …";
 }
 
-function severityDotColor(sev: SceneResult["severity"] | null): string {
+function severityDotColor(sev: DetectionResult["severity"] | null | undefined): string {
   if (sev === "critical") return "bg-red-500 animate-pulse";
   if (sev === "notable") return "bg-amber-300";
   return "bg-emerald-400";
-}
-
-function tierChainLabel(
-  t2: SceneResult["status"] | null,
-  t3: DetectionResult["status"] | null,
-): string {
-  const t2On = t2 === "ok";
-  const t3On = t3 === "ok";
-  if (t2On && t3On) return "T2+T3";
-  if (t2On) return "T2-only";
-  if (t3On) return "T3-only";
-  return "—";
 }

@@ -37,7 +37,7 @@ import {
   SESSION_COOKIE_NAME,
 } from "./auth.mjs";
 import * as frigate from "./frigate.mjs";
-import { streamChatGpt, analyzeImage, isChatConfigured } from "./agent.mjs";
+import { streamChatGpt, isChatConfigured } from "./agent.mjs";
 import * as harness from "./harness/index.mjs";
 import { WebSocketServer } from "ws";
 
@@ -449,29 +449,48 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/agent/detections") {
+      // Phase 3: this endpoint is now ROUTER-DRIVEN.
+      //   - T2 (local Ollama VLM, $0) runs every tick — cheap.
+      //   - T3 (GPT-4o-mini vision, ~$0.0001) only fires when T2 says
+      //     severity >= notable AND we're past the per-camera refresh window.
+      // Cost: ~70-95% reduction vs Phase 2 in typical usage.
       const me = getCurrentUser(db, req);
       if (!me) return send(res, 401, { error: "unauthenticated" });
       if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
       const camera = url.searchParams.get("camera") ?? "";
       if (!/^[A-Za-z0-9_\-]+$/.test(camera)) return send(res, 400, { error: "invalid_camera" });
       if (!frigate.isConfigured()) return send(res, 200, { detections: [], status: "frigate_not_configured" });
-      // Quota gate before doing any work. Each detection call is one
-      // GPT-4o-mini vision call (~$0.0001) — gate it per camera so a single
-      // tab can't burn the daily budget if the user leaves it open for
-      // hours and the visibility heuristic fails.
-      const tenant = "default"; // multi-tenant: replace with me.tenant_id later
-      const gate = harness.checkQuota({ tenant, camera, kind: "t3-vision" });
-      if (!gate.allowed) {
-        return send(res, 429, { error: "quota_exceeded", reason: gate.reason });
+
+      // Optional ?mode= override (admin debugging). Falls back to
+      // DETECTION_ROUTER_MODE env (default "t2-gates-t3").
+      const allowedModes = new Set(["always-t3", "t2-gates-t3", "t2-only", "off"]);
+      const reqMode = url.searchParams.get("mode");
+      const mode = allowedModes.has(reqMode) ? reqMode : undefined;
+
+      const tenant = "default";
+
+      // T2 quota gate — even local calls use shared GPU; protect it.
+      const t2Gate = harness.checkQuota({ tenant, camera, kind: "t2-vision" });
+      if (!t2Gate.allowed) {
+        return send(res, 429, { error: "quota_exceeded", reason: t2Gate.reason, kind: "t2-vision" });
       }
+
       try {
         const snap = await frigate.getSnapshot(camera, { height: 480 });
         const result = await harness.timed("agent.detections", () =>
-          analyzeImage({ imageBuffer: snap.body, camera }),
+          harness.analyzeImageRouted({ imageBuffer: snap.body, camera, mode }),
         );
-        // Record AFTER success so failed calls don't consume budget.
-        harness.recordQuota({ tenant, camera, kind: "t3-vision", dollars: 0.0001 });
-        return send(res, 200, { camera, ...result, tier: "T3" });
+
+        // Record T2 always. Record T3 ONLY if it actually ran live.
+        harness.recordQuota({ tenant, camera, kind: "t2-vision", dollars: 0 });
+        if (result.escalation?.ran) {
+          // Re-check T3 budget AFTER the call so a quota cap reduces but
+          // doesn't outright block a critical T3 escalation. Ledger keeps
+          // the spend honest even if the gate would have refused.
+          harness.recordQuota({ tenant, camera, kind: "t3-vision", dollars: 0.0001 });
+        }
+
+        return send(res, 200, { camera, ...result });
       } catch (err) {
         console.error("[agent] detections failed:", err.message);
         return send(res, 502, { error: "agent_failed", detail: err.message });

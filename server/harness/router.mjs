@@ -119,6 +119,64 @@ export function shouldEscalateT3(ev, policy = DEFAULT_POLICY) {
 }
 
 /**
+ * Phase 3 — interactive (polling) gate. Decides whether the live detection
+ * polling endpoint should pay for a T3 cloud call given:
+ *
+ *   - the latest T2 verdict (severity + alert_type)
+ *   - when the last T3 call for this camera completed
+ *   - what mode the operator/env has selected
+ *
+ * Pure: no I/O, no clock reads — `now` is injected so tests can drive it.
+ *
+ * Modes:
+ *   "always-t3"    — Phase 2 behavior: T3 every tick. Costly but full coverage.
+ *                    Useful for tuning / golden datasets.
+ *   "t2-gates-t3"  — DEFAULT. T3 only when T2 says >= notable, and only once
+ *                    per T3_REFRESH_MS per camera.
+ *   "t2-only"      — Never call T3. T2 scene description only, no bboxes.
+ *   "off"          — Don't call anything; return last cached.
+ *
+ * @param {{
+ *   t2: { ok: boolean, severity: "normal"|"notable"|"critical", alert_type?: string|null, hits?: object } | null,
+ *   lastT3Ts: number | null,
+ *   now: number,
+ *   mode?: "always-t3"|"t2-gates-t3"|"t2-only"|"off",
+ *   refreshMs?: number,
+ * }} input
+ * @returns {{ runT3: boolean, reason: string }}
+ */
+export function shouldRunT3FromT2({
+  t2,
+  lastT3Ts = null,
+  now,
+  mode = "t2-gates-t3",
+  refreshMs = 15_000,
+} = {}) {
+  if (mode === "off") return { runT3: false, reason: "router_off" };
+  if (mode === "t2-only") return { runT3: false, reason: "t2_only_mode" };
+  if (mode === "always-t3") return { runT3: true, reason: "always_t3_mode" };
+
+  // mode === "t2-gates-t3"
+  if (!t2 || !t2.ok) {
+    // T2 failed — fall open to T3 so we never end up with zero coverage.
+    // This is a deliberate "safety > savings" choice.
+    return { runT3: true, reason: "t2_unavailable_fallback" };
+  }
+  const sevRank = SEVERITY_ORDER[t2.severity ?? "normal"] ?? 0;
+  if (sevRank === 0) {
+    return { runT3: false, reason: `t2_normal:${t2.alert_type ?? "no_trigger"}` };
+  }
+  // T2 says notable+. Rate-limit T3 so a busy scene doesn't burn budget.
+  if (typeof lastT3Ts === "number" && now - lastT3Ts < refreshMs) {
+    return {
+      runT3: false,
+      reason: `rate_limited:${Math.round((refreshMs - (now - lastT3Ts)) / 1000)}s_remaining`,
+    };
+  }
+  return { runT3: true, reason: `t2_${t2.severity}:${t2.alert_type ?? "no_alert_type"}` };
+}
+
+/**
  * For a user-typed chat prompt, classify which tier we should call.
  * Used by /api/agent/chat to keep cheap lookups off T3.
  *
