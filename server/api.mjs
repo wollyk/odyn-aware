@@ -36,6 +36,7 @@ import * as cameraRoutes from "./routes/cameras.mjs";
 import * as agentStatus from "./routes/agent-status.mjs";
 import * as agentEvents from "./routes/agent-events.mjs";
 import * as agentFaces from "./routes/agent-faces.mjs";
+import * as agentWeapon from "./routes/agent-weapon.mjs";
 import * as agentSummaries from "./routes/agent-summaries.mjs";
 import * as agentDetections from "./routes/agent-detections.mjs";
 import * as agentChat from "./routes/agent-chat.mjs";
@@ -71,6 +72,7 @@ const ROUTES = [
   agentStatus,
   agentEvents,
   agentFaces,
+  agentWeapon,
   agentSummaries,
   agentDetections,
   agentChat,

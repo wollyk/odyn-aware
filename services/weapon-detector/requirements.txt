@@ -1,0 +1,16 @@
+# AuroraView weapon-detector sidecar requirements.
+#
+# ultralytics pulls torch (~700MB) + opencv-python-headless (~70MB).
+# That's the cost of having one-line model loading and free NMS. If we ever
+# want to drop torch we can:
+#   1. Run `ultralytics export model=yolov8n.pt format=onnx` once.
+#   2. Switch app.py to onnxruntime + a 30-line letterbox+NMS shim.
+#   3. Pin onnxruntime + numpy + pillow only.
+#
+# Pinned versions are looser than face-embedder because YOLO is less
+# sensitive to numpy major versions.
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+ultralytics>=8.3.0,<9.0

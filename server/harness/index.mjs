@@ -32,6 +32,7 @@ import * as tier1 from "./tier1.mjs";
 import * as tier2 from "./tier2.mjs";
 import * as tier3 from "./tier3.mjs";
 import * as face from "./face.mjs";
+import * as weapon from "./weapon.mjs";
 import * as summary from "./summary.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
@@ -75,6 +76,12 @@ export function start(deps) {
   // matrix. Sidecar reachability is opportunistic; it fails open until
   // the InsightFace service is installed (services/face-embedder).
   face.init({ db: deps.db });
+
+  // Phase 6: weapon / suspicious-object detector. Stateless on the Node
+  // side (no DB lookups), so init() is a no-op marker. Sidecar
+  // reachability is opportunistic: scoreSafe() fails open with
+  // decision="clear" if services/weapon-detector isn't installed yet.
+  weapon.init();
 
   // Phase 5: event-driven daily summaries. Subscribes to TOPIC.ALERT and
   // debounces regen per (day, scope). Runs against local Gemma; falls back
@@ -166,6 +173,29 @@ export function invalidateFaceCache() {
 
 export const FACE_CONFIG = face.FACE_CONFIG;
 
+// ---- Phase 6: weapon / suspicious-object detection -----------------------
+//
+// The Node API only ever calls scoreWeapon directly via debug endpoints
+// (admin-gated). The hot path uses weapon.scoreSafe() inside
+// analyzeImageRouted so a sidecar outage never breaks detection.
+
+/**
+ * Score a single frame for suspicious objects. Throws on sidecar failure;
+ * use the safe wrapper inside the routed pipeline.
+ *
+ * @param {{ imageBuffer: Buffer }} opts
+ */
+export async function scoreWeapon({ imageBuffer } = {}) {
+  return weapon.score(imageBuffer);
+}
+
+/** Health probe for the YOLOv8 sidecar. Returns { ok, model, suspicious_classes, ... }. */
+export async function pingWeaponDetector() {
+  return weapon.ping();
+}
+
+export const WEAPON_CONFIG = weapon.WEAPON_CONFIG;
+
 // ---- Phase 5: daily summaries ---------------------------------------------
 
 /**
@@ -252,28 +282,35 @@ export async function analyzeImageRouted({
     tier3.analyzeImage({ imageBuffer: ib, camera: c })
   );
 
-  // Step 1: T2 + face recognition in parallel. T2 is the slow path (~1-2s
-  // local VLM); face recognition is ~166ms locally so we hide its latency
-  // entirely. Both work on the same already-fetched frame buffer.
+  // Step 1: T2 + face + weapon in parallel. T2 is the slow path (~1-2s
+  // local VLM); face recognition is ~166ms; weapon is ~100-250ms (yolov8n
+  // CPU). All three work on the same already-fetched frame buffer so we
+  // pay the slowest, not the sum.
   //
-  // Face recognition fails open: if the sidecar is down we still get T2.
+  // ALL three fail open: a sidecar outage never blocks detection.
   let t2Result = null;
   let faceResult = null;
+  let weaponResult = null;
   if (mode !== "off" && mode !== "always-t3") {
-    const [t2Settled, faceSettled] = await Promise.allSettled([
+    const [t2Settled, faceSettled, weaponSettled] = await Promise.allSettled([
       t2Caller({ imageBuffer, camera }),
       face.recognize(imageBuffer, { camera, recordMatch: true }).catch((err) => ({
         ok: false, error: err?.message ?? "recognize_failed", faces: [],
       })),
+      weapon.scoreSafe(imageBuffer),
     ]);
     t2Result = t2Settled.status === "fulfilled" ? t2Settled.value : null;
     faceResult = faceSettled.status === "fulfilled" ? faceSettled.value : null;
+    weaponResult = weaponSettled.status === "fulfilled" ? weaponSettled.value : null;
   } else if (mode === "always-t3") {
     // Skip T2 in always-t3 mode for parity with old behavior (no extra cost).
     t2Result = { ok: false, severity: "normal", scene: "", alert_type: null, confidence: 0, hits: {} };
-    // Still run faces so the unknown-face badge surfaces.
-    faceResult = await face.recognize(imageBuffer, { camera, recordMatch: true })
-      .catch((err) => ({ ok: false, error: err?.message ?? "recognize_failed", faces: [] }));
+    // Still run faces + weapons so the badges surface.
+    [faceResult, weaponResult] = await Promise.all([
+      face.recognize(imageBuffer, { camera, recordMatch: true })
+        .catch((err) => ({ ok: false, error: err?.message ?? "recognize_failed", faces: [] })),
+      weapon.scoreSafe(imageBuffer),
+    ]);
   }
 
   // Step 1.5: face-driven severity bump.
@@ -288,6 +325,38 @@ export async function analyzeImageRouted({
       severity: "notable",
       alert_type: t2Result.alert_type ?? "unknown_face",
       hits: { ...(t2Result.hits ?? {}), unknown_face: unknownFaceCount },
+    };
+  }
+
+  // Step 1.6: weapon-driven severity bump.
+  //   The reviewer feedback was explicit: don't claim "weapon" — call it
+  //   "suspicious_object" — and *always* gate the alert behind a T3
+  //   confirmation so we don't surface an embarrassing false positive
+  //   directly to the operator.
+  //
+  //   Behavior: if the YOLO sidecar reports decision="suspicious", we
+  //   ELEVATE severity to "critical" (the highest tier) and stamp
+  //   alert_type="suspicious_object". The router's shouldRunT3FromT2
+  //   already escalates critical to T3 with a tighter cooldown, so this
+  //   plumbs in naturally — no router rule change needed.
+  //
+  //   We never DOWN-grade. If T2 already said critical, we keep T2's
+  //   alert_type but stash the suspicious class in hits[].
+  const weaponSuspicious =
+    weaponResult?.ok &&
+    weaponResult.decision === "suspicious" &&
+    weaponResult.suspicious_object_score >= weaponResult.threshold;
+  if (weaponSuspicious && t2Result) {
+    const wasCritical = t2Result.severity === "critical";
+    t2Result = {
+      ...t2Result,
+      severity: "critical",
+      alert_type: wasCritical ? t2Result.alert_type : "suspicious_object",
+      hits: {
+        ...(t2Result.hits ?? {}),
+        suspicious_object: weaponResult.suspicious_class ?? "unknown",
+        suspicious_score: Number(weaponResult.suspicious_object_score.toFixed(3)),
+      },
     };
   }
 
@@ -366,6 +435,18 @@ export async function analyzeImageRouted({
     face_status: faceResult?.ok === false ? (faceResult.error ?? "face_failed") : "ok",
     known_face_count: (faceResult?.faces ?? []).filter((f) => f.decision === "match").length,
     unknown_face_count: unknownFaceCount,
+    // Weapon / suspicious-object surface. Always present so the UI can
+    // render a stable shape; values are zeroed when the sidecar is down.
+    weapon: weaponResult ? {
+      decision: weaponResult.decision,
+      suspicious_object_score: typeof weaponResult.suspicious_object_score === "number"
+        ? Number(weaponResult.suspicious_object_score.toFixed(3))
+        : 0,
+      suspicious_class: weaponResult.suspicious_class ?? null,
+      suspicious_count: weaponResult.suspicious_count ?? 0,
+      took_ms: weaponResult.took_ms ?? 0,
+    } : { decision: "clear", suspicious_object_score: 0, suspicious_class: null, suspicious_count: 0, took_ms: 0 },
+    weapon_status: weaponResult?.ok === false ? (weaponResult.error ?? "weapon_failed") : "ok",
   };
 }
 

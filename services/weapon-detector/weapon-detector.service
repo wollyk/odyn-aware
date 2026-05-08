@@ -1,0 +1,44 @@
+[Unit]
+Description=AuroraView weapon detector (YOLOv8n suspicious-object scorer)
+After=network.target
+# Don't take the api server down with us — they're independent.
+Wants=odyn-api.service
+
+[Service]
+Type=simple
+User=kamal
+Group=kamal
+WorkingDirectory=/var/www/odyn-aware/current/services/weapon-detector
+Environment=WEAPON_DETECTOR_HOST=127.0.0.1
+Environment=WEAPON_DETECTOR_PORT=8766
+# Stage 1 model. Stage 2 (firearm fine-tune) will run as a SEPARATE service
+# (weapon-detector-firearms.service) on a different port so we can A/B and
+# combine scores in the Node harness without coupling the two model pipes.
+Environment=WEAPON_MODEL=yolov8n.pt
+Environment=WEAPON_SUSPICIOUS_CLASSES=knife,scissors,baseball bat
+Environment=WEAPON_CONF_THRESHOLD=0.35
+# ultralytics caches downloaded weights under HOME/.cache/ultralytics.
+# Pin a writable dir so we don't redownload across restarts.
+Environment=HOME=/var/lib/auroraview-weapon-detector
+ExecStart=/var/www/odyn-aware/current/services/weapon-detector/.venv/bin/uvicorn app:api --host 127.0.0.1 --port 8766 --log-level info
+Restart=on-failure
+RestartSec=5
+# First boot downloads ~12MB of weights + lets ultralytics import torch.
+# 180s is generous; typical first start is ~30s.
+TimeoutStartSec=180
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Security hardening — sidecar is a single-purpose HTTP service.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auroraview-weapon-detector
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
