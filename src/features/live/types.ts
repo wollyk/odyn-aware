@@ -21,6 +21,28 @@ export type Detection = {
   bbox: [number, number, number, number];
 };
 
+/** Phase-4 face recognizer per-face record (bbox stripped server-side
+ *  for the live polling path; bboxes come from T3 instead). */
+export type FaceRecord = {
+  decision: "match" | "unknown" | "low_quality";
+  person_id: number | null;
+  person_name: string | null;
+  similarity: number;
+  quality: number;
+  bbox: [number, number, number, number] | null;
+};
+
+/** Phase-6 weapon / suspicious-object summary. The harness always returns
+ *  this object — when the sidecar is down it's zeroed and weapon_status
+ *  reports the reason. */
+export type WeaponSummary = {
+  decision: "clear" | "suspicious";
+  suspicious_object_score: number;
+  suspicious_class: string | null;
+  suspicious_count: number;
+  took_ms: number;
+};
+
 export type DetectionResult = {
   camera: string;
   detections: Detection[];
@@ -51,6 +73,14 @@ export type DetectionResult = {
     source: "live" | "cache" | "none";
   };
   t3_age_ms?: number | null;
+  /** Phase-4 face recognition surface. */
+  faces?: FaceRecord[];
+  face_status?: string;
+  known_face_count?: number;
+  unknown_face_count?: number;
+  /** Phase-6 weapon / suspicious-object surface. */
+  weapon?: WeaponSummary;
+  weapon_status?: string;
 };
 
 /**

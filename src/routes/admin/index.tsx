@@ -1,5 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  AdminHeader,
+  AuthDeniedScreen,
+  AuthLoadingScreen,
+  useAdminAuth,
+} from "@/components/admin-shell";
 
 export const Route = createFileRoute("/admin/")({
   component: AdminDashboard,
@@ -20,8 +26,7 @@ type SortKey = "id" | "created_at" | "name" | "email" | "company" | "environment
 
 function AdminDashboard() {
   const navigate = useNavigate();
-  const [authState, setAuthState] = useState<"loading" | "ok" | "denied">("loading");
-  const [me, setMe] = useState<{ email: string; role: string } | null>(null);
+  const { state: authState, me, logout, error: authError } = useAdminAuth();
   const [rows, setRows] = useState<Submission[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -31,35 +36,6 @@ function AdminDashboard() {
   const [sort, setSort] = useState<SortKey>("id");
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [selected, setSelected] = useState<Submission | null>(null);
-
-  // Auth check on mount.
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/auth/me", { credentials: "include" })
-      .then(async (r) => {
-        if (cancelled) return;
-        if (r.status === 401) {
-          navigate({ to: "/admin/login" });
-          return;
-        }
-        if (!r.ok) throw new Error(`auth check failed (${r.status})`);
-        const data = await r.json();
-        if (data.user?.role !== "admin") {
-          setAuthState("denied");
-          return;
-        }
-        setMe(data.user);
-        setAuthState("ok");
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setAuthState("denied");
-        setError(err instanceof Error ? err.message : "auth check failed");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [navigate]);
 
   const loadRows = useCallback(async () => {
     setLoading(true);
@@ -110,70 +86,12 @@ function AdminDashboard() {
     }
   };
 
-  async function logout() {
-    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
-    navigate({ to: "/admin/login" });
-  }
-
-  if (authState === "loading") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-          Verifying session…
-        </span>
-      </div>
-    );
-  }
-  if (authState === "denied") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="max-w-md text-center">
-          <p className="font-mono text-xs uppercase tracking-widest text-alert">Access denied</p>
-          <p className="mt-3 text-sm text-muted-foreground">{error ?? "This account does not have admin access."}</p>
-          <button
-            type="button"
-            onClick={() => navigate({ to: "/admin/login" })}
-            className="mt-6 inline-flex items-center gap-2 border border-foreground/80 px-4 py-2 text-xs font-medium tracking-widest uppercase text-foreground hover:bg-foreground hover:text-background transition-colors"
-          >
-            Sign in
-          </button>
-        </div>
-      </div>
-    );
-  }
+  if (authState === "loading") return <AuthLoadingScreen />;
+  if (authState === "denied") return <AuthDeniedScreen error={authError ?? error} />;
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border/60 bg-background/70 backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-6">
-          <div className="flex items-center gap-3">
-            <a href="/" className="font-mono text-sm font-semibold tracking-[0.3em] text-foreground">AURORAVIEW</a>
-            <span className="label-mono">/ Admin</span>
-          </div>
-          <nav className="flex items-center gap-6">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-foreground border-b border-foreground pb-0.5">
-              Submissions
-            </span>
-            <a
-              href="/admin/live"
-              className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Live View
-            </a>
-          </nav>
-          <div className="flex items-center gap-4">
-            <span className="hidden sm:inline font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              {me?.email}
-            </span>
-            <button
-              onClick={logout}
-              className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Sign out
-            </button>
-          </div>
-        </div>
-      </header>
+      <AdminHeader active="submissions" me={me} logout={logout} />
 
       <main className="mx-auto max-w-7xl px-6 py-10">
         <div className="mb-8 flex items-center gap-3">

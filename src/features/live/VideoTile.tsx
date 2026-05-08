@@ -6,7 +6,14 @@
 // frame still visible underneath. Don't surface raw state names.
 
 import { useEffect, useRef, useState } from "react";
-import type { AgentStatus, Camera, DetectionResult, StreamMode } from "./types";
+import type {
+  AgentStatus,
+  Camera,
+  DetectionResult,
+  FaceRecord,
+  StreamMode,
+  WeaponSummary,
+} from "./types";
 import { useMseStream } from "./useMseStream";
 import { useDetections } from "./useDetections";
 
@@ -231,6 +238,21 @@ export function VideoTile({
         </div>
       </div>
 
+      {/* Phase-4/6 status strip: face recognizer + weapon detector summary
+          for this tick. Always rendered when vision is on so the operator
+          can confirm the specialist sidecars are alive even on quiet frames. */}
+      {det.status === "ok" && (
+        <div className="mt-2 flex flex-wrap items-center gap-3 font-mono text-[10px] uppercase tracking-widest">
+          <FaceBadge
+            status={det.faceStatus}
+            knownCount={det.knownFaceCount}
+            unknownCount={det.unknownFaceCount}
+            faces={det.faces}
+          />
+          <WeaponBadge status={det.weaponStatus} weapon={det.weapon} />
+        </div>
+      )}
+
       {/* T2 scene caption — what the local agent independently thinks is
           going on. Severity colour: amber=notable, red=critical. */}
       {det.localScene && det.status === "ok" && (
@@ -279,4 +301,119 @@ function severityDotColor(sev: DetectionResult["severity"] | null | undefined): 
   if (sev === "critical") return "bg-red-500 animate-pulse";
   if (sev === "notable") return "bg-amber-300";
   return "bg-emerald-400";
+}
+
+/**
+ * FACES badge — Phase-4 surface.
+ *   ok + 0/0          → dim (no faces in frame, system healthy)
+ *   ok + N known      → emerald
+ *   ok + any unknown  → amber, with names of any matches
+ *   error             → red, "engine offline"
+ */
+function FaceBadge({
+  status,
+  knownCount,
+  unknownCount,
+  faces,
+}: {
+  status: string;
+  knownCount: number;
+  unknownCount: number;
+  faces: FaceRecord[];
+}) {
+  if (status !== "ok") {
+    return (
+      <span className="flex items-center gap-1.5 bg-card/40 border border-border/60 px-2 py-1 text-alert/80">
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-alert" />
+        Faces · engine offline
+      </span>
+    );
+  }
+  const total = knownCount + unknownCount;
+  const dotClass =
+    unknownCount > 0
+      ? "bg-amber-400"
+      : knownCount > 0
+      ? "bg-emerald-400"
+      : "bg-foreground/30";
+  const knownNames = faces
+    .filter((f) => f.decision === "match" && f.person_name)
+    .map((f) => f.person_name)
+    .filter((v, i, arr): v is string => Boolean(v) && arr.indexOf(v) === i);
+  const label =
+    total === 0
+      ? "no faces"
+      : `${knownCount} known · ${unknownCount} unknown`;
+  return (
+    <span
+      className={`flex items-center gap-1.5 bg-card/40 border border-border/60 px-2 py-1 ${
+        unknownCount > 0 ? "text-amber-200" : "text-foreground/85"
+      }`}
+      title={
+        knownNames.length
+          ? `Known: ${knownNames.join(", ")}`
+          : total === 0
+          ? "No faces detected this tick"
+          : "Faces present"
+      }
+    >
+      <span className={`inline-block h-1.5 w-1.5 rounded-full ${dotClass}`} />
+      Faces · {label}
+      {knownNames.length > 0 && (
+        <span className="ml-1 text-foreground/60 normal-case tracking-normal">
+          ({knownNames.join(", ")})
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * WEAPON badge — Phase-6 surface.
+ *   ok + clear      → dim, "clear"
+ *   ok + suspicious → red, pulsing, with class + score
+ *   error           → red outline, "engine offline"
+ */
+function WeaponBadge({
+  status,
+  weapon,
+}: {
+  status: string;
+  weapon: WeaponSummary;
+}) {
+  if (status !== "ok") {
+    return (
+      <span className="flex items-center gap-1.5 bg-card/40 border border-border/60 px-2 py-1 text-alert/80">
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-alert" />
+        Weapon · engine offline
+      </span>
+    );
+  }
+  const isSuspicious = weapon.decision === "suspicious";
+  if (!isSuspicious) {
+    return (
+      <span
+        className="flex items-center gap-1.5 bg-card/40 border border-border/60 px-2 py-1 text-foreground/70"
+        title={`Last scan ${weapon.took_ms}ms · score ${weapon.suspicious_object_score.toFixed(2)}`}
+      >
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-foreground/30" />
+        Weapon · clear
+      </span>
+    );
+  }
+  return (
+    <span
+      className="flex items-center gap-1.5 bg-red-950/60 border border-red-500/70 px-2 py-1 text-red-200"
+      title={`score ${weapon.suspicious_object_score.toFixed(2)} · ${weapon.suspicious_count} object(s) · escalated to T3`}
+    >
+      <span className="inline-block h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+      Weapon · suspicious
+      {weapon.suspicious_class && (
+        <span className="ml-1 text-red-100">[{weapon.suspicious_class}]</span>
+      )}
+      <span className="ml-1 text-red-300/80">
+        {Math.round(weapon.suspicious_object_score * 100)}%
+      </span>
+    </span>
+  );
 }

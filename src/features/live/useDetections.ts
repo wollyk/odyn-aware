@@ -12,9 +12,17 @@
 //   - server-side per-camera quota (returns 429)
 
 import { useEffect, useState } from "react";
-import type { Camera, Detection, DetectionResult } from "./types";
+import type { Camera, Detection, DetectionResult, FaceRecord, WeaponSummary } from "./types";
 
 const POLL_MS = 5000;
+
+const EMPTY_WEAPON: WeaponSummary = {
+  decision: "clear",
+  suspicious_object_score: 0,
+  suspicious_class: null,
+  suspicious_count: 0,
+  took_ms: 0,
+};
 
 export type UseDetectionsResult = {
   detections: Detection[];
@@ -28,6 +36,14 @@ export type UseDetectionsResult = {
   escalationRan: boolean;
   escalationReason: string | null;
   t3AgeMs: number | null;
+  /** Phase-4 faces (this tick). */
+  faces: FaceRecord[];
+  faceStatus: string;
+  knownFaceCount: number;
+  unknownFaceCount: number;
+  /** Phase-6 weapon summary (always present — zeroed when sidecar down). */
+  weapon: WeaponSummary;
+  weaponStatus: string;
 };
 
 const EMPTY: UseDetectionsResult = {
@@ -41,6 +57,12 @@ const EMPTY: UseDetectionsResult = {
   escalationRan: false,
   escalationReason: null,
   t3AgeMs: null,
+  faces: [],
+  faceStatus: "ok",
+  knownFaceCount: 0,
+  unknownFaceCount: 0,
+  weapon: EMPTY_WEAPON,
+  weaponStatus: "ok",
 };
 
 export function useDetections(cam: Camera | null): UseDetectionsResult {
@@ -79,6 +101,12 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
             escalationRan: Boolean(d.escalation?.ran),
             escalationReason: d.escalation?.reason ?? null,
             t3AgeMs: typeof d.t3_age_ms === "number" ? d.t3_age_ms : null,
+            faces: d.faces ?? [],
+            faceStatus: d.face_status ?? "ok",
+            knownFaceCount: d.known_face_count ?? 0,
+            unknownFaceCount: d.unknown_face_count ?? 0,
+            weapon: d.weapon ?? EMPTY_WEAPON,
+            weaponStatus: d.weapon_status ?? "ok",
           });
         }
       } catch {

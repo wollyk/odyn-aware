@@ -1,18 +1,23 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import type { AgentStatus, StreamMode } from "@/features/live/types";
 import { useCameras } from "@/features/live/useCameras";
 import { VideoTile } from "@/features/live/VideoTile";
 import { ChatPanel } from "@/features/live/ChatPanel";
+import { DailySummaryPanel } from "@/features/live/DailySummaryPanel";
+import {
+  AdminHeader,
+  AuthDeniedScreen,
+  AuthLoadingScreen,
+  useAdminAuth,
+} from "@/components/admin-shell";
 
 export const Route = createFileRoute("/admin/live")({
   component: AdminLive,
 });
 
 function AdminLive() {
-  const navigate = useNavigate();
-  const [authState, setAuthState] = useState<"loading" | "ok" | "denied">("loading");
-  const [me, setMe] = useState<{ email: string; role: string } | null>(null);
+  const { state: authState, me, logout, error: authError } = useAdminAuth();
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
 
   // Resilient camera fetch: 30s background refresh, never blanks the dropdown
@@ -28,38 +33,19 @@ function AdminLive() {
     [camList.cameras, camera],
   );
 
-  // Auth check + agent status. Camera fetch is owned by useCameras().
+  // Pull agent status once we're authenticated. Auth itself is owned by
+  // useAdminAuth(); this effect only does the harness-status fetch.
   useEffect(() => {
+    if (authState !== "ok") return;
     let cancelled = false;
-    (async () => {
-      try {
-        const meRes = await fetch("/api/auth/me", { credentials: "include" });
-        if (cancelled) return;
-        if (meRes.status === 401) return navigate({ to: "/admin/login" });
-        const meJson = await meRes.json();
-        if (meJson.user?.role !== "admin") {
-          setAuthState("denied");
-          return;
-        }
-        setMe(meJson.user);
-
-        const statusRes = await fetch("/api/agent/status", { credentials: "include" });
-        if (cancelled) return;
-        if (statusRes.ok) {
-          setAgentStatus(await statusRes.json());
-        }
-        setAuthState("ok");
-      } catch (err) {
-        if (cancelled) return;
-        setAuthState("denied");
-        console.error(err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navigate]);
+    fetch("/api/agent/status", { credentials: "include" })
+      .then(async (r) => {
+        if (cancelled || !r.ok) return;
+        setAgentStatus(await r.json());
+      })
+      .catch(() => { /* harness optional */ });
+    return () => { cancelled = true; };
+  }, [authState]);
 
   // Auto-select first camera once we have any. Survives empty intermediates
   // because useCameras keeps last known good — we never accidentally clear.
@@ -69,73 +55,16 @@ function AdminLive() {
     }
   }, [camList.cameras, camera]);
 
-  async function logout() {
-    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
-    navigate({ to: "/admin/login" });
-  }
-
-  if (authState === "loading") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-          Verifying session…
-        </span>
-      </div>
-    );
-  }
-  if (authState === "denied") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="max-w-md text-center">
-          <p className="font-mono text-xs uppercase tracking-widest text-alert">Access denied</p>
-          <button
-            type="button"
-            onClick={() => navigate({ to: "/admin/login" })}
-            className="mt-6 inline-flex items-center gap-2 border border-foreground/80 px-4 py-2 text-xs font-medium tracking-widest uppercase text-foreground hover:bg-foreground hover:text-background transition-colors"
-          >
-            Sign in
-          </button>
-        </div>
-      </div>
-    );
-  }
+  if (authState === "loading") return <AuthLoadingScreen />;
+  if (authState === "denied") return <AuthDeniedScreen error={authError} />;
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border/60 bg-background/70 backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-[1600px] items-center justify-between px-6">
-          <div className="flex items-center gap-3">
-            <a href="/" className="font-mono text-sm font-semibold tracking-[0.3em] text-foreground">
-              AURORAVIEW
-            </a>
-            <span className="label-mono">/ Admin</span>
-          </div>
-          <nav className="flex items-center gap-6">
-            <a
-              href="/admin"
-              className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Submissions
-            </a>
-            <span className="font-mono text-[10px] uppercase tracking-widest text-foreground border-b border-foreground pb-0.5">
-              Live View
-            </span>
-          </nav>
-          <div className="flex items-center gap-4">
-            <span className="hidden sm:inline font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              {me?.email}
-            </span>
-            <button
-              onClick={logout}
-              className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Sign out
-            </button>
-          </div>
-        </div>
-      </header>
+      <AdminHeader active="live" me={me} logout={logout} maxWidthClass="max-w-[1600px]" />
 
       <main className="mx-auto max-w-[1600px] px-6 py-6">
+        <DailySummaryPanel />
+
         <div className="mb-4 flex items-center gap-4">
           <span className="font-mono text-xs text-alert">[02]</span>
           <span className="label-mono">Live View</span>
