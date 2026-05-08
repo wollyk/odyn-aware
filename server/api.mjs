@@ -538,7 +538,13 @@ const server = http.createServer(async (req, res) => {
           recordMatch: false, // enrollment isn't a "match event"
         });
       } catch (err) {
-        return send(res, 502, { error: "embedder_unreachable", detail: err.message });
+        // Distinguish "embedder said this image is bad" (4xx — caller's
+        // problem) from "embedder is unreachable" (5xx — our problem).
+        const msg = err?.message ?? "";
+        if (/embedder_http_4\d\d/.test(msg)) {
+          return send(res, 422, { error: "embedder_rejected_image", detail: msg });
+        }
+        return send(res, 502, { error: "embedder_unreachable", detail: msg });
       }
       if (!embedded?.faces?.length) {
         return send(res, 422, {
@@ -571,7 +577,11 @@ const server = http.createServer(async (req, res) => {
       try {
         rawEmbed = await harness.embedFace({ imageBuffer });
       } catch (err) {
-        return send(res, 502, { error: "embedder_unreachable_on_store", detail: err.message });
+        const msg = err?.message ?? "";
+        if (/embedder_http_4\d\d/.test(msg)) {
+          return send(res, 422, { error: "embedder_rejected_image_on_store", detail: msg });
+        }
+        return send(res, 502, { error: "embedder_unreachable_on_store", detail: msg });
       }
       const bestRaw = rawEmbed?.faces?.length
         ? [...rawEmbed.faces].sort((a, b) => b.quality - a.quality)[0]
@@ -634,7 +644,11 @@ const server = http.createServer(async (req, res) => {
         });
         return send(res, 200, r);
       } catch (err) {
-        return send(res, 502, { error: "embedder_unreachable", detail: err.message });
+        const msg = err?.message ?? "";
+        if (/embedder_http_4\d\d/.test(msg)) {
+          return send(res, 422, { error: "embedder_rejected_image", detail: msg });
+        }
+        return send(res, 502, { error: "embedder_unreachable", detail: msg });
       }
     }
 
