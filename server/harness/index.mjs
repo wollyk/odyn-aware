@@ -229,13 +229,43 @@ export async function analyzeImageRouted({
     tier3.analyzeImage({ imageBuffer: ib, camera: c })
   );
 
-  // Step 1: T2 always — except when explicitly off.
+  // Step 1: T2 + face recognition in parallel. T2 is the slow path (~1-2s
+  // local VLM); face recognition is ~166ms locally so we hide its latency
+  // entirely. Both work on the same already-fetched frame buffer.
+  //
+  // Face recognition fails open: if the sidecar is down we still get T2.
   let t2Result = null;
+  let faceResult = null;
   if (mode !== "off" && mode !== "always-t3") {
-    t2Result = await t2Caller({ imageBuffer, camera });
+    const [t2Settled, faceSettled] = await Promise.allSettled([
+      t2Caller({ imageBuffer, camera }),
+      face.recognize(imageBuffer, { camera, recordMatch: true }).catch((err) => ({
+        ok: false, error: err?.message ?? "recognize_failed", faces: [],
+      })),
+    ]);
+    t2Result = t2Settled.status === "fulfilled" ? t2Settled.value : null;
+    faceResult = faceSettled.status === "fulfilled" ? faceSettled.value : null;
   } else if (mode === "always-t3") {
     // Skip T2 in always-t3 mode for parity with old behavior (no extra cost).
     t2Result = { ok: false, severity: "normal", scene: "", alert_type: null, confidence: 0, hits: {} };
+    // Still run faces so the unknown-face badge surfaces.
+    faceResult = await face.recognize(imageBuffer, { camera, recordMatch: true })
+      .catch((err) => ({ ok: false, error: err?.message ?? "recognize_failed", faces: [] }));
+  }
+
+  // Step 1.5: face-driven severity bump.
+  //   If T2 says "normal" but we just saw an unknown face, elevate to
+  //   "notable" with alert_type="unknown_face" so the existing
+  //   shouldRunT3FromT2 logic kicks T3 in (rate-limited as usual).
+  //   We never DOWN-grade T2 — only raise.
+  const unknownFaceCount = (faceResult?.faces ?? []).filter((f) => f.decision === "unknown").length;
+  if (unknownFaceCount > 0 && t2Result && t2Result.severity === "normal") {
+    t2Result = {
+      ...t2Result,
+      severity: "notable",
+      alert_type: t2Result.alert_type ?? "unknown_face",
+      hits: { ...(t2Result.hits ?? {}), unknown_face: unknownFaceCount },
+    };
   }
 
   // Step 2: ask the router whether T3 should run.
@@ -300,6 +330,19 @@ export async function analyzeImageRouted({
     escalation: { ran: Boolean(t3Live), reason: decision.reason, source },
     t3_age_ms: t3AgeMs,
     t3_error: t3Error,
+    // Face recognition results for this frame (parallel to T2). Stripped
+    // of bbox JSON because the live UI gets bboxes from T3 instead.
+    faces: (faceResult?.faces ?? []).map((f) => ({
+      decision: f.decision,
+      person_id: f.person_id,
+      person_name: f.person_name,
+      similarity: typeof f.similarity === "number" ? Number(f.similarity.toFixed(3)) : f.similarity,
+      quality: typeof f.quality === "number" ? Number(f.quality.toFixed(3)) : f.quality,
+      bbox: f.bbox,
+    })),
+    face_status: faceResult?.ok === false ? (faceResult.error ?? "face_failed") : "ok",
+    known_face_count: (faceResult?.faces ?? []).filter((f) => f.decision === "match").length,
+    unknown_face_count: unknownFaceCount,
   };
 }
 
