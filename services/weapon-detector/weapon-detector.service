@@ -14,12 +14,20 @@ Environment=WEAPON_DETECTOR_PORT=8766
 # Stage 1 model. Stage 2 (firearm fine-tune) will run as a SEPARATE service
 # (weapon-detector-firearms.service) on a different port so we can A/B and
 # combine scores in the Node harness without coupling the two model pipes.
-Environment=WEAPON_MODEL=yolov8n.pt
+#
+# ABSOLUTE PATH is mandatory here because ProtectSystem=strict makes the
+# WorkingDirectory read-only. ultralytics defaults to downloading bare
+# filenames into the CWD which would fail at startup. install.sh
+# pre-downloads to this exact path during install.
+Environment=WEAPON_MODEL=/var/lib/auroraview-weapon-detector/yolov8n.pt
 Environment=WEAPON_SUSPICIOUS_CLASSES=knife,scissors,baseball bat
 Environment=WEAPON_CONF_THRESHOLD=0.35
-# ultralytics caches downloaded weights under HOME/.cache/ultralytics.
+# ultralytics caches downloaded weights + dataset configs under HOME.
 # Pin a writable dir so we don't redownload across restarts.
 Environment=HOME=/var/lib/auroraview-weapon-detector
+# Some sub-paths ultralytics writes into are derived from XDG_CONFIG_HOME.
+Environment=XDG_CONFIG_HOME=/var/lib/auroraview-weapon-detector/.config
+Environment=YOLO_CONFIG_DIR=/var/lib/auroraview-weapon-detector/.config/Ultralytics
 ExecStart=/var/www/odyn-aware/current/services/weapon-detector/.venv/bin/uvicorn app:api --host 127.0.0.1 --port 8766 --log-level info
 Restart=on-failure
 RestartSec=5
