@@ -20,7 +20,12 @@ Environment=WEAPON_DETECTOR_PORT=8766
 # filenames into the CWD which would fail at startup. install.sh
 # pre-downloads to this exact path during install.
 Environment=WEAPON_MODEL=/var/lib/auroraview-weapon-detector/yolov8n.pt
-Environment=WEAPON_SUSPICIOUS_CLASSES=knife,scissors,baseball bat
+# IMPORTANT: the entire VAR=VALUE pair must be quoted because the value
+# contains a space ("baseball bat" is a single COCO class). Without the
+# outer quotes systemd treats the space as a separator and silently drops
+# everything after it. Same convention works for any future classes
+# containing spaces.
+Environment="WEAPON_SUSPICIOUS_CLASSES=knife,scissors,baseball bat"
 Environment=WEAPON_CONF_THRESHOLD=0.35
 # ultralytics caches downloaded weights + dataset configs under HOME.
 # Pin a writable dir so we don't redownload across restarts.
