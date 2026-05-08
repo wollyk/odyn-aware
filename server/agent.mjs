@@ -32,6 +32,9 @@ import {
   listEvents as listHarnessEvents,
   listPeople,
   listRecentFaceMatches,
+  dayKeyUtc,
+  getDailySummary,
+  listDailySummaries,
 } from "./db.mjs";
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY ?? "";
@@ -167,6 +170,44 @@ const TOOLS = [
             oneOf: [{ type: "integer" }, { type: "string", enum: ["unknown"] }],
           },
           limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_daily_summary",
+      description:
+        "Return today's (or a specified day's) summary of camera activity. " +
+        "Pre-aggregated by the harness and narrated by a local Gemma model — " +
+        "FREE to call. Use this for 'what happened today?', 'how was last " +
+        "night?', or 'recap this week'. If `regenerate` is true, force a " +
+        "fresh summary now (ignores cooldown). Use sparingly.",
+      parameters: {
+        type: "object",
+        properties: {
+          day: {
+            type: "string",
+            description: "YYYY-MM-DD (UTC). Defaults to today.",
+            pattern: "^\\d{4}-\\d{2}-\\d{2}$",
+          },
+          scope: {
+            type: "string",
+            description: "'tenant' (all cameras) or 'camera:<name>'. Defaults to 'tenant'.",
+            default: "tenant",
+          },
+          regenerate: {
+            type: "boolean",
+            description: "Force regen now. Defaults to false.",
+            default: false,
+          },
+          recent_days: {
+            type: "integer",
+            description: "If set, return summaries for the last N days instead of one. Max 14.",
+            minimum: 1, maximum: 14,
+          },
         },
         required: [],
       },
@@ -399,6 +440,61 @@ async function runTool(name, args, ctx) {
           model: r.model,
           event_id: r.event_id,
         })),
+      };
+    }
+    if (name === "get_daily_summary") {
+      const scope = String(args?.scope ?? "tenant").trim();
+      if (scope !== "tenant" && !scope.startsWith("camera:")) {
+        return { ok: false, error: "invalid_scope", detail: "scope must be 'tenant' or 'camera:<name>'" };
+      }
+      const day = (args?.day && /^\d{4}-\d{2}-\d{2}$/.test(args.day)) ? args.day : dayKeyUtc();
+
+      // Multi-day list mode
+      if (Number.isInteger(args?.recent_days)) {
+        const limit = Math.min(Math.max(Number(args.recent_days), 1), 14);
+        const since = new Date(Date.now() - limit * 24 * 3600 * 1000).toISOString().slice(0, 10);
+        const rows = listDailySummaries(ctx.db, { since_day: since, scope, limit });
+        return { ok: true, count: rows.length, rows };
+      }
+
+      // Force a regen if asked
+      if (args?.regenerate && ctx.harness?.regenerateSummary) {
+        try {
+          const out = await ctx.harness.regenerateSummary({ db: ctx.db, day, scope, force: true });
+          return {
+            ok: true,
+            day,
+            scope,
+            regenerated: !out.regen_skipped,
+            llm_ok: out.llm_ok ?? null,
+            llm_error: out.llm_error ?? null,
+            event_count: out.event_count,
+            model: out.model,
+            summary: out.summary,
+            generated_at: out.generated_at,
+            generated_in_ms: out.generated_in_ms,
+            version: out.version,
+          };
+        } catch (err) {
+          return { ok: false, error: "regen_failed", detail: err.message };
+        }
+      }
+
+      // Cached read
+      const row = getDailySummary(ctx.db, { day, scope });
+      if (!row) {
+        return { ok: true, day, scope, found: false, note: "No summary yet for this day/scope. Pass regenerate=true to build one now." };
+      }
+      return {
+        ok: true,
+        day: row.day,
+        scope: row.scope,
+        found: true,
+        event_count: row.event_count,
+        model: row.model,
+        summary: row.summary,
+        generated_at: row.generated_at,
+        version: row.version,
       };
     }
     if (name === "propose_alert_rule") {

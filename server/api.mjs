@@ -30,6 +30,9 @@ import {
   archivePerson,
   insertFaceEmbedding,
   listRecentFaceMatches,
+  dayKeyUtc,
+  getDailySummary,
+  listDailySummaries,
 } from "./db.mjs";
 import {
   verifyPassword,
@@ -669,6 +672,64 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { rows, count: rows.length });
       } catch (err) {
         return send(res, 500, { error: "matches_failed", detail: err.message });
+      }
+    }
+
+    // ---- Phase 5: daily summaries ----------------------------------------
+    //
+    // Reads are admin-only (PII risk: people_seen). Regen is admin-only
+    // and rate-limited inside the harness; we don't add another rate-limit
+    // here.
+
+    // GET /api/agent/summaries
+    //   ?day=YYYY-MM-DD&scope=tenant            → single row (current day default)
+    //   ?day=YYYY-MM-DD&scope=camera:Garage     → camera-scoped row
+    //   ?since_day=YYYY-MM-DD&limit=14          → list (any scope)
+    if (req.method === "GET" && url.pathname === "/api/agent/summaries") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+
+      const day = url.searchParams.get("day");
+      const scope = url.searchParams.get("scope");
+      const since_day = url.searchParams.get("since_day");
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 14), 1), 90);
+
+      try {
+        if (day && scope) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return send(res, 400, { error: "invalid_day" });
+          const row = getDailySummary(db, { day, scope });
+          if (!row) return send(res, 404, { error: "not_found", day, scope });
+          return send(res, 200, { row });
+        }
+        const rows = listDailySummaries(db, { since_day, scope: scope || null, limit });
+        return send(res, 200, { rows, count: rows.length });
+      } catch (err) {
+        return send(res, 500, { error: "summaries_failed", detail: err.message });
+      }
+    }
+
+    // POST /api/agent/summaries/regenerate
+    //   Body: { day?: "YYYY-MM-DD", scope: "tenant" | "camera:Garage", force?: bool }
+    //   → { row, regen_skipped, llm_ok, llm_error }
+    if (req.method === "POST" && url.pathname === "/api/agent/summaries/regenerate") {
+      const me = getCurrentUser(db, req);
+      if (!me) return send(res, 401, { error: "unauthenticated" });
+      if (me.role !== "admin") return send(res, 403, { error: "forbidden" });
+      let body;
+      try { body = await readJson(req); } catch (err) { return send(res, 400, { error: "bad_body", detail: err.message }); }
+      const day = (body?.day && /^\d{4}-\d{2}-\d{2}$/.test(body.day)) ? body.day : dayKeyUtc();
+      const scope = String(body?.scope ?? "").trim();
+      const force = Boolean(body?.force);
+      if (!scope) return send(res, 400, { error: "scope_required" });
+      if (scope !== "tenant" && !scope.startsWith("camera:")) {
+        return send(res, 400, { error: "invalid_scope", detail: "scope must be 'tenant' or 'camera:<name>'" });
+      }
+      try {
+        const out = await harness.regenerateSummary({ db, day, scope, force });
+        return send(res, 200, out);
+      } catch (err) {
+        return send(res, 500, { error: "regen_failed", detail: err.message });
       }
     }
 

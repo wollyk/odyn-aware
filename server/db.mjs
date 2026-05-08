@@ -183,6 +183,38 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
     CREATE INDEX IF NOT EXISTS idx_face_matches_camera_created ON face_matches(camera, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_face_matches_person ON face_matches(person_id);
     CREATE INDEX IF NOT EXISTS idx_face_matches_event ON face_matches(event_id);
+
+    -- Phase 5: daily_summaries
+    --
+    -- ONE row per (tenant, day, scope). Scope is either "camera:<name>" for a
+    -- per-camera daily roll-up, or "tenant" for a tenant-wide daily roll-up.
+    -- This lets the chat tool answer both "what happened today on Garage?" and
+    -- "give me today's overview" cheaply.
+    --
+    -- The summary is generated EVENT-DRIVEN, not on a cron — see
+    -- harness/summary.mjs. Inputs are kept in stats_json so we can
+    -- regenerate the prose without re-walking events tables.
+    --
+    -- IMPORTANT: prose comes from the LOCAL Gemma model on 192.168.0.137
+    -- (cheap), not GPT. Cost guard: at most one regeneration per (day, scope)
+    -- per min_regen_seconds.
+    CREATE TABLE IF NOT EXISTS daily_summaries (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id       TEXT NOT NULL DEFAULT 'default',
+      day             TEXT NOT NULL,                       -- 'YYYY-MM-DD' (UTC)
+      scope           TEXT NOT NULL,                       -- 'tenant' | 'camera:<name>'
+      stats_json      TEXT NOT NULL,                       -- counts, top alerts, etc.
+      summary         TEXT NOT NULL DEFAULT '',            -- prose from Gemma
+      model           TEXT,                                -- e.g. 'gemma3:4b' or 'manual'
+      event_count     INTEGER NOT NULL DEFAULT 0,          -- # events that fed this summary
+      last_event_id   TEXT,                                -- for "stale?" detection
+      version         INTEGER NOT NULL DEFAULT 1,          -- bumps on each regeneration
+      generated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      generated_in_ms INTEGER,                             -- prose latency (telemetry)
+      UNIQUE(tenant_id, day, scope)
+    );
+    CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day DESC, tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_summaries_scope ON daily_summaries(tenant_id, scope, day DESC);
   `);
   return db;
 }
@@ -731,6 +763,223 @@ export function listRecentFaceMatches(
     LEFT JOIN people p ON p.id = fm.person_id
         WHERE ${where.join(" AND ")}
         ORDER BY fm.id DESC
+        LIMIT @limit`,
+    )
+    .all(params);
+}
+
+// ---- Phase 5: daily summaries -------------------------------------------
+
+/**
+ * Convert a timestamp / Date / string to a UTC YYYY-MM-DD day key. We keep
+ * everything in UTC for now — DST shifts and per-tenant timezones can be
+ * a Phase 5.1 follow-up; the schema is timezone-agnostic.
+ */
+export function dayKeyUtc(at = new Date()) {
+  const d = at instanceof Date ? at : new Date(at);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Compute aggregate stats for a given (day, scope) over the events table.
+ * Returns the shape the summary builder feeds Gemma + persists in stats_json.
+ *
+ * Cheap: pure SQL, indexed by (camera, created_at). We never load full
+ * event records here — only counts + top-N strings.
+ *
+ * @param {{ tenant_id?: string, day: string, scope: string }} args
+ *   scope: 'tenant' | 'camera:<name>'
+ */
+export function aggregateDailyStats(db, { tenant_id = "default", day, scope }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("invalid day");
+  // SQLite doesn't have a strict timestamp type; we stored ISO strings with
+  // millisecond precision. A simple prefix match on YYYY-MM-DD is the
+  // cheapest and most reliable way to bucket by day.
+  const dayPrefix = `${day}T`;
+  const whereScope =
+    scope === "tenant" ? "" :
+    scope.startsWith("camera:") ? "AND camera = @camera" :
+    null;
+  if (whereScope === null) throw new Error(`invalid scope: ${scope}`);
+  const params = { tenant_id, day_prefix: `${dayPrefix}%` };
+  if (whereScope) params.camera = scope.slice("camera:".length);
+
+  const totals = db
+    .prepare(
+      `SELECT
+         COUNT(*)                                    AS total,
+         SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_count,
+         SUM(CASE WHEN severity='notable'  THEN 1 ELSE 0 END) AS notable_count,
+         SUM(CASE WHEN severity='normal'   THEN 1 ELSE 0 END) AS normal_count,
+         MIN(id) AS first_event_id,
+         MAX(id) AS last_event_id
+         FROM events
+        WHERE tenant_id = @tenant_id
+          AND created_at LIKE @day_prefix
+          ${whereScope}`,
+    )
+    .get(params);
+
+  const byCamera = db
+    .prepare(
+      `SELECT camera, COUNT(*) AS n,
+              SUM(CASE WHEN severity IN ('notable','critical') THEN 1 ELSE 0 END) AS alerts
+         FROM events
+        WHERE tenant_id = @tenant_id
+          AND created_at LIKE @day_prefix
+          ${whereScope}
+        GROUP BY camera
+        ORDER BY n DESC
+        LIMIT 12`,
+    )
+    .all(params);
+
+  const byOrigin = db
+    .prepare(
+      `SELECT origin, COUNT(*) AS n
+         FROM events
+        WHERE tenant_id = @tenant_id
+          AND created_at LIKE @day_prefix
+          ${whereScope}
+        GROUP BY origin
+        ORDER BY n DESC`,
+    )
+    .all(params);
+
+  // Top alert reasons (notable/critical), bucketed by alert_type. Pulled
+  // from the JSON payload because the events schema is intentionally narrow
+  // (only severity is denormalized; everything else lives in payload).
+  const topAlertReasons = db
+    .prepare(
+      `SELECT json_extract(payload, '$.alert_type') AS alert_type,
+              COUNT(*) AS n
+         FROM events
+        WHERE tenant_id = @tenant_id
+          AND created_at LIKE @day_prefix
+          AND severity IN ('notable','critical')
+          AND json_extract(payload, '$.alert_type') IS NOT NULL
+          AND json_extract(payload, '$.alert_type') <> ''
+          ${whereScope}
+        GROUP BY alert_type
+        ORDER BY n DESC
+        LIMIT 8`,
+    )
+    .all(params);
+
+  // Face-matches over the same window. People who appeared today.
+  const peopleSeen = db
+    .prepare(
+      `SELECT COALESCE(p.name, '(unknown)') AS who,
+              COUNT(*) AS sightings,
+              MIN(fm.created_at) AS first_seen,
+              MAX(fm.created_at) AS last_seen
+         FROM face_matches fm
+    LEFT JOIN people p ON p.id = fm.person_id
+        WHERE fm.tenant_id = @tenant_id
+          AND fm.created_at LIKE @day_prefix
+          ${scope.startsWith("camera:") ? "AND fm.camera = @camera" : ""}
+        GROUP BY who
+        ORDER BY sightings DESC
+        LIMIT 12`,
+    )
+    .all(params);
+
+  return {
+    day,
+    scope,
+    tenant_id,
+    totals: {
+      events: Number(totals?.total ?? 0),
+      critical: Number(totals?.critical_count ?? 0),
+      notable: Number(totals?.notable_count ?? 0),
+      normal: Number(totals?.normal_count ?? 0),
+      first_event_id: totals?.first_event_id ?? null,
+      last_event_id: totals?.last_event_id ?? null,
+    },
+    by_camera: byCamera,
+    by_origin: byOrigin,
+    top_alert_reasons: topAlertReasons,
+    people_seen: peopleSeen,
+  };
+}
+
+/**
+ * Upsert the summary row. Bumps version, sets generated_at to now, leaves
+ * the unique (tenant, day, scope) intact.
+ */
+export function upsertDailySummary(
+  db,
+  {
+    tenant_id = "default",
+    day,
+    scope,
+    stats,
+    summary = "",
+    model = null,
+    last_event_id = null,
+    generated_in_ms = null,
+  },
+) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("invalid day");
+  if (!scope) throw new Error("scope required");
+  const stats_json = JSON.stringify(stats ?? {});
+  const event_count = Number(stats?.totals?.events ?? 0);
+
+  const stmt = db.prepare(`
+    INSERT INTO daily_summaries
+      (tenant_id, day, scope, stats_json, summary, model,
+       event_count, last_event_id, version, generated_at, generated_in_ms)
+    VALUES
+      (@tenant_id, @day, @scope, @stats_json, @summary, @model,
+       @event_count, @last_event_id, 1,
+       strftime('%Y-%m-%dT%H:%M:%fZ','now'), @generated_in_ms)
+    ON CONFLICT(tenant_id, day, scope) DO UPDATE SET
+      stats_json     = excluded.stats_json,
+      summary        = excluded.summary,
+      model          = excluded.model,
+      event_count    = excluded.event_count,
+      last_event_id  = excluded.last_event_id,
+      version        = daily_summaries.version + 1,
+      generated_at   = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+      generated_in_ms= excluded.generated_in_ms
+  `);
+  stmt.run({ tenant_id, day, scope, stats_json, summary, model, event_count, last_event_id, generated_in_ms });
+  return getDailySummary(db, { tenant_id, day, scope });
+}
+
+export function getDailySummary(db, { tenant_id = "default", day, scope }) {
+  const row = db
+    .prepare(
+      `SELECT id, tenant_id, day, scope, stats_json, summary, model,
+              event_count, last_event_id, version, generated_at, generated_in_ms
+         FROM daily_summaries
+        WHERE tenant_id = @tenant_id AND day = @day AND scope = @scope`,
+    )
+    .get({ tenant_id, day, scope });
+  if (!row) return null;
+  let stats = null;
+  try { stats = JSON.parse(row.stats_json); } catch { stats = null; }
+  return { ...row, stats };
+}
+
+/**
+ * Most recent N days of summaries (any scope). Useful for "give me the
+ * week" chat queries.
+ */
+export function listDailySummaries(
+  db,
+  { tenant_id = "default", scope = null, since_day = null, limit = 14 } = {},
+) {
+  const where = ["tenant_id = @tenant_id"];
+  const params = { tenant_id, limit: Math.min(Math.max(Number(limit) || 14, 1), 90) };
+  if (scope) { where.push("scope = @scope"); params.scope = scope; }
+  if (since_day) { where.push("day >= @since_day"); params.since_day = since_day; }
+  return db
+    .prepare(
+      `SELECT id, day, scope, summary, model, event_count, version, generated_at
+         FROM daily_summaries
+        WHERE ${where.join(" AND ")}
+        ORDER BY day DESC, scope ASC
         LIMIT @limit`,
     )
     .all(params);

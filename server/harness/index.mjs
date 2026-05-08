@@ -32,6 +32,7 @@ import * as tier1 from "./tier1.mjs";
 import * as tier2 from "./tier2.mjs";
 import * as tier3 from "./tier3.mjs";
 import * as face from "./face.mjs";
+import * as summary from "./summary.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
 import { quotaGate } from "./quota.mjs";
@@ -75,6 +76,11 @@ export function start(deps) {
   // the InsightFace service is installed (services/face-embedder).
   face.init({ db: deps.db });
 
+  // Phase 5: event-driven daily summaries. Subscribes to TOPIC.ALERT and
+  // debounces regen per (day, scope). Runs against local Gemma; falls back
+  // to deterministic stats prose if Gemma is unreachable.
+  summary.start({ db: deps.db });
+
   // Health probes — uses local Ollama for upstream checks (cost-free).
   health.startProbes({
     frigate: deps.frigate,
@@ -94,6 +100,7 @@ export function stop() {
   tier0.stop();
   tier1.stop();
   tier2.stop();
+  summary.stop();
   eventlog.stop();
   health.stopProbes();
   started = false;
@@ -158,6 +165,22 @@ export function invalidateFaceCache() {
 }
 
 export const FACE_CONFIG = face.FACE_CONFIG;
+
+// ---- Phase 5: daily summaries ---------------------------------------------
+
+/**
+ * Force a regen of the daily summary for a (tenant, day, scope) triplet.
+ * Caller picks the scope: "tenant" or "camera:<name>". Returns the row.
+ *
+ * @param {{ db?: object, tenant_id?: string, day?: string, scope: string, force?: boolean }} args
+ */
+export async function regenerateSummary({ db, tenant_id, day, scope, force = false } = {}) {
+  if (!db) throw new Error("regenerateSummary: db required");
+  return summary.regenerate({ db, tenant_id, day, scope, force });
+}
+
+export const SUMMARY_CONFIG = summary.SUMMARY_CONFIG;
+export const summaryInspect = summary.inspect;
 
 // ---- Phase 3: routed (cost-controlled) detection ---------------------------
 //
