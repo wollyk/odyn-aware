@@ -35,6 +35,7 @@ import * as face from "./face.mjs";
 import * as weapon from "./weapon.mjs";
 import * as summary from "./summary.mjs";
 import * as alerts from "./alerts.mjs";
+import * as motion from "./motion.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
 import { quotaGate } from "./quota.mjs";
@@ -478,6 +479,14 @@ export async function analyzeImageRouted({
     }
   }
 
+  // Phase 8: feed the adaptive motion gate so future polls on a quiet
+  // camera can be served from cache without paying for T2/face/weapon.
+  // recordResult is a pure state update — never throws meaningfully.
+  if (camera) {
+    try { motion.recordResult({ camera, result }); }
+    catch (err) { console.error("[harness] motion.recordResult failed:", err?.message); }
+  }
+
   return result;
 }
 
@@ -509,6 +518,12 @@ export function clearT3Cache(camera = null) {
 // module never imports alerts.mjs directly so the public surface stays
 // consolidated here.
 export const sendTestAlert = alerts.sendTestAlert;
+
+// Phase-8: motion-gate facade. The detections route consults this BEFORE
+// fetching a snapshot so a gated tick costs us zero work end-to-end.
+export const motionGateDecide = motion.decideGate;
+export const motionGateReplay = motion.gatedReplay;
+export const motionGateInspect = motion.inspect;
 
 // Quota + telemetry — exposed so the API layer can gate calls and observe
 // latency without reaching into the harness internals.
@@ -546,6 +561,7 @@ export function status() {
     memory: workingMemory.inspect(),
     tier0: tier0.inspect(),
     tier3: tier3.ping(),
+    motion_gate: motion.inspect(),
   };
 }
 

@@ -33,6 +33,23 @@ export async function register(req, res, url, ctx) {
     const reqMode = url.searchParams.get("mode");
     const mode = allowedModes.has(reqMode) ? reqMode : undefined;
 
+    // Phase-8 motion gate: when this camera was idle on the last tick and
+    // the recheck window hasn't elapsed, replay the cached result without
+    // fetching a snapshot or paying T2/face/weapon. The gate auto-bypasses
+    // for "always-t3" mode (used for golden-dataset runs) and any explicit
+    // ?force=1 from an admin.
+    const force = url.searchParams.get("force") === "1" || mode === "always-t3";
+    const decision = harness.motionGateDecide({ camera, force });
+    if (decision.gate) {
+      const cached = harness.motionGateReplay({ camera, gateReason: decision.reason });
+      if (cached) {
+        send(res, 200, { camera, ...cached });
+        return true;
+      }
+      // Cache miss (shouldn't happen — decideGate returned gate=true only
+      // if a prior result existed). Fall through to a real run.
+    }
+
     const tenant = "default";
     const t2Gate = harness.checkQuota({ tenant, camera, kind: "t2-vision" });
     if (!t2Gate.allowed) {

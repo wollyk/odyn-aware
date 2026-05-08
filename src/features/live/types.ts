@@ -81,6 +81,12 @@ export type DetectionResult = {
   /** Phase-6 weapon / suspicious-object surface. */
   weapon?: WeaponSummary;
   weapon_status?: string;
+  /** Phase-8 adaptive motion gate. When `gated:true`, the response is a
+   *  cached replay of the last full pipeline run and `cached_age_ms` is
+   *  how stale it is. tier="none", tookMs=0, escalation.ran=false. */
+  gated?: boolean;
+  gate_reason?: string;
+  cached_age_ms?: number;
 };
 
 /**

@@ -211,31 +211,44 @@ export function VideoTile({
         </div>
 
         {/* Tier badge — bottom-left, just above the camera label.
-            T2 dot color tracks severity (green=normal, amber=notable,
-            red=critical). T3 dot is solid when a paid call landed this tick,
-            outlined when we're using cached bboxes, dim when gated. */}
-        <div
-          className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-foreground/85"
-          title={det.escalationReason ? `router: ${det.escalationReason}` : "router: idle"}
-        >
-          <span
-            className={`inline-block h-1.5 w-1.5 rounded-full ${
-              det.status === "ok" ? severityDotColor(det.severity) : "bg-foreground/30"
-            }`}
-            title={`T2 local · severity=${det.severity ?? "—"}`}
-          />
-          <span
-            className={`inline-block h-1.5 w-1.5 rounded-full ${
-              det.escalationRan
-                ? "bg-emerald-400"
-                : det.tier === "T2-cached-T3"
-                ? "ring-1 ring-emerald-400/60 bg-emerald-400/30"
-                : "bg-foreground/30"
-            }`}
-            title="T3 cloud · gpt-4o-mini"
-          />
-          <span className="ml-1 text-foreground/70">{det.tier ?? "—"}</span>
-        </div>
+            When the motion gate is active (cached replay, no paid work
+            this tick), we collapse to a single "GATED" pill so the
+            operator can see the savings happening in real time. */}
+        {det.gated ? (
+          <div
+            className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-emerald-300/85"
+            title={`Idle gate active · cached ${Math.round((det.cachedAgeMs ?? 0) / 1000)}s ago · ${det.gateReason ?? ""}`}
+          >
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400/60" />
+            <span>GATED</span>
+            <span className="ml-1 text-foreground/55 normal-case tracking-normal">
+              {Math.round((det.cachedAgeMs ?? 0) / 1000)}s cache
+            </span>
+          </div>
+        ) : (
+          <div
+            className="pointer-events-none absolute left-3 bottom-12 flex items-center gap-1.5 bg-black/65 px-2 py-1 font-mono text-[9px] uppercase tracking-[0.18em] text-foreground/85"
+            title={det.escalationReason ? `router: ${det.escalationReason}` : "router: idle"}
+          >
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                det.status === "ok" ? severityDotColor(det.severity) : "bg-foreground/30"
+              }`}
+              title={`T2 local · severity=${det.severity ?? "—"}`}
+            />
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                det.escalationRan
+                  ? "bg-emerald-400"
+                  : det.tier === "T2-cached-T3"
+                  ? "ring-1 ring-emerald-400/60 bg-emerald-400/30"
+                  : "bg-foreground/30"
+              }`}
+              title="T3 cloud · gpt-4o-mini"
+            />
+            <span className="ml-1 text-foreground/70">{det.tier ?? "—"}</span>
+          </div>
+        )}
       </div>
 
       {/* Phase-4/6 status strip: face recognizer + weapon detector summary

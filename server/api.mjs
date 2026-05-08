@@ -20,6 +20,8 @@
 //   DB_PATH=/var/www/auroraview/data/auroraview.db
 //   ALLOWED_ORIGINS=https://example.com,https://www.example.com
 //   SMTP_HOST=, SMTP_PORT=587, SMTP_USER=, SMTP_PASS=, SMTP_FROM=, NOTIFY_TO=
+//   PUBLIC_BASE_URL=https://auroraview.tech    (used in alert email body)
+//   ALERT_WEBHOOK_TIMEOUT_MS=5000              (Phase-7 webhook deadline)
 
 import http from "node:http";
 import { WebSocketServer } from "ws";

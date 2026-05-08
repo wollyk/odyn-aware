@@ -44,6 +44,10 @@ export type UseDetectionsResult = {
   /** Phase-6 weapon summary (always present — zeroed when sidecar down). */
   weapon: WeaponSummary;
   weaponStatus: string;
+  /** Phase-8 motion gate — true when this tick was a cached replay. */
+  gated: boolean;
+  gateReason: string | null;
+  cachedAgeMs: number | null;
 };
 
 const EMPTY: UseDetectionsResult = {
@@ -63,6 +67,9 @@ const EMPTY: UseDetectionsResult = {
   unknownFaceCount: 0,
   weapon: EMPTY_WEAPON,
   weaponStatus: "ok",
+  gated: false,
+  gateReason: null,
+  cachedAgeMs: null,
 };
 
 export function useDetections(cam: Camera | null): UseDetectionsResult {
@@ -107,6 +114,9 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
             unknownFaceCount: d.unknown_face_count ?? 0,
             weapon: d.weapon ?? EMPTY_WEAPON,
             weaponStatus: d.weapon_status ?? "ok",
+            gated: Boolean(d.gated),
+            gateReason: d.gate_reason ?? null,
+            cachedAgeMs: typeof d.cached_age_ms === "number" ? d.cached_age_ms : null,
           });
         }
       } catch {
