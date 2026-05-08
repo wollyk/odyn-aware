@@ -27,7 +27,13 @@ import {
 } from "../db.mjs";
 
 const OLLAMA_BASE = process.env.OLLAMA_BASE ?? "http://192.168.0.137:11434";
-const SUMMARY_MODEL = process.env.OLLAMA_TEXT_MODEL ?? "gemma3:4b";
+// Picked from `ollama list` on the local box (192.168.0.137):
+//   - llama3.2:3b is ~2GB, ~250-700ms on CPU for short prose, very stable
+//     on summarization tasks. The bigger gemma/qwen variants on the box
+//     (27B+) would give nicer prose but at 3-10s — too slow when alerts
+//     trigger debounced regens.
+// Override with OLLAMA_TEXT_MODEL=<name> if a better small model lands.
+const SUMMARY_MODEL = process.env.OLLAMA_TEXT_MODEL ?? "llama3.2:3b";
 const SUMMARY_TIMEOUT_MS = Number(process.env.OLLAMA_TEXT_TIMEOUT_MS ?? 12_000);
 const SUMMARY_KEEP_ALIVE = process.env.OLLAMA_TEXT_KEEP_ALIVE ?? "10m";
 
