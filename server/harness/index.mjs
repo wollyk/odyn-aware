@@ -24,8 +24,8 @@
 //   subscribeAlerts(signal) — async iterator of alert events for SSE
 //   subscribeHealth(signal) — async iterator of health snapshots for SSE
 
-import { TOPIC } from "./types.mjs";
-import { subscribeIterator, inspect as inspectBus } from "./eventbus.mjs";
+import { TOPIC, SEVERITY } from "./types.mjs";
+import { subscribeIterator, publish, inspect as inspectBus } from "./eventbus.mjs";
 import * as router from "./router.mjs";
 import * as tier0 from "./tier0.mjs";
 import * as tier1 from "./tier1.mjs";
@@ -34,11 +34,13 @@ import * as tier3 from "./tier3.mjs";
 import * as face from "./face.mjs";
 import * as weapon from "./weapon.mjs";
 import * as summary from "./summary.mjs";
+import * as alerts from "./alerts.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
 import { quotaGate } from "./quota.mjs";
 import { snapshot as telemetrySnapshot } from "./telemetry.mjs";
 import { workingMemory } from "./memory.mjs";
+import crypto from "node:crypto";
 
 let started = false;
 let _gate = null;
@@ -88,6 +90,12 @@ export function start(deps) {
   // to deterministic stats prose if Gemma is unreachable.
   summary.start({ db: deps.db });
 
+  // Phase 7: alert dispatcher. Subscribes to TOPIC.ALERT and delivers via
+  // email + webhook destinations stored in alert_destinations. Hydrates
+  // cooldown state from the alert_dispatches audit log so a restart
+  // doesn't re-fire stale alerts.
+  alerts.start({ db: deps.db });
+
   // Health probes — uses local Ollama for upstream checks (cost-free).
   health.startProbes({
     frigate: deps.frigate,
@@ -108,6 +116,7 @@ export function stop() {
   tier1.stop();
   tier2.stop();
   summary.stop();
+  alerts.stop();
   eventlog.stop();
   health.stopProbes();
   started = false;
@@ -408,7 +417,7 @@ export async function analyzeImageRouted({
   else if (cacheAfter) { tier = "T2-cached-T3"; source = "cache"; }
   else { tier = "T2-only"; source = "none"; }
 
-  return {
+  const result = {
     tier,
     detections,
     summary,
@@ -448,6 +457,46 @@ export async function analyzeImageRouted({
     } : { decision: "clear", suspicious_object_score: 0, suspicious_class: null, suspicious_count: 0, took_ms: 0 },
     weapon_status: weaponResult?.ok === false ? (weaponResult.error ?? "weapon_failed") : "ok",
   };
+
+  // Phase 7: alert publish hook. Fires on TOPIC.ALERT when this analysis
+  // crosses any of: severity >= notable, weapon=suspicious, or any
+  // unknown face is present. The alerts module's per-destination
+  // min_severity + cooldown decide whether anyone actually gets pinged.
+  // Publish is fire-and-forget: subscribers run synchronously on the
+  // event bus but their dispatch work is async + non-blocking.
+  if (shouldPublishAlert(result)) {
+    const event_id = result?.detections?.event_id ?? `routed_${crypto.randomUUID()}`;
+    try {
+      publish(TOPIC.ALERT, alerts.buildAlertPayload({
+        event_id,
+        camera,
+        result,
+        tenant_id: "default",
+      }));
+    } catch (err) {
+      console.error("[harness] alert publish failed:", err?.message);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Decide whether a routed analysis result is worth raising to the alert
+ * bus. Three OR conditions:
+ *   1. Severity is notable or critical (T2 said something interesting).
+ *   2. Weapon detector flagged a suspicious object (Phase 6 escalation).
+ *   3. An unknown face was seen (privacy-sensitive but operator-required).
+ *
+ * Subscribers (alerts.mjs) apply the per-destination min_severity filter
+ * AND the cooldown, so over-publishing here is cheap.
+ */
+function shouldPublishAlert(result) {
+  const sev = SEVERITY[result?.severity ?? "normal"] ?? 0;
+  if (sev >= SEVERITY.notable) return true;
+  if (result?.weapon?.decision === "suspicious") return true;
+  if ((result?.unknown_face_count ?? 0) > 0) return true;
+  return false;
 }
 
 /** Test/diagnostics: clear all cached T3 results (or one camera). */
@@ -455,6 +504,11 @@ export function clearT3Cache(camera = null) {
   if (camera) _t3Cache.delete(camera);
   else _t3Cache.clear();
 }
+
+// Phase-7: alert dispatch helpers exposed to route handlers. The route
+// module never imports alerts.mjs directly so the public surface stays
+// consolidated here.
+export const sendTestAlert = alerts.sendTestAlert;
 
 // Quota + telemetry — exposed so the API layer can gate calls and observe
 // latency without reaching into the harness internals.

@@ -19,12 +19,13 @@ import { useCallback, useEffect, useState } from "react";
 export type AdminUser = { email: string; role: string };
 export type AdminAuthState = "loading" | "ok" | "denied";
 
-export type AdminTab = "submissions" | "live" | "faces";
+export type AdminTab = "submissions" | "live" | "faces" | "alerts";
 
 const TABS: { id: AdminTab; label: string; href: string }[] = [
   { id: "submissions", label: "Submissions", href: "/admin" },
   { id: "live", label: "Live View", href: "/admin/live" },
   { id: "faces", label: "Faces", href: "/admin/faces" },
+  { id: "alerts", label: "Alerts", href: "/admin/alerts" },
 ];
 
 /**
