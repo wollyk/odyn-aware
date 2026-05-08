@@ -12,9 +12,22 @@
 //   - server-side per-camera quota (returns 429)
 
 import { useEffect, useState } from "react";
-import type { Camera, Detection, DetectionResult, FaceRecord, WeaponSummary } from "./types";
+import type {
+  Camera,
+  Detection,
+  DetectionResult,
+  FaceRecord,
+  OverlayBox,
+  WeaponSummary,
+} from "./types";
 
-const POLL_MS = 5000;
+// Adaptive poll cadence:
+//   - Active scene (any signal): 2s for near-real-time bbox updates.
+//   - Idle scene (motion gate or quiet): 5s.
+// The motion gate already short-circuits idle ticks server-side so we
+// can afford 2s on active cameras without proportional cost.
+const POLL_MS_ACTIVE = 2000;
+const POLL_MS_IDLE = 5000;
 
 const EMPTY_WEAPON: WeaponSummary = {
   decision: "clear",
@@ -48,6 +61,9 @@ export type UseDetectionsResult = {
   gated: boolean;
   gateReason: string | null;
   cachedAgeMs: number | null;
+  /** Phase-9 unified overlay (face + weapon real-CV boxes). */
+  boxes: OverlayBox[];
+  tickAt: number | null;
 };
 
 const EMPTY: UseDetectionsResult = {
@@ -70,6 +86,8 @@ const EMPTY: UseDetectionsResult = {
   gated: false,
   gateReason: null,
   cachedAgeMs: null,
+  boxes: [],
+  tickAt: null,
 };
 
 export function useDetections(cam: Camera | null): UseDetectionsResult {
@@ -82,11 +100,12 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
     }
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let nextDelayMs = POLL_MS_IDLE;
 
     const tick = async () => {
       if (cancelled) return;
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
-        timer = setTimeout(tick, POLL_MS);
+        timer = setTimeout(tick, POLL_MS_IDLE);
         return;
       }
       try {
@@ -97,6 +116,16 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
         if (cancelled) return;
         if (res.ok) {
           const d: DetectionResult = await res.json();
+          // Pick the next poll delay based on what the server returned.
+          // Anything that looks like a real signal (non-normal severity,
+          // any overlay box, unknown face, suspicious weapon, gate not
+          // engaged) → speed up. Otherwise idle cadence.
+          const hasSignal =
+            (d.severity && d.severity !== "normal") ||
+            ((d.boxes ?? []).length > 0) ||
+            (d.unknown_face_count ?? 0) > 0 ||
+            d.weapon?.decision === "suspicious";
+          nextDelayMs = !d.gated && hasSignal ? POLL_MS_ACTIVE : POLL_MS_IDLE;
           setState({
             detections: d.detections ?? [],
             summary: d.summary ?? "",
@@ -117,12 +146,14 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
             gated: Boolean(d.gated),
             gateReason: d.gate_reason ?? null,
             cachedAgeMs: typeof d.cached_age_ms === "number" ? d.cached_age_ms : null,
+            boxes: d.boxes ?? [],
+            tickAt: typeof d.tickAt === "number" ? d.tickAt : Date.now(),
           });
         }
       } catch {
         // Swallow transient errors; the next tick will try again.
       } finally {
-        if (!cancelled) timer = setTimeout(tick, POLL_MS);
+        if (!cancelled) timer = setTimeout(tick, nextDelayMs);
       }
     };
 

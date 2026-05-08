@@ -74,15 +74,73 @@ export function VideoTile({
     return () => clearInterval(t);
   }, []);
 
-  // Canvas overlay sizing + box drawing
+  // Canvas overlay — AR-aware + age-fading.
+  //
+  // Two correctness fixes vs the previous overlay:
+  //
+  //   1. The displayed video has `object-contain` and a fixed-AR tile
+  //      wrapper, so when source AR ≠ tile AR the video letterboxes.
+  //      Previously we projected normalized bboxes onto the FULL canvas
+  //      (the tile rect), which stretched them across the letterbox bars.
+  //      Now we compute the actual displayed video rect using the source
+  //      videoWidth/videoHeight (or naturalWidth/naturalHeight for
+  //      snapshots) and project bbox coords into THAT rect only.
+  //
+  //   2. Boxes carry a `ts` (when the underlying CV detector saw the
+  //      object) and we fade opacity 1 → 0 over BOX_FADE_MS, then drop
+  //      them entirely after BOX_MAX_AGE_MS. So when an object leaves
+  //      the frame, its box gracefully decays instead of being held at
+  //      full strength until the next 5s poll arrives.
+  //
+  // The drawn boxes are real-CV only (face from InsightFace, weapon from
+  // YOLO). T3's hallucinated bboxes are intentionally not on the canvas
+  // — they were the source of the "boxes are way bigger than the object"
+  // complaint.
   useEffect(() => {
     const canvas = canvasRef.current;
     const target: HTMLElement | null = mode === "live" ? live.videoRef.current : imgRef.current;
     if (!canvas || !target) return;
+
+    // Per-source visual styling. Alpha is the BASE alpha — fade multiplies it.
+    const STYLE: Record<
+      string,
+      { stroke: string; fill: string; chip: string; chipText: string }
+    > = {
+      face_known: {
+        stroke: "rgba(110, 231, 183, ALPHA)",     // emerald-300
+        fill: "rgba(110, 231, 183, FILL_A)",
+        chip: "rgba(0, 0, 0, ALPHA)",
+        chipText: "rgba(110, 231, 183, ALPHA)",
+      },
+      face_unknown: {
+        stroke: "rgba(251, 191, 36, ALPHA)",      // amber-400
+        fill: "rgba(251, 191, 36, FILL_A)",
+        chip: "rgba(0, 0, 0, ALPHA)",
+        chipText: "rgba(251, 191, 36, ALPHA)",
+      },
+      weapon_suspicious: {
+        stroke: "rgba(248, 113, 113, ALPHA)",     // red-400
+        fill: "rgba(248, 113, 113, FILL_A)",
+        chip: "rgba(0, 0, 0, ALPHA)",
+        chipText: "rgba(248, 113, 113, ALPHA)",
+      },
+      weapon_clear: {
+        stroke: "rgba(148, 163, 184, ALPHA)",     // slate-400
+        fill: "rgba(148, 163, 184, FILL_A)",
+        chip: "rgba(0, 0, 0, ALPHA)",
+        chipText: "rgba(148, 163, 184, ALPHA)",
+      },
+    };
+    const BOX_FADE_MS = 2000;
+    const BOX_MAX_AGE_MS = 3000;
+
+    let raf = 0;
+
     const draw = () => {
       const w = target.clientWidth;
       const h = target.clientHeight;
       if (!w || !h) return;
+
       const dpr = window.devicePixelRatio || 1;
       if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
         canvas.width = w * dpr;
@@ -94,35 +152,98 @@ export function VideoTile({
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
+
+      // Resolve the source's intrinsic dimensions so we can compute the
+      // real "displayed video rect" inside the letterboxed tile.
+      let srcW = 0;
+      let srcH = 0;
+      if (mode === "live" && target instanceof HTMLVideoElement) {
+        srcW = target.videoWidth || 0;
+        srcH = target.videoHeight || 0;
+      } else if (target instanceof HTMLImageElement) {
+        srcW = target.naturalWidth || 0;
+        srcH = target.naturalHeight || 0;
+      }
+      // Until metadata is available, fall back to filling the tile so the
+      // first ~ms post-load doesn't draw nothing.
+      let rectX = 0,
+        rectY = 0,
+        rectW = w,
+        rectH = h;
+      if (srcW > 0 && srcH > 0) {
+        const tileAR = w / h;
+        const srcAR = srcW / srcH;
+        if (srcAR > tileAR) {
+          // Source wider than tile → letterbox top/bottom.
+          rectW = w;
+          rectH = Math.round(w / srcAR);
+          rectX = 0;
+          rectY = Math.round((h - rectH) / 2);
+        } else if (srcAR < tileAR) {
+          // Source taller than tile → pillarbox left/right.
+          rectH = h;
+          rectW = Math.round(h * srcAR);
+          rectY = 0;
+          rectX = Math.round((w - rectW) / 2);
+        }
+      }
+
       ctx.lineWidth = 1.5;
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.textBaseline = "top";
-      for (const d of det.detections) {
-        const [x, y, ww, hh] = d.bbox;
-        const rx = x * w;
-        const ry = y * h;
-        const rw = ww * w;
-        const rh = hh * h;
-        ctx.strokeStyle = "rgba(110, 231, 183, 0.95)";
-        ctx.fillStyle = "rgba(110, 231, 183, 0.18)";
+
+      const nowTs = Date.now();
+      let anyAlive = false;
+      for (const b of det.boxes) {
+        const ageMs = Math.max(0, nowTs - (b.ts ?? 0));
+        if (ageMs > BOX_MAX_AGE_MS) continue;
+        const alpha = ageMs <= BOX_FADE_MS ? 1 - ageMs / BOX_FADE_MS / 1.5 : 0.05;
+        if (alpha < 0.05) continue;
+        anyAlive = true;
+        const style = STYLE[b.source] ?? STYLE.face_unknown;
+        const stroke = style.stroke
+          .replace("ALPHA", alpha.toFixed(2));
+        const fill = style.fill.replace("FILL_A", (alpha * 0.18).toFixed(2));
+        const chip = style.chip.replace("ALPHA", (alpha * 0.85).toFixed(2));
+        const chipText = style.chipText.replace("ALPHA", alpha.toFixed(2));
+
+        const [x, y, ww, hh] = b.bbox;
+        const rx = rectX + x * rectW;
+        const ry = rectY + y * rectH;
+        const rw = ww * rectW;
+        const rh = hh * rectH;
+        ctx.strokeStyle = stroke;
+        ctx.fillStyle = fill;
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeRect(rx, ry, rw, rh);
-        const label = `${d.label} ${d.confidence.toFixed(2)}`;
+        const label =
+          b.confidence > 0
+            ? `${b.label} ${b.confidence.toFixed(2)}`
+            : b.label;
         const textW = ctx.measureText(label).width + 8;
         const chipH = 16;
-        const chipY = Math.max(0, ry - chipH);
-        ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+        const chipY = Math.max(rectY, ry - chipH);
+        ctx.fillStyle = chip;
         ctx.fillRect(rx, chipY, textW, chipH);
-        ctx.fillStyle = "rgba(110, 231, 183, 1)";
+        ctx.fillStyle = chipText;
         ctx.fillText(label, rx + 4, chipY + 3);
       }
+
+      // Schedule the next frame ONLY while at least one box is still
+      // alive. Once everything has decayed past BOX_MAX_AGE_MS the
+      // canvas is empty and we can stop the loop until new state arrives.
+      if (anyAlive) raf = requestAnimationFrame(draw);
     };
+
     draw();
     const ro = new ResizeObserver(draw);
     ro.observe(target);
-    return () => ro.disconnect();
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [det.detections, imgUrl, mode, live.status]);
+  }, [det.boxes, det.tickAt, imgUrl, mode, live.status]);
 
   const camLabel = cam ? cam.label : "—";
   const wireName = cam ? cam.name : "";

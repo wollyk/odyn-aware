@@ -38,6 +38,7 @@ import * as alerts from "./alerts.mjs";
 import * as motion from "./motion.mjs";
 import * as health from "./health.mjs";
 import * as eventlog from "./eventlog.mjs";
+import { getJpegDims } from "../util/jpeg-dims.mjs";
 import { quotaGate } from "./quota.mjs";
 import { snapshot as telemetrySnapshot } from "./telemetry.mjs";
 import { workingMemory } from "./memory.mjs";
@@ -418,6 +419,53 @@ export async function analyzeImageRouted({
   else if (cacheAfter) { tier = "T2-cached-T3"; source = "cache"; }
   else { tier = "T2-only"; source = "none"; }
 
+  // Build the unified canvas-overlay box list.
+  //
+  // GPT-4o-mini bboxes (`detections` from T3) are deliberately EXCLUDED:
+  // empirically the model returns boxes 20-50% larger than the actual
+  // object because it's a description model, not a localizer. We keep
+  // T3's TEXT (summary, severity, alert_type) — those are reliable.
+  //
+  // Real-CV detections (face from InsightFace, weapon from YOLO) DO go
+  // here. They're returned in absolute pixel coords by the sidecars; we
+  // normalize once using the snapshot's actual dimensions so the
+  // frontend can render against any displayed size.
+  const dims = getJpegDims(imageBuffer);
+  const imgW = dims?.width ?? 0;
+  const imgH = dims?.height ?? 0;
+  const overlayBoxes = [];
+  const tickAt = Date.now();
+  if (imgW > 0 && imgH > 0) {
+    for (const f of faceResult?.faces ?? []) {
+      const b = absToNormXywh(f.bbox, imgW, imgH);
+      if (!b) continue;
+      const known = f.decision === "match";
+      overlayBoxes.push({
+        source: known ? "face_known" : "face_unknown",
+        bbox: b,
+        label: known ? (f.person_name ?? "known") : "unknown",
+        confidence: typeof f.similarity === "number" ? Number(f.similarity.toFixed(2)) : 0,
+        ts: tickAt,
+      });
+    }
+    if (Array.isArray(weaponResult?.detections)) {
+      for (const d of weaponResult.detections) {
+        const b = absToNormXywh(d.bbox, imgW, imgH);
+        if (!b) continue;
+        const suspicious = weaponResult.suspicious_class
+          ? d.class_name === weaponResult.suspicious_class
+          : false;
+        overlayBoxes.push({
+          source: suspicious ? "weapon_suspicious" : "weapon_clear",
+          bbox: b,
+          label: d.class_name ?? "object",
+          confidence: typeof d.confidence === "number" ? Number(d.confidence.toFixed(2)) : 0,
+          ts: tickAt,
+        });
+      }
+    }
+  }
+
   const result = {
     tier,
     detections,
@@ -457,6 +505,12 @@ export async function analyzeImageRouted({
       took_ms: weaponResult.took_ms ?? 0,
     } : { decision: "clear", suspicious_object_score: 0, suspicious_class: null, suspicious_count: 0, took_ms: 0 },
     weapon_status: weaponResult?.ok === false ? (weaponResult.error ?? "weapon_failed") : "ok",
+    // Phase-9 unified overlay surface. Real-CV boxes only (face + weapon).
+    // T3's hallucinated bboxes deliberately not included — see comment above.
+    boxes: overlayBoxes,
+    image_w: imgW,
+    image_h: imgH,
+    tickAt,
   };
 
   // Phase 7: alert publish hook. Fires on TOPIC.ALERT when this analysis
@@ -512,6 +566,30 @@ function shouldPublishAlert(result) {
 export function clearT3Cache(camera = null) {
   if (camera) _t3Cache.delete(camera);
   else _t3Cache.clear();
+}
+
+/**
+ * Convert an absolute-pixel `[x1, y1, x2, y2]` bbox (from face / weapon
+ * sidecars) into a normalized `[x, y, w, h]` in [0..1]. Returns null if
+ * the input is malformed or zero-area.
+ *
+ * @param {number[]} src
+ * @param {number} imgW
+ * @param {number} imgH
+ */
+function absToNormXywh(src, imgW, imgH) {
+  if (!Array.isArray(src) || src.length < 4) return null;
+  if (!imgW || !imgH) return null;
+  const [x1, y1, x2, y2] = src.map(Number);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  const lo_x = Math.max(0, Math.min(x1, x2));
+  const hi_x = Math.min(imgW, Math.max(x1, x2));
+  const lo_y = Math.max(0, Math.min(y1, y2));
+  const hi_y = Math.min(imgH, Math.max(y1, y2));
+  const w = hi_x - lo_x;
+  const h = hi_y - lo_y;
+  if (w <= 0 || h <= 0) return null;
+  return [lo_x / imgW, lo_y / imgH, w / imgW, h / imgH];
 }
 
 // Phase-7: alert dispatch helpers exposed to route handlers. The route

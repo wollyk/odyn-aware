@@ -87,6 +87,32 @@ export type DetectionResult = {
   gated?: boolean;
   gate_reason?: string;
   cached_age_ms?: number;
+  /** Phase-9 unified canvas overlay. Real-CV boxes only (face + weapon)
+   *  with normalized [x,y,w,h] coords in [0..1]. T3's hallucinated
+   *  bboxes are deliberately excluded from this surface. */
+  boxes?: OverlayBox[];
+  /** Snapshot dimensions used to normalize the boxes. 0 if dim parse
+   *  failed (rare; falls back to no boxes drawn). */
+  image_w?: number;
+  image_h?: number;
+  /** Wall-clock ms when this analysis result was assembled. Used by
+   *  the canvas overlay to age-fade boxes. */
+  tickAt?: number;
+};
+
+/**
+ * Phase-9 unified overlay box. `source` drives the rendering style
+ * (color, fill alpha, label tone). `ts` is the wall-clock ms at which
+ * the underlying detector saw the object — used by the canvas to fade
+ * old boxes and stop drawing them after a few seconds.
+ */
+export type OverlayBox = {
+  source: "face_known" | "face_unknown" | "weapon_suspicious" | "weapon_clear";
+  /** Normalized [x, y, w, h] with values in [0..1]. */
+  bbox: [number, number, number, number];
+  label: string;
+  confidence: number;
+  ts: number;
 };
 
 /**
