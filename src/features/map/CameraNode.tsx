@@ -97,7 +97,12 @@ export function CameraNode({
         strokeWidth={1}
         listening={false}
       />
-      {/* Camera body — draggable dot. */}
+      {/* Camera body — draggable dot. `hitStrokeWidth` extends the
+          invisible hit area well beyond the visible 8px circle so a
+          near-miss (or a click on the operator's mental "camera halo")
+          still grabs the dot instead of falling through to the
+          pannable layer. Without this, an off-by-3px click starts a
+          map pan that feels like the camera is moving the map. */}
       <Circle
         x={placement.x_px}
         y={placement.y_px}
@@ -105,6 +110,7 @@ export function CameraNode({
         fill={NODE_FILL}
         stroke={selected ? SELECTED_STROKE : NODE_STROKE}
         strokeWidth={selected ? 2.5 : 1.5}
+        hitStrokeWidth={20}
         draggable
         onDragMove={handleDragMoveBody}
         onClick={() => onSelect(placement.name)}
@@ -136,7 +142,9 @@ export function CameraNode({
           listening={false}
         />
       )}
-      {/* Rotation handle at the cone tip — only when selected. */}
+      {/* Rotation handle at the cone tip — only when selected. Same
+          hit-area trick as the camera body so the handle is easy to
+          grab even at low zoom. */}
       {selected && (
         <Circle
           x={tip.x}
@@ -145,6 +153,7 @@ export function CameraNode({
           fill={HANDLE_FILL}
           stroke="#0f172a"
           strokeWidth={1.5}
+          hitStrokeWidth={18}
           draggable
           onDragMove={handleDragMoveTip}
         />

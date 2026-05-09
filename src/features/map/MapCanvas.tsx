@@ -1,19 +1,32 @@
 // Konva stage that hosts the background image + camera nodes.
 //
-// V1 sizing model — INTENTIONALLY locked, no pan/zoom:
-//   - The Stage matches its parent's width/height (resize-observed).
-//   - The background image is fit-to-screen ("contain"): scaled to the
-//     largest factor where the whole image stays inside the canvas, then
-//     centered horizontally and vertically.
-//   - Camera placements live in IMAGE-PIXEL space; the layer transform
-//     applies the same fit so cameras follow the image automatically.
+// Sizing & gesture model:
+//   - Stage matches its parent's width/height (resize-observed).
+//   - Background fits-to-contain on first load. After that the operator
+//     owns the view: drag empty area to pan, wheel to pan, shift+wheel
+//     to zoom around the cursor. A "fit" button restores the framed
+//     view if they get lost.
+//   - Camera placements live in IMAGE-PIXEL space and inherit the
+//     layer transform, so they pan/zoom with the image automatically.
 //
-// We removed the layer-level `draggable` because nested draggables
-// (a draggable Circle inside a draggable Layer) caused the map to pan
-// alongside the camera node during a drag — confusing, and we don't
-// need pan in V1. Operators report "fixed map, draggable cameras" is
-// what they want; we'll bring back gestural pan/zoom with proper
-// intent isolation in V1.5 if the request comes back.
+// CRITICAL ISOLATION RULE — why this file is fussy about events:
+//
+//   The visible-content layer is `draggable` (so empty-area drag pans).
+//   Each CameraNode body is ALSO `draggable` (so dot drag moves the
+//   camera). With nested draggables, Konva normally picks the deepest
+//   draggable hit by the cursor and starts only that one — the layer
+//   stays put. BUT if the operator's mousedown lands a few pixels off
+//   the dot (e.g. on the empty layer next to it), the layer drag wins
+//   and the entire map slides while the operator thinks they're moving
+//   the camera. Two defenses:
+//     1. CameraNode dots use a generous `hitStrokeWidth` so a near-miss
+//        still grabs the dot.
+//     2. Layer's `onDragStart` aborts the layer drag if the actual
+//        drag target turns out to be a child node — belt and suspenders
+//        in case Konva's hit-test still falls through.
+//
+//   Operator request was explicit: "I should still be able to move the
+//   map, but moving the camera should not move the image of the map."
 
 import Konva from "konva";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -37,8 +50,14 @@ export function MapCanvas({
   onOpenLive,
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const layerRef = useRef<Konva.Layer | null>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
+  const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const [bgImage, setBgImage] = useState<HTMLImageElement | null>(null);
+
+  // True once the operator has manually panned/zoomed. Stops auto-fit
+  // from yanking their view back when the container resizes.
+  const userInteractedRef = useRef(false);
 
   // ResizeObserver — keep the stage flush with its parent.
   useEffect(() => {
@@ -66,26 +85,51 @@ export function MapCanvas({
     img.src = layout.image_data;
   }, [layout.image_data]);
 
-  // Fit-to-screen is recomputed every render from current container size
-  // and image natural size. There's no user-controlled view state, so
-  // the map is *always* in its canonical fitted position. Cameras follow
-  // because they share the same layer transform.
-  const fit = useMemo(() => {
-    const iw = layout.image_width || 0;
-    const ih = layout.image_height || 0;
-    if (iw <= 0 || ih <= 0) return { x: 0, y: 0, scale: 1 };
-    const scale = Math.min(size.w / iw, size.h / ih);
-    return {
-      scale,
-      x: (size.w - iw * scale) / 2,
-      y: (size.h - ih * scale) / 2,
-    };
+  // Auto-fit the background to "contain" on first load + container
+  // resizes, but only if the operator hasn't started panning/zooming.
+  useEffect(() => {
+    if (userInteractedRef.current) return;
+    if (!layout.image_width || !layout.image_height) return;
+    const fitScale = Math.min(
+      size.w / layout.image_width,
+      size.h / layout.image_height,
+      1,
+    );
+    setView({
+      x: (size.w - layout.image_width * fitScale) / 2,
+      y: (size.h - layout.image_height * fitScale) / 2,
+      scale: fitScale,
+    });
   }, [size.w, size.h, layout.image_width, layout.image_height]);
 
-  // Click on empty stage → deselect. We only deselect when the click
-  // target is the stage itself (not a node, not the background image),
-  // so dragging cameras doesn't accidentally clear the selection on
-  // mouseup.
+  // Wheel = pan; shift+wheel = zoom around cursor.
+  const onWheel = useCallback(
+    (e: Konva.KonvaEventObject<WheelEvent>) => {
+      e.evt.preventDefault();
+      userInteractedRef.current = true;
+      if (e.evt.shiftKey) {
+        const stage = e.target.getStage();
+        if (!stage) return;
+        const pointer = stage.getPointerPosition();
+        if (!pointer) return;
+        const oldScale = view.scale;
+        const factor = 1 + (e.evt.deltaY > 0 ? -0.1 : 0.1);
+        const newScale = Math.max(0.1, Math.min(4, oldScale * factor));
+        const mx = (pointer.x - view.x) / oldScale;
+        const my = (pointer.y - view.y) / oldScale;
+        setView({
+          scale: newScale,
+          x: pointer.x - mx * newScale,
+          y: pointer.y - my * newScale,
+        });
+      } else {
+        setView((v) => ({ ...v, x: v.x - e.evt.deltaX, y: v.y - e.evt.deltaY }));
+      }
+    },
+    [view],
+  );
+
+  // Click on truly empty stage → deselect.
   const onStageClick = useCallback(
     (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
       if (e.target !== e.target.getStage()) return;
@@ -94,10 +138,15 @@ export function MapCanvas({
     [onSelectCamera],
   );
 
+  // Reset back to fit-to-screen.
+  const refit = useCallback(() => {
+    userInteractedRef.current = false;
+    setSize((s) => ({ ...s }));
+  }, []);
+
   const placements = layout.placements;
 
-  // Subtle grid backdrop when no image is set, so the canvas doesn't
-  // look like a void on first load.
+  // Subtle grid backdrop when no image is set.
   const checkerboard = useMemo(() => {
     const gridSize = 40;
     const cells: { x: number; y: number; key: string }[] = [];
@@ -116,7 +165,13 @@ export function MapCanvas({
       className="relative h-full w-full overflow-hidden bg-foreground/[0.02]"
       onContextMenu={(e) => e.preventDefault()}
     >
-      <Stage width={size.w} height={size.h} onClick={onStageClick} onTap={onStageClick}>
+      <Stage
+        width={size.w}
+        height={size.h}
+        onWheel={onWheel}
+        onClick={onStageClick}
+        onTap={onStageClick}
+      >
         <Layer listening={false}>
           {checkerboard.map((c) => (
             <Rect
@@ -129,8 +184,27 @@ export function MapCanvas({
             />
           ))}
         </Layer>
-        {/* Map + camera layer. NOT draggable — see header note. */}
-        <Layer x={fit.x} y={fit.y} scaleX={fit.scale} scaleY={fit.scale}>
+        <Layer
+          ref={layerRef}
+          x={view.x}
+          y={view.y}
+          scaleX={view.scale}
+          scaleY={view.scale}
+          draggable
+          // ISOLATION GUARD — see file header. If a CameraNode child is
+          // the actual drag target, abort the layer's drag so the map
+          // doesn't slide alongside the camera.
+          onDragStart={(e) => {
+            if (e.target !== layerRef.current) {
+              layerRef.current?.stopDrag();
+            }
+          }}
+          onDragEnd={(e) => {
+            if (e.target !== layerRef.current) return;
+            userInteractedRef.current = true;
+            setView((v) => ({ ...v, x: e.target.x(), y: e.target.y() }));
+          }}
+        >
           {bgImage && (
             <KonvaImage
               image={bgImage}
@@ -154,9 +228,19 @@ export function MapCanvas({
         </Layer>
       </Stage>
 
-      {/* Bottom-left hint: only the gestures we actually support. */}
+      {/* HUD: zoom indicator + manual fit. */}
+      <div className="pointer-events-none absolute right-3 top-3 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-foreground/55">
+        <span className="bg-black/60 px-2 py-0.5">{Math.round(view.scale * 100)}%</span>
+        <button
+          type="button"
+          onClick={refit}
+          className="pointer-events-auto bg-black/60 px-2 py-0.5 hover:text-foreground"
+        >
+          fit
+        </button>
+      </div>
       <div className="pointer-events-none absolute bottom-3 left-3 max-w-md font-mono text-[10px] uppercase tracking-widest text-foreground/40">
-        drag dot · move camera &nbsp;|&nbsp; drag amber handle · rotate / extend FOV &nbsp;|&nbsp; double-click · open live
+        drag empty area · pan map &nbsp;|&nbsp; scroll · pan &nbsp;|&nbsp; shift+scroll · zoom &nbsp;|&nbsp; drag dot · move camera &nbsp;|&nbsp; double-click · open live
       </div>
     </div>
   );
