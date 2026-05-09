@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import type { AgentStatus, StreamMode } from "@/features/live/types";
 import { useCameras } from "@/features/live/useCameras";
@@ -49,10 +49,19 @@ function AdminLive() {
 
   // Auto-select first camera once we have any. Survives empty intermediates
   // because useCameras keeps last known good — we never accidentally clear.
+  // Honor `?camera=NAME` (used by the /admin/map page when an operator
+  // double-clicks a node) so the requested camera takes priority over the
+  // arbitrary first-in-list pick.
   useEffect(() => {
-    if (!camera && camList.cameras.length > 0) {
-      setCamera(camList.cameras[0].name);
+    if (camList.cameras.length === 0) return;
+    if (typeof window !== "undefined") {
+      const requested = new URLSearchParams(window.location.search).get("camera");
+      if (requested && camList.cameras.some((c) => c.name === requested)) {
+        if (camera !== requested) setCamera(requested);
+        return;
+      }
     }
+    if (!camera) setCamera(camList.cameras[0].name);
   }, [camList.cameras, camera]);
 
   if (authState === "loading") return <AuthLoadingScreen />;
@@ -69,6 +78,16 @@ function AdminLive() {
           <span className="font-mono text-xs text-alert">[02]</span>
           <span className="label-mono">Live View</span>
           <span className="h-px flex-1 bg-border" />
+          {/* Map shortcut — sits just left of the camera dropdown so an
+              operator can pivot from any single camera view to the spatial
+              overview without losing the live page in their history. */}
+          <Link
+            to="/admin/map"
+            className="border border-border bg-background px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:border-foreground hover:text-foreground"
+            aria-label="Open map overview"
+          >
+            [ Map ]
+          </Link>
           {camList.cameras.length > 1 && (
             <select
               value={camera}

@@ -146,7 +146,7 @@ function motionBadge(row: TrackRow) {
 // ---- main component -----------------------------------------------------
 
 function AdminTracks() {
-  const { authState, logout } = useAdminAuth();
+  const { state, me, logout } = useAdminAuth();
 
   const [summary, setSummary] = useState<SummaryResp | null>(null);
   const [rows, setRows] = useState<TrackRow[]>([]);
@@ -188,11 +188,11 @@ function AdminTracks() {
   }, [windowMs, cameraFilter, labelFilter, openOnly]);
 
   useEffect(() => {
-    if (authState !== "ok") return;
+    if (state !== "ok") return;
     fetchAll();
     const t = setInterval(fetchAll, 15_000);
     return () => clearInterval(t);
-  }, [authState, fetchAll]);
+  }, [state, fetchAll]);
 
   const cameraOptions = useMemo(() => {
     const set = new Set<string>();
@@ -208,12 +208,12 @@ function AdminTracks() {
     return Array.from(set).sort();
   }, [summary, rows]);
 
-  if (authState === "loading") return <AuthLoadingScreen />;
-  if (authState === "denied") return <AuthDeniedScreen />;
+  if (state === "loading") return <AuthLoadingScreen />;
+  if (state === "denied") return <AuthDeniedScreen />;
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <AdminHeader active="tracks" onLogout={logout} />
+      <AdminHeader active="tracks" me={me} logout={logout} />
       <main className="mx-auto max-w-[1200px] px-6 py-6 space-y-6">
         {/* [01] Summary --------------------------------------------- */}
         <section className="border border-foreground/15 bg-foreground/[0.02] p-4">

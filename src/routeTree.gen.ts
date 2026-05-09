@@ -12,6 +12,8 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
+import { Route as AdminTracksRouteImport } from './routes/admin/tracks'
+import { Route as AdminMapRouteImport } from './routes/admin/map'
 import { Route as AdminLoginRouteImport } from './routes/admin/login'
 import { Route as AdminLiveRouteImport } from './routes/admin/live'
 import { Route as AdminFacesRouteImport } from './routes/admin/faces'
@@ -30,6 +32,16 @@ const IndexRoute = IndexRouteImport.update({
 const AdminIndexRoute = AdminIndexRouteImport.update({
   id: '/admin/',
   path: '/admin/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AdminTracksRoute = AdminTracksRouteImport.update({
+  id: '/admin/tracks',
+  path: '/admin/tracks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AdminMapRoute = AdminMapRouteImport.update({
+  id: '/admin/map',
+  path: '/admin/map',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AdminLoginRoute = AdminLoginRouteImport.update({
@@ -60,6 +72,8 @@ export interface FileRoutesByFullPath {
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
+  '/admin/map': typeof AdminMapRoute
+  '/admin/tracks': typeof AdminTracksRoute
   '/admin/': typeof AdminIndexRoute
 }
 export interface FileRoutesByTo {
@@ -69,6 +83,8 @@ export interface FileRoutesByTo {
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
+  '/admin/map': typeof AdminMapRoute
+  '/admin/tracks': typeof AdminTracksRoute
   '/admin': typeof AdminIndexRoute
 }
 export interface FileRoutesById {
@@ -79,6 +95,8 @@ export interface FileRoutesById {
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
+  '/admin/map': typeof AdminMapRoute
+  '/admin/tracks': typeof AdminTracksRoute
   '/admin/': typeof AdminIndexRoute
 }
 export interface FileRouteTypes {
@@ -90,6 +108,8 @@ export interface FileRouteTypes {
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
+    | '/admin/map'
+    | '/admin/tracks'
     | '/admin/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -99,6 +119,8 @@ export interface FileRouteTypes {
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
+    | '/admin/map'
+    | '/admin/tracks'
     | '/admin'
   id:
     | '__root__'
@@ -108,6 +130,8 @@ export interface FileRouteTypes {
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
+    | '/admin/map'
+    | '/admin/tracks'
     | '/admin/'
   fileRoutesById: FileRoutesById
 }
@@ -118,6 +142,8 @@ export interface RootRouteChildren {
   AdminFacesRoute: typeof AdminFacesRoute
   AdminLiveRoute: typeof AdminLiveRoute
   AdminLoginRoute: typeof AdminLoginRoute
+  AdminMapRoute: typeof AdminMapRoute
+  AdminTracksRoute: typeof AdminTracksRoute
   AdminIndexRoute: typeof AdminIndexRoute
 }
 
@@ -142,6 +168,20 @@ declare module '@tanstack/react-router' {
       path: '/admin'
       fullPath: '/admin/'
       preLoaderRoute: typeof AdminIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/admin/tracks': {
+      id: '/admin/tracks'
+      path: '/admin/tracks'
+      fullPath: '/admin/tracks'
+      preLoaderRoute: typeof AdminTracksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/admin/map': {
+      id: '/admin/map'
+      path: '/admin/map'
+      fullPath: '/admin/map'
+      preLoaderRoute: typeof AdminMapRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/admin/login': {
@@ -182,6 +222,8 @@ const rootRouteChildren: RootRouteChildren = {
   AdminFacesRoute: AdminFacesRoute,
   AdminLiveRoute: AdminLiveRoute,
   AdminLoginRoute: AdminLoginRoute,
+  AdminMapRoute: AdminMapRoute,
+  AdminTracksRoute: AdminTracksRoute,
   AdminIndexRoute: AdminIndexRoute,
 }
 export const routeTree = rootRouteImport
