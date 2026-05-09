@@ -15,4 +15,9 @@ uvicorn
 websockets
 httpx
 pillow
+# `lap` is required by ByteTrack's Hungarian-assignment step. Ultralytics
+# treats it as optional (only needed when `model.track(tracker="bytetrack")`
+# is called), so it's missing from the default install. Without it the
+# very first track call throws "No module named 'lap'" on every frame.
+lap>=0.5.0
 ultralytics>=8.3.0,<9.0
