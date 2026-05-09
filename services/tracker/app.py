@@ -39,6 +39,7 @@ import io
 import os
 import ssl
 import time
+from collections import Counter, deque
 from typing import Any
 
 import httpx
@@ -86,11 +87,60 @@ if not os.path.isfile(MODEL_PATH):
     MODEL_PATH = "yolov8s.pt"
 
 # COCO class allowlist. We only broadcast tracks for classes we care about.
-# Operator can override via env if they want broader coverage.
-DEFAULT_CLASSES = "person,bicycle,car,motorcycle,airplane,bus,truck,boat,bird,cat,dog,horse,sheep,cow,backpack,umbrella,handbag,suitcase"
+# Operator can override via env if they want broader coverage. Default is
+# tight on purpose: a security operator cares about people, vehicles, and
+# pets — not the full COCO long-tail. Suitcase/backpack/umbrella in
+# particular are common YOLOv8s mis-fires for clothing, jackets, and
+# tripods, so they're excluded to enforce "miss-rather-than-mistag".
+DEFAULT_CLASSES = "person,bicycle,car,motorcycle,bus,truck,dog,cat"
 ALLOWED_CLASSES = {
     s.strip().lower() for s in os.environ.get("TRACKER_CLASSES", DEFAULT_CLASSES).split(",") if s.strip()
 }
+
+# Per-class minimum *voted* confidence floor (applied after modal-class
+# voting below, not raw YOLO conf). Anything not listed inherits
+# PER_CLASS_DEFAULT_CONF. Format: "class=val,class=val,...".
+#
+# Tuned for "miss rather than mistag" on a security camera. Person is the
+# class YOLOv8s is most reliable on, so it gets the lowest floor; animals
+# are the most confused class family, so they get the highest.
+PER_CLASS_DEFAULT_CONF = float(os.environ.get("TRACKER_PER_CLASS_DEFAULT_CONF", "0.55"))
+
+
+def _parse_per_class_conf(raw: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        try:
+            out[k.strip().lower()] = float(v.strip())
+        except ValueError:
+            continue
+    return out
+
+
+PER_CLASS_CONF = _parse_per_class_conf(
+    os.environ.get(
+        "TRACKER_PER_CLASS_CONF",
+        "person=0.50,car=0.55,truck=0.55,bus=0.55,motorcycle=0.55,bicycle=0.55,dog=0.60,cat=0.60",
+    )
+)
+
+# Modal-class voting parameters. A track must have been observed at least
+# MIN_TRACK_FRAMES times in its recent window before any box is emitted —
+# this kills 1-frame flickers. Inside the window we count classes seen
+# and emit only the modal class IF it owns ≥ VOTE_MAJORITY of the window.
+# A 60% majority means a track that flips between "couch" and "dog" will
+# be suppressed entirely instead of strobing.
+MIN_TRACK_FRAMES = int(os.environ.get("TRACKER_MIN_FRAMES", "3"))
+VOTE_WINDOW = int(os.environ.get("TRACKER_VOTE_WINDOW", "8"))
+VOTE_MAJORITY = float(os.environ.get("TRACKER_VOTE_MAJORITY", "0.6"))
+
+# How long to keep a track's voting history alive after we last saw it.
+# Older entries get GC'd to keep memory bounded under busy scenes.
+TRACK_TTL_S = float(os.environ.get("TRACKER_TRACK_TTL_S", "5.0"))
 
 # How long to keep a per-camera loop alive after the last unsubscribe.
 # Avoids tearing down + restarting the model when the operator just
@@ -156,6 +206,57 @@ class FrigateClient:
         return res.content
 
 
+# ---- Modal-class voter ----------------------------------------------------
+class _TrackVoter:
+    """Per-track ring buffer of recent (cls_id, conf) observations.
+
+    Why this exists: ByteTrack assigns persistent track IDs but YOLO can
+    reclassify the same blob frame-to-frame ("person" → "couch" →
+    "person"). Without smoothing, the operator sees the label strobe.
+    Voting holds the last VOTE_WINDOW classes per track and emits the
+    modal class only if it owns ≥ VOTE_MAJORITY of the window AND the
+    track has been seen ≥ MIN_TRACK_FRAMES times. Anything else is
+    suppressed — better to miss than to mistag.
+
+    State is per-camera (each CameraTracker owns one) because track IDs
+    are not unique across cameras.
+    """
+
+    def __init__(self):
+        self._tracks: dict[int, deque[tuple[int, float]]] = {}
+        self._last_ts: dict[int, float] = {}
+
+    def update(
+        self, tid: int, cls: int, conf: float, ts: float
+    ) -> tuple[int | None, float, int]:
+        """Record one observation; return (modal_cls, avg_conf, frames_seen).
+
+        Returns modal_cls=None when the track lacks a clear winner — the
+        caller should suppress that track for this frame.
+        """
+        d = self._tracks.get(tid)
+        if d is None:
+            d = deque(maxlen=VOTE_WINDOW)
+            self._tracks[tid] = d
+        d.append((cls, conf))
+        self._last_ts[tid] = ts
+        counts = Counter(c for c, _ in d)
+        if not counts:
+            return None, 0.0, 0
+        modal_cls, modal_count = counts.most_common(1)[0]
+        majority = modal_count / len(d)
+        if majority < VOTE_MAJORITY:
+            return None, 0.0, len(d)
+        avg_conf = sum(cc for c2, cc in d if c2 == modal_cls) / modal_count
+        return modal_cls, avg_conf, len(d)
+
+    def gc(self, now_ts: float) -> None:
+        dead = [tid for tid, ts in self._last_ts.items() if now_ts - ts > TRACK_TTL_S]
+        for tid in dead:
+            self._tracks.pop(tid, None)
+            self._last_ts.pop(tid, None)
+
+
 # ---- Per-camera tracker ---------------------------------------------------
 class CameraTracker:
     """Owns a YOLO model + a persistent loop for one camera.
@@ -176,6 +277,8 @@ class CameraTracker:
         self._subscribers: set[WebSocket] = set()
         self._latest: dict | None = None
         self._grace_task: asyncio.Task | None = None
+        # Per-camera class-voter — see _TrackVoter docstring for why.
+        self._voter = _TrackVoter()
 
     # -- model loaded lazily so importing this module doesn't block on
     # -- torch + ultralytics warm-up.
@@ -317,14 +420,38 @@ class CameraTracker:
         if boxes is None or len(boxes) == 0 or boxes.id is None:
             return []
         names = self._model.names
-        out = []
         xyxy = boxes.xyxy.cpu().numpy()
         ids = boxes.id.cpu().numpy().astype(int)
         cls = boxes.cls.cpu().numpy().astype(int)
         confs = boxes.conf.cpu().numpy()
+
+        # Decision pipeline per detection (in this order, fail-fast):
+        #   1. Push (cls, conf) into the per-track voter — always, so the
+        #      voter sees the full history even for raw classes we'd
+        #      ultimately reject. Keeps the modal-class signal honest.
+        #   2. Drop if the track has fewer than MIN_TRACK_FRAMES samples
+        #      (kills 1-frame flickers).
+        #   3. Drop if no clear modal class (majority < VOTE_MAJORITY).
+        #   4. Drop if voted class is not in ALLOWED_CLASSES.
+        #   5. Drop if voted-avg conf < per-class floor (or default).
+        # Surviving detections inherit the *current* frame's bbox, since
+        # voting only changes the label, not where the object is now.
+        now_ts = time.monotonic()
+        out: list[dict] = []
         for i in range(len(xyxy)):
-            label = str(names.get(int(cls[i]), str(int(cls[i])))).lower()
+            tid = int(ids[i])
+            raw_cls = int(cls[i])
+            raw_conf = float(confs[i])
+            voted_cls, voted_conf, frames = self._voter.update(
+                tid, raw_cls, raw_conf, now_ts
+            )
+            if frames < MIN_TRACK_FRAMES or voted_cls is None:
+                continue
+            label = str(names.get(voted_cls, str(voted_cls))).lower()
             if ALLOWED_CLASSES and label not in ALLOWED_CLASSES:
+                continue
+            floor = PER_CLASS_CONF.get(label, PER_CLASS_DEFAULT_CONF)
+            if voted_conf < floor:
                 continue
             x1, y1, x2, y2 = (float(v) for v in xyxy[i].tolist())
             w = max(0.0, x2 - x1)
@@ -333,9 +460,9 @@ class CameraTracker:
                 continue
             out.append(
                 {
-                    "id": int(ids[i]),
+                    "id": tid,
                     "label": label,
-                    "conf": round(float(confs[i]), 3),
+                    "conf": round(voted_conf, 3),
                     "bbox": [
                         round(x1 / ow, 5),
                         round(y1 / oh, 5),
@@ -344,6 +471,9 @@ class CameraTracker:
                     ],
                 }
             )
+        # GC tracks we haven't seen recently so the voter doesn't grow
+        # unboundedly under busy scenes.
+        self._voter.gc(now_ts)
         return out
 
     async def _broadcast(self, payload: dict):
@@ -378,7 +508,13 @@ async def _startup():
     if not FRIGATE_USER or not FRIGATE_PASS:
         print("[tracker] WARNING: FRIGATE_USER/PASS not set — snapshot fetches will fail", flush=True)
     _state["frigate"] = FrigateClient(FRIGATE_BASE, FRIGATE_USER, FRIGATE_PASS, FRIGATE_VERIFY)
-    print(f"[tracker] startup; model={MODEL_PATH} fps={TARGET_FPS} h={SNAPSHOT_HEIGHT} classes={sorted(ALLOWED_CLASSES)}", flush=True)
+    print(
+        f"[tracker] startup; model={MODEL_PATH} fps={TARGET_FPS} h={SNAPSHOT_HEIGHT} "
+        f"classes={sorted(ALLOWED_CLASSES)} "
+        f"min_frames={MIN_TRACK_FRAMES} vote_window={VOTE_WINDOW} "
+        f"vote_majority={VOTE_MAJORITY} per_class_conf={PER_CLASS_CONF}",
+        flush=True,
+    )
 
 
 @app.on_event("shutdown")
@@ -412,6 +548,11 @@ async def health() -> JSONResponse:
             "conf_threshold": CONF_THRESHOLD,
             "iou_threshold": IOU_THRESHOLD,
             "allowed_classes": sorted(ALLOWED_CLASSES),
+            "per_class_conf": PER_CLASS_CONF,
+            "per_class_default_conf": PER_CLASS_DEFAULT_CONF,
+            "min_track_frames": MIN_TRACK_FRAMES,
+            "vote_window": VOTE_WINDOW,
+            "vote_majority": VOTE_MAJORITY,
             "active_cameras": [
                 {
                     "camera": c,

@@ -26,8 +26,23 @@ Environment=TRACKER_SNAPSHOT_HEIGHT=720
 Environment=TRACKER_IMGSZ=640
 Environment=TRACKER_CONF=0.30
 Environment=TRACKER_IOU=0.45
-# Drop the COCO classes we don't care about (toilet, toaster, hairbrush, ...)
-Environment="TRACKER_CLASSES=person,bicycle,car,motorcycle,bus,truck,bird,cat,dog,horse,sheep,cow,backpack,umbrella,handbag,suitcase"
+# Tight allowlist for "miss-rather-than-mistag". Excludes COCO long-tail
+# classes that are common YOLOv8s mis-fires for clothing/bags/static
+# objects (suitcase, backpack, umbrella, handbag). Add more here only if
+# operators ask for them.
+Environment="TRACKER_CLASSES=person,bicycle,car,motorcycle,bus,truck,dog,cat"
+# Modal-class voting parameters. See _TrackVoter in app.py for the
+# rationale. Defaults are tuned for security-camera scenes; raise
+# VOTE_MAJORITY (e.g. 0.7) if the operator complains about strobe, or
+# lower MIN_TRACK_FRAMES (e.g. 2) if real objects feel too slow to
+# appear.
+Environment=TRACKER_MIN_FRAMES=3
+Environment=TRACKER_VOTE_WINDOW=8
+Environment=TRACKER_VOTE_MAJORITY=0.6
+# Per-class voted-conf floors (after voting, not raw YOLO conf). Raise
+# any single class here to make it stricter without affecting others.
+Environment="TRACKER_PER_CLASS_CONF=person=0.50,car=0.55,truck=0.55,bus=0.55,motorcycle=0.55,bicycle=0.55,dog=0.60,cat=0.60"
+Environment=TRACKER_PER_CLASS_DEFAULT_CONF=0.55
 # Frigate runs on a self-signed cert locally; allow it.
 Environment=FRIGATE_VERIFY=false
 # Ultralytics caches go under HOME / XDG_CONFIG_HOME — pin to a writable
