@@ -43,6 +43,30 @@ Environment=TRACKER_VOTE_MAJORITY=0.6
 # any single class here to make it stricter without affecting others.
 Environment="TRACKER_PER_CLASS_CONF=person=0.50,car=0.55,truck=0.55,bus=0.55,motorcycle=0.55,bicycle=0.55,dog=0.60,cat=0.60"
 Environment=TRACKER_PER_CLASS_DEFAULT_CONF=0.55
+
+# ---- Phase 11A: motion classification + VLM verification --------------
+# A track is classified static when IoU(newest, oldest) over an 8-frame
+# window stays >=STATIC_IOU. Static tracks get one VLM check (Moondream
+# via Ollama on the LAN) before being emitted; unverified static tracks
+# are suppressed (operator preference: miss > mistag). Moving tracks
+# bypass the VLM entirely.
+Environment=TRACKER_MOTION_WINDOW=8
+Environment=TRACKER_MIN_MOTION_FRAMES=5
+Environment=TRACKER_STATIC_IOU=0.85
+Environment=TRACKER_MIN_STATIC_DWELL_S=2.0
+# Master toggle for VLM. If Ollama is down, set this to false to skip
+# the verification path; static tracks will then emit unconditionally.
+Environment=TRACKER_VLM_VERIFY=true
+Environment=TRACKER_STATIC_REQUIRE_VERIFY=true
+# Ollama defaults match server/harness/tier2.mjs so we hit the same
+# model the rest of the harness uses.
+Environment=OLLAMA_BASE=http://192.168.0.137:11434
+Environment=OLLAMA_VLM_MODEL=moondream:latest
+Environment=TRACKER_VLM_TIMEOUT_S=10
+Environment=TRACKER_VLM_CONCURRENCY=2
+Environment=TRACKER_VLM_VERDICT_TTL_S=300
+Environment=TRACKER_VLM_RETRY_COOLDOWN_S=30
+Environment=TRACKER_CROP_PAD_RATIO=0.15
 # Frigate runs on a self-signed cert locally; allow it.
 Environment=FRIGATE_VERIFY=false
 # Ultralytics caches go under HOME / XDG_CONFIG_HOME — pin to a writable

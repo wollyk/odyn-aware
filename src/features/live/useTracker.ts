@@ -35,6 +35,18 @@ export type TrackedBox = {
   conf: number;
   /** Normalized [x, y, w, h] in 0..1 of the source frame. */
   bbox: [number, number, number, number];
+  /** Phase-11A motion classification:
+   *   - "moving"  → IoU(newest, oldest) below static threshold
+   *   - "static"  → IoU stayed high → object hasn't moved
+   *   - "warming" → not enough frames yet to decide
+   *  Sidecar may omit this on legacy payloads; default to undefined. */
+  motion?: "moving" | "static" | "warming";
+  /** Phase-11A VLM verification verdict for static tracks:
+   *   - true   → Moondream confirmed the YOLO label
+   *   - false  → Moondream rejected (track is suppressed at sidecar, so
+   *              this normally won't reach the client)
+   *   - null   → static but verdict pending OR moving (skipped VLM) */
+  verified?: boolean | null;
 };
 
 export type TrackerStatus =
