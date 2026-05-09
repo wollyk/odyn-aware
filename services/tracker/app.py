@@ -40,6 +40,7 @@ import io
 import os
 import ssl
 import time
+import uuid
 from collections import Counter, deque
 from typing import Any
 
@@ -199,6 +200,27 @@ VLM_RETRY_COOLDOWN_S = float(os.environ.get("TRACKER_VLM_RETRY_COOLDOWN_S", "30.
 # crop loses context (e.g. just the tarp, no surrounding driveway);
 # 15% padding gives Moondream enough scene to ground the answer.
 CROP_PAD_RATIO = float(os.environ.get("TRACKER_CROP_PAD_RATIO", "0.15"))
+
+# ---- Phase 11B: persisted track timeline -----------------------------------
+#
+# The tracker doesn't talk to the DB directly; it POSTs batches of
+# observations to the Node API at INGEST_URL with a shared secret in
+# X-Tracker-Secret. Node owns the schema/CRUD and the admin read API.
+#
+# Cadence: a single async task per CameraTracker wakes every
+# INGEST_INTERVAL_S and ships the current set of "active" sessions —
+# tracks whose last_seen_ms is within the recent window. The Node
+# stale-closer takes care of marking finished sessions closed without
+# us having to send "this ended" messages.
+INGEST_URL = os.environ.get("TRACKER_INGEST_URL", "").strip()
+INGEST_SECRET = os.environ.get("TRACKER_INGEST_SECRET", "").strip()
+INGEST_INTERVAL_S = float(os.environ.get("TRACKER_INGEST_INTERVAL_S", "10.0"))
+# Sessions whose last_seen is older than this aren't sent (Node will
+# close them on the next ingest from any camera).
+INGEST_FRESH_WINDOW_S = float(os.environ.get("TRACKER_INGEST_FRESH_WINDOW_S", "30.0"))
+# Drop sessions from local memory that are older than this so the dict
+# can't grow unbounded under busy scenes.
+SESSION_TTL_S = float(os.environ.get("TRACKER_SESSION_TTL_S", "120.0"))
 
 # How long to keep a per-camera loop alive after the last unsubscribe.
 # Avoids tearing down + restarting the model when the operator just
@@ -568,6 +590,11 @@ class CameraTracker:
         # shared across cameras.
         self._bbox_history = _BBoxHistory()
         self._vlm = _VLMVerifier()
+        # Phase-11B sessions: track_id -> session dict with stable UUID,
+        # first_seen, last_seen, label, etc. Updated every emit; flushed
+        # to Node on the ingest interval.
+        self._sessions: dict[int, dict[str, Any]] = {}
+        self._ingest_task: asyncio.Task | None = None
 
     # -- model loaded lazily so importing this module doesn't block on
     # -- torch + ultralytics warm-up.
@@ -586,6 +613,15 @@ class CameraTracker:
         if self._task is None or self._task.done():
             self._stop_event.clear()
             self._task = asyncio.create_task(self._run_loop(), name=f"tracker-{self.camera}")
+        # Phase-11B: start ingest loop alongside the tracker loop. It's
+        # cheap (sleeps most of the time) and lifecycle-bound to the
+        # same _stop_event.
+        if INGEST_URL and INGEST_SECRET and (
+            self._ingest_task is None or self._ingest_task.done()
+        ):
+            self._ingest_task = asyncio.create_task(
+                self._run_ingest_loop(), name=f"ingest-{self.camera}"
+            )
 
     def remove_subscriber(self, ws: WebSocket):
         self._subscribers.discard(ws)
@@ -608,6 +644,19 @@ class CameraTracker:
             except asyncio.TimeoutError:
                 self._task.cancel()
         self._task = None
+        # Phase-11B: flush + cancel the ingest task. Final flush so the
+        # last 30s of session state survives the loop teardown.
+        if self._ingest_task and not self._ingest_task.done():
+            try:
+                await self._flush_to_ingest()
+            except Exception:
+                pass
+            self._ingest_task.cancel()
+            try:
+                await self._ingest_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._ingest_task = None
         # Keep the model loaded so a quick re-subscribe is fast. Drop only
         # if we want to free RAM (left for ops).
 
@@ -676,6 +725,85 @@ class CameraTracker:
             )
         finally:
             self._vlm.in_flight.discard((tid, label))
+
+    async def _run_ingest_loop(self) -> None:
+        """Phase-11B: periodic flush of session state to the Node API.
+
+        Sleeps INGEST_INTERVAL_S, wakes, ships any sessions seen within
+        the FRESH window, repeats. Errors are logged but never crash
+        the loop — tracker correctness must not depend on the audit
+        log being available.
+        """
+        print(
+            f"[tracker:{self.camera}] ingest loop start interval={INGEST_INTERVAL_S}s url={INGEST_URL}",
+            flush=True,
+        )
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=INGEST_INTERVAL_S
+                )
+                # If we get here, stop_event was set — exit before flushing.
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._flush_to_ingest()
+            except Exception as exc:  # pragma: no cover — defensive
+                print(
+                    f"[tracker:{self.camera}] ingest flush crashed: {exc}",
+                    flush=True,
+                )
+        print(f"[tracker:{self.camera}] ingest loop stopped", flush=True)
+
+    async def _flush_to_ingest(self) -> None:
+        """Send a single batch of fresh sessions. No-op if nothing fresh."""
+        if not INGEST_URL or not INGEST_SECRET:
+            return
+        now_mono = time.monotonic()
+        fresh_cutoff = now_mono - INGEST_FRESH_WINDOW_S
+        observations: list[dict] = []
+        # Snapshot to avoid concurrent-mutation surprises during the
+        # async POST below.
+        for tid, sess in list(self._sessions.items()):
+            if sess.get("last_seen_mono", 0.0) < fresh_cutoff:
+                continue
+            if "session_id" not in sess or "label" not in sess:
+                continue
+            observations.append(
+                {
+                    "session_id": sess["session_id"],
+                    "track_id": int(tid),
+                    "label": sess["label"],
+                    "conf": float(sess.get("conf", 0.0)),
+                    "bbox": list(sess.get("bbox", [0.0, 0.0, 0.0, 0.0])),
+                    "motion": sess.get("motion"),
+                    "verified": sess.get("verified"),
+                    "frames_seen": int(sess.get("frames_seen", 1)),
+                    "first_seen_ms": int(sess.get("first_seen_ms", 0)),
+                    "last_seen_ms": int(sess.get("last_seen_ms", 0)),
+                }
+            )
+        if not observations:
+            return
+        client: httpx.AsyncClient = _state["vlm_client"]
+        body = {"camera": self.camera, "observations": observations}
+        try:
+            res = await client.post(
+                INGEST_URL,
+                json=body,
+                headers={"X-Tracker-Secret": INGEST_SECRET},
+                timeout=httpx.Timeout(10.0),
+            )
+            if res.status_code != 200:
+                print(
+                    f"[tracker:{self.camera}] ingest http {res.status_code}: {res.text[:200]}",
+                    flush=True,
+                )
+        except Exception as exc:
+            # Network error or timeout. Log and move on; the next flush
+            # will resync the same sessions.
+            print(f"[tracker:{self.camera}] ingest error: {exc}", flush=True)
 
     async def _tick(self) -> tuple[dict, list[tuple[int, str, bytes]]] | None:
         """One frame: fetch → decode → track → return (payload, verify-queue).
@@ -849,27 +977,69 @@ class CameraTracker:
                         # next tick will emit (or permanently suppress).
                         continue
 
+            bbox_norm = [
+                round(x1 / ow, 5),
+                round(y1 / oh, 5),
+                round(w / ow, 5),
+                round(h / oh, 5),
+            ]
+            # Phase-11B: maintain per-track session state for ingest.
+            # Same track_id reuses the session_id; track_id reuse after
+            # ByteTrack resets gets a fresh UUID (we delete dead
+            # sessions in _gc_sessions).
+            wall_now_ms = int(time.time() * 1000)
+            session = self._sessions.get(tid)
+            if session is None:
+                session = {
+                    "session_id": uuid.uuid4().hex,
+                    "first_seen_ms": wall_now_ms,
+                    "frames_seen": 0,
+                }
+                self._sessions[tid] = session
+            session["track_id"] = tid
+            session["label"] = label
+            session["conf"] = float(voted_conf)
+            session["bbox"] = bbox_norm
+            session["motion"] = motion
+            session["verified"] = verified
+            session["frames_seen"] = int(session.get("frames_seen", 0)) + 1
+            session["last_seen_ms"] = wall_now_ms
+            session["last_seen_mono"] = now_ts
             out.append(
                 {
                     "id": tid,
                     "label": label,
                     "conf": round(voted_conf, 3),
-                    "bbox": [
-                        round(x1 / ow, 5),
-                        round(y1 / oh, 5),
-                        round(w / ow, 5),
-                        round(h / oh, 5),
-                    ],
+                    "bbox": bbox_norm,
                     "motion": motion,
                     "verified": verified,
+                    "session_id": session["session_id"],
                 }
             )
-        # GC voter + history + verifier so memory stays bounded under
-        # long sessions on busy scenes.
+        # GC voter + history + verifier + sessions so memory stays
+        # bounded under long sessions on busy scenes.
         self._voter.gc(now_ts)
         self._bbox_history.gc(now_ts)
         self._vlm.gc(now_ts)
+        self._gc_sessions(now_ts)
         return out, verify_queue
+
+    def _gc_sessions(self, now_ts: float) -> None:
+        """Drop sessions whose last_seen_mono is older than SESSION_TTL_S.
+
+        Important: we keep dead sessions around for the TTL so the next
+        ingest batch reports them with their final state — Node will
+        close them via the stale-closer once last_seen_ms ages out, but
+        keeping them locally a bit longer means a brief Node outage
+        doesn't drop the final-state record.
+        """
+        dead = [
+            tid
+            for tid, s in self._sessions.items()
+            if now_ts - s.get("last_seen_mono", now_ts) > SESSION_TTL_S
+        ]
+        for tid in dead:
+            self._sessions.pop(tid, None)
 
     async def _broadcast(self, payload: dict):
         if not self._subscribers:
@@ -918,7 +1088,8 @@ async def _startup():
         f"min_frames={MIN_TRACK_FRAMES} vote_window={VOTE_WINDOW} "
         f"vote_majority={VOTE_MAJORITY} per_class_conf={PER_CLASS_CONF} "
         f"vlm_enabled={VLM_VERIFY_ENABLED} vlm_model={VLM_MODEL} "
-        f"static_iou={STATIC_IOU_THRESHOLD} min_static_dwell_s={MIN_STATIC_DWELL_S}",
+        f"static_iou={STATIC_IOU_THRESHOLD} min_static_dwell_s={MIN_STATIC_DWELL_S} "
+        f"ingest_url={INGEST_URL or '<unset>'} ingest_interval_s={INGEST_INTERVAL_S}",
         flush=True,
     )
     # Fire-and-forget VLM probe so a misconfigured Ollama is visible in
@@ -1017,6 +1188,13 @@ async def health() -> JSONResponse:
                 "retry_cooldown_s": VLM_RETRY_COOLDOWN_S,
                 "min_static_dwell_s": MIN_STATIC_DWELL_S,
                 "static_iou_threshold": STATIC_IOU_THRESHOLD,
+            },
+            "ingest": {
+                "enabled": bool(INGEST_URL and INGEST_SECRET),
+                "url": INGEST_URL or None,
+                "interval_s": INGEST_INTERVAL_S,
+                "fresh_window_s": INGEST_FRESH_WINDOW_S,
+                "session_ttl_s": SESSION_TTL_S,
             },
             "active_cameras": [
                 {

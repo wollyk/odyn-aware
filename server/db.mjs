@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import { applyAlertsSchema } from "./db/alerts.mjs";
+import { applyTracksSchema } from "./db/tracks.mjs";
 
 const DEFAULT_PATH = path.resolve(process.cwd(), "data/odyn.db");
 
@@ -218,6 +219,7 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
     CREATE INDEX IF NOT EXISTS idx_daily_summaries_scope ON daily_summaries(tenant_id, scope, day DESC);
   `);
   applyAlertsSchema(db);
+  applyTracksSchema(db);
   return db;
 }
 

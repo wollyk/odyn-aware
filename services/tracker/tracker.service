@@ -67,6 +67,20 @@ Environment=TRACKER_VLM_CONCURRENCY=2
 Environment=TRACKER_VLM_VERDICT_TTL_S=300
 Environment=TRACKER_VLM_RETRY_COOLDOWN_S=30
 Environment=TRACKER_CROP_PAD_RATIO=0.15
+
+# ---- Phase 11B: persisted track timeline ------------------------------
+# Sidecar POSTs session state to the Node API on this URL with the
+# shared secret in X-Tracker-Secret. Node verifies the secret and
+# upserts into track_observations. If TRACKER_INGEST_SECRET is empty,
+# the ingest loop refuses to start and Node refuses to accept — this
+# is the secure default for unconfigured deploys.
+Environment=TRACKER_INGEST_URL=http://127.0.0.1:3001/api/tracker/ingest
+Environment=TRACKER_INGEST_INTERVAL_S=10
+Environment=TRACKER_INGEST_FRESH_WINDOW_S=30
+Environment=TRACKER_SESSION_TTL_S=120
+# TRACKER_INGEST_SECRET MUST be set in /etc/odyn-aware/api.env so both
+# the Node api server and the python sidecar see the same value. We
+# don't set it here so it isn't in the unit file.
 # Frigate runs on a self-signed cert locally; allow it.
 Environment=FRIGATE_VERIFY=false
 # Ultralytics caches go under HOME / XDG_CONFIG_HOME — pin to a writable
