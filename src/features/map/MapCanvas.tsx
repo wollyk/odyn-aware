@@ -1,18 +1,19 @@
 // Konva stage that hosts the background image + camera nodes.
 //
-// Sizing strategy:
+// V1 sizing model — INTENTIONALLY locked, no pan/zoom:
 //   - The Stage matches its parent's width/height (resize-observed).
-//   - The background image is rendered at its natural pixel size and
-//     translated/scaled by `view` (zoom + pan). Camera placements live
-//     in image-pixel space, so they share the same transform.
-//   - Wheel + middle-mouse drag pan; shift-wheel zoom. We cap zoom at
-//     0.1..4x.
+//   - The background image is fit-to-screen ("contain"): scaled to the
+//     largest factor where the whole image stays inside the canvas, then
+//     centered horizontally and vertically.
+//   - Camera placements live in IMAGE-PIXEL space; the layer transform
+//     applies the same fit so cameras follow the image automatically.
 //
-// Why one transform instead of CSS-scaled stage:
-//   We want the camera dots to stay a constant SCREEN size regardless
-//   of zoom (a zoomed-in property still has 8px dots). We do that by
-//   un-scaling the dot/handle radii via the inverse of the current
-//   zoom; that requires keeping the transform on the stage layer.
+// We removed the layer-level `draggable` because nested draggables
+// (a draggable Circle inside a draggable Layer) caused the map to pan
+// alongside the camera node during a drag — confusing, and we don't
+// need pan in V1. Operators report "fixed map, draggable cameras" is
+// what they want; we'll bring back gestural pan/zoom with proper
+// intent isolation in V1.5 if the request comes back.
 
 import Konva from "konva";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -37,7 +38,6 @@ export function MapCanvas({
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
-  const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const [bgImage, setBgImage] = useState<HTMLImageElement | null>(null);
 
   // ResizeObserver — keep the stage flush with its parent.
@@ -66,59 +66,29 @@ export function MapCanvas({
     img.src = layout.image_data;
   }, [layout.image_data]);
 
-  // Auto-fit: when an image first loads (or the container resizes
-  // before any user pan/zoom), center it in the stage.
-  const userInteractedRef = useRef(false);
-  useEffect(() => {
-    if (userInteractedRef.current) return;
-    if (!layout.image_width || !layout.image_height) return;
-    const fitScale = Math.min(
-      size.w / layout.image_width,
-      size.h / layout.image_height,
-      1,
-    );
-    setView({
-      x: (size.w - layout.image_width * fitScale) / 2,
-      y: (size.h - layout.image_height * fitScale) / 2,
-      scale: fitScale,
-    });
+  // Fit-to-screen is recomputed every render from current container size
+  // and image natural size. There's no user-controlled view state, so
+  // the map is *always* in its canonical fitted position. Cameras follow
+  // because they share the same layer transform.
+  const fit = useMemo(() => {
+    const iw = layout.image_width || 0;
+    const ih = layout.image_height || 0;
+    if (iw <= 0 || ih <= 0) return { x: 0, y: 0, scale: 1 };
+    const scale = Math.min(size.w / iw, size.h / ih);
+    return {
+      scale,
+      x: (size.w - iw * scale) / 2,
+      y: (size.h - ih * scale) / 2,
+    };
   }, [size.w, size.h, layout.image_width, layout.image_height]);
 
-  // Wheel = pan, shift+wheel = zoom around cursor. Middle-button drag
-  // is also pan but Konva handles that via `draggable` on the layer.
-  const onWheel = useCallback(
-    (e: Konva.KonvaEventObject<WheelEvent>) => {
-      e.evt.preventDefault();
-      userInteractedRef.current = true;
-      if (e.evt.shiftKey) {
-        const stage = e.target.getStage();
-        if (!stage) return;
-        const pointer = stage.getPointerPosition();
-        if (!pointer) return;
-        const oldScale = view.scale;
-        const dir = e.evt.deltaY > 0 ? -1 : 1;
-        const factor = 1 + dir * 0.1;
-        const newScale = Math.max(0.1, Math.min(4, oldScale * factor));
-        // Anchor zoom around the cursor.
-        const mx = (pointer.x - view.x) / oldScale;
-        const my = (pointer.y - view.y) / oldScale;
-        setView({
-          scale: newScale,
-          x: pointer.x - mx * newScale,
-          y: pointer.y - my * newScale,
-        });
-      } else {
-        setView((v) => ({ ...v, x: v.x - e.evt.deltaX, y: v.y - e.evt.deltaY }));
-      }
-    },
-    [view],
-  );
-
-  // Click on empty stage → deselect.
+  // Click on empty stage → deselect. We only deselect when the click
+  // target is the stage itself (not a node, not the background image),
+  // so dragging cameras doesn't accidentally clear the selection on
+  // mouseup.
   const onStageClick = useCallback(
     (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
-      // If the click bubbled up from a node, ignore it.
-      if (e.target !== e.target.getStage() && e.target.className !== "Rect") return;
+      if (e.target !== e.target.getStage()) return;
       onSelectCamera(null);
     },
     [onSelectCamera],
@@ -126,15 +96,9 @@ export function MapCanvas({
 
   const placements = layout.placements;
 
-  // Inverse-scale the handles inside CameraNode by overriding via a
-  // Group transform. Right now the camera node draws constant-pixel
-  // dots; if they need to stay constant SCREEN size we wrap them in a
-  // Group that pre-multiplies by 1/view.scale. V1 keeps it simple and
-  // lets dots grow/shrink with the map — easier to read at a glance.
-
+  // Subtle grid backdrop when no image is set, so the canvas doesn't
+  // look like a void on first load.
   const checkerboard = useMemo(() => {
-    // When no image is loaded, draw a subtle grid so the operator
-    // sees they're inside a working canvas instead of a void.
     const gridSize = 40;
     const cells: { x: number; y: number; key: string }[] = [];
     if (layout.image_data) return cells;
@@ -152,15 +116,8 @@ export function MapCanvas({
       className="relative h-full w-full overflow-hidden bg-foreground/[0.02]"
       onContextMenu={(e) => e.preventDefault()}
     >
-      <Stage
-        width={size.w}
-        height={size.h}
-        onWheel={onWheel}
-        onClick={onStageClick}
-        onTap={onStageClick}
-      >
+      <Stage width={size.w} height={size.h} onClick={onStageClick} onTap={onStageClick}>
         <Layer listening={false}>
-          {/* Backdrop pattern when no image. */}
           {checkerboard.map((c) => (
             <Rect
               key={c.key}
@@ -172,17 +129,8 @@ export function MapCanvas({
             />
           ))}
         </Layer>
-        <Layer
-          x={view.x}
-          y={view.y}
-          scaleX={view.scale}
-          scaleY={view.scale}
-          draggable
-          onDragEnd={(e) => {
-            userInteractedRef.current = true;
-            setView((v) => ({ ...v, x: e.target.x(), y: e.target.y() }));
-          }}
-        >
+        {/* Map + camera layer. NOT draggable — see header note. */}
+        <Layer x={fit.x} y={fit.y} scaleX={fit.scale} scaleY={fit.scale}>
           {bgImage && (
             <KonvaImage
               image={bgImage}
@@ -193,7 +141,6 @@ export function MapCanvas({
               listening={false}
             />
           )}
-          {/* Camera nodes — drawn last so they sit above the image. */}
           {placements.map((p) => (
             <CameraNode
               key={p.name}
@@ -207,26 +154,9 @@ export function MapCanvas({
         </Layer>
       </Stage>
 
-      {/* HUD: zoom level + reset-fit hint. Pure DOM, sits above the
-          stage. Doesn't capture pointer events except on the buttons. */}
-      <div className="pointer-events-none absolute right-3 top-3 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-foreground/55">
-        <span className="bg-black/60 px-2 py-0.5">
-          {Math.round(view.scale * 100)}%
-        </span>
-        <button
-          type="button"
-          className="pointer-events-auto bg-black/60 px-2 py-0.5 hover:text-foreground"
-          onClick={() => {
-            userInteractedRef.current = false;
-            // re-trigger auto-fit by nudging size state
-            setSize((s) => ({ ...s }));
-          }}
-        >
-          fit
-        </button>
-      </div>
+      {/* Bottom-left hint: only the gestures we actually support. */}
       <div className="pointer-events-none absolute bottom-3 left-3 max-w-md font-mono text-[10px] uppercase tracking-widest text-foreground/40">
-        scroll · pan &nbsp;|&nbsp; shift+scroll · zoom &nbsp;|&nbsp; drag empty area · pan &nbsp;|&nbsp; double-click camera · open live
+        drag dot · move camera &nbsp;|&nbsp; drag amber handle · rotate / extend FOV &nbsp;|&nbsp; double-click · open live
       </div>
     </div>
   );
