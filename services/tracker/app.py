@@ -1,0 +1,460 @@
+"""AuroraView object tracker sidecar.
+
+Persistent per-camera detection + tracking loop:
+  - Pull latest.jpg from Frigate at ~5Hz (lazy: only while subscribers are
+    attached).
+  - Run YOLOv8s + ByteTrack with persist=True so track IDs survive across
+    frames.
+  - Broadcast {tick_at, image_w, image_h, took_ms, tracks: [{id, label,
+    conf, bbox: [x,y,w,h] normalized 0..1}]} to every open websocket
+    listening on /ws?camera=<name>.
+
+Why this exists:
+  - The previous /api/agent/detections path called YOLO every 5s with no
+    tracker, no continuity, no smoothing. Boxes pulsed and IDs didn't
+    persist, so the operator UI couldn't show "this is the same person
+    from 3s ago". This sidecar fixes that by owning the loop.
+
+Cost / scaling notes:
+  - One YOLO model instance per camera (track persist state is held on
+    the model). Memory: ~70MB per camera. Fine for the 1-3 cams we have;
+    if we go to 10+ we'll switch to a shared model + manual BYTETracker
+    instances.
+  - Loops are reference-counted: started on the first WS subscriber,
+    stopped GRACE_SHUTDOWN_S seconds after the last unsubscribe so a
+    page reload doesn't drop the loop.
+
+Failure modes considered:
+  - Frigate down: loop logs and broadcasts an empty-tracks payload, then
+    keeps trying.
+  - Frame decode error: skipped, loop continues.
+  - WS client disconnects mid-broadcast: removed, loop continues for any
+    remaining subscribers.
+  - Ultralytics throws: caught, broadcast empty-tracks, loop continues.
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import ssl
+import time
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from PIL import Image, ImageOps
+
+# ---- Config ----------------------------------------------------------------
+TRACKER_HOST = os.environ.get("TRACKER_HOST", "127.0.0.1")
+TRACKER_PORT = int(os.environ.get("TRACKER_PORT", "8767"))
+
+# Frigate snapshot source. Default points to the same instance the API
+# server uses; verify=False because the local Frigate runs on a self-signed
+# cert.
+FRIGATE_BASE = os.environ.get("FRIGATE_BASE", "https://127.0.0.1:3000")
+FRIGATE_USER = os.environ.get("FRIGATE_USER", "")
+FRIGATE_PASS = os.environ.get("FRIGATE_PASS", "")
+FRIGATE_VERIFY = os.environ.get("FRIGATE_VERIFY", "false").lower() == "true"
+
+# Snapshot height in px. Tracker accuracy improves a lot from 480 → 720;
+# inference cost goes up ~1.5x. 720 is the right default for YOLOv8s on
+# CPU.
+SNAPSHOT_HEIGHT = int(os.environ.get("TRACKER_SNAPSHOT_HEIGHT", "720"))
+
+# Target loop FPS. We back off if a single tick exceeds 1/TARGET_FPS so we
+# don't pile work indefinitely.
+TARGET_FPS = float(os.environ.get("TRACKER_FPS", "5"))
+LOOP_INTERVAL_S = 1.0 / max(0.5, TARGET_FPS)
+
+# Detection thresholds. Ultralytics defaults to 0.25 / 0.7 for YOLO; we use
+# 0.30 conf (stricter than the weapon-detector's 0.35 because we WANT to
+# surface persons even at distance) and 0.45 IOU (slightly looser to keep
+# the tracker happy when boxes drift between frames).
+CONF_THRESHOLD = float(os.environ.get("TRACKER_CONF", "0.30"))
+IOU_THRESHOLD = float(os.environ.get("TRACKER_IOU", "0.45"))
+IMGSZ = int(os.environ.get("TRACKER_IMGSZ", "640"))
+
+# YOLO model path. Pre-downloaded by install.sh to a writable absolute path
+# because ProtectSystem=strict makes the deploy dir read-only.
+MODEL_PATH = os.environ.get(
+    "TRACKER_MODEL", "/var/lib/auroraview-tracker/yolov8s.pt"
+)
+if not os.path.isfile(MODEL_PATH):
+    # Local dev fallback so we don't crash importing the module.
+    MODEL_PATH = "yolov8s.pt"
+
+# COCO class allowlist. We only broadcast tracks for classes we care about.
+# Operator can override via env if they want broader coverage.
+DEFAULT_CLASSES = "person,bicycle,car,motorcycle,airplane,bus,truck,boat,bird,cat,dog,horse,sheep,cow,backpack,umbrella,handbag,suitcase"
+ALLOWED_CLASSES = {
+    s.strip().lower() for s in os.environ.get("TRACKER_CLASSES", DEFAULT_CLASSES).split(",") if s.strip()
+}
+
+# How long to keep a per-camera loop alive after the last unsubscribe.
+# Avoids tearing down + restarting the model when the operator just
+# refreshes the page.
+GRACE_SHUTDOWN_S = float(os.environ.get("TRACKER_GRACE_S", "30"))
+
+# ---- Frigate client --------------------------------------------------------
+class FrigateClient:
+    """Minimal async Frigate client. Owns the JWT cookie and refreshes
+    on 401. Mirrors the behavior of server/frigate.mjs::loginIfNeeded so
+    failures look identical to ops.
+    """
+
+    def __init__(self, base: str, user: str, password: str, verify: bool):
+        self._base = base.rstrip("/")
+        self._user = user
+        self._pass = password
+        # Frigate runs on self-signed cert locally. Don't fail on it.
+        self._client = httpx.AsyncClient(
+            verify=verify,
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+        )
+        self._token: str | None = None
+        self._token_lock = asyncio.Lock()
+
+    async def aclose(self):
+        await self._client.aclose()
+
+    async def _login(self):
+        # Concurrent callers all wait on the same lock so we don't fan out
+        # multiple parallel logins.
+        async with self._token_lock:
+            if self._token is not None:
+                return
+            res = await self._client.post(
+                f"{self._base}/api/login",
+                json={"user": self._user, "password": self._pass},
+            )
+            if res.status_code != 200:
+                raise RuntimeError(f"frigate_login_failed: {res.status_code}")
+            cookie = res.headers.get("set-cookie", "")
+            for part in cookie.split(","):
+                if "frigate_token=" in part:
+                    self._token = part.split("frigate_token=")[1].split(";")[0]
+                    return
+            raise RuntimeError("frigate_login_no_cookie")
+
+    async def get_snapshot(self, camera: str, height: int) -> bytes:
+        """GET /api/<camera>/latest.jpg?h=<height>. Refreshes token on 401."""
+        if self._token is None:
+            await self._login()
+        url = f"{self._base}/api/{camera}/latest.jpg"
+        params = {"h": str(height)}
+        headers = {"Cookie": f"frigate_token={self._token}"}
+        res = await self._client.get(url, params=params, headers=headers)
+        if res.status_code == 401:
+            self._token = None
+            await self._login()
+            headers["Cookie"] = f"frigate_token={self._token}"
+            res = await self._client.get(url, params=params, headers=headers)
+        if res.status_code != 200:
+            raise RuntimeError(f"frigate_snapshot_{res.status_code}")
+        return res.content
+
+
+# ---- Per-camera tracker ---------------------------------------------------
+class CameraTracker:
+    """Owns a YOLO model + a persistent loop for one camera.
+
+    Lifecycle:
+      add_subscriber(ws)    — add WS, start the loop if not running.
+      remove_subscriber(ws) — remove WS; if last, schedule a delayed stop.
+      stop()                — cancel the loop and drop the model.
+    """
+
+    def __init__(self, camera: str, model_path: str, frigate: FrigateClient):
+        self.camera = camera
+        self.frigate = frigate
+        self.model_path = model_path
+        self._model: Any = None
+        self._task: asyncio.Task | None = None
+        self._stop_event = asyncio.Event()
+        self._subscribers: set[WebSocket] = set()
+        self._latest: dict | None = None
+        self._grace_task: asyncio.Task | None = None
+
+    # -- model loaded lazily so importing this module doesn't block on
+    # -- torch + ultralytics warm-up.
+    def _load_model(self):
+        if self._model is not None:
+            return
+        from ultralytics import YOLO  # imported here so it doesn't block startup
+        self._model = YOLO(self.model_path)
+
+    def add_subscriber(self, ws: WebSocket):
+        self._subscribers.add(ws)
+        # Cancel any pending grace shutdown — operator is back.
+        if self._grace_task and not self._grace_task.done():
+            self._grace_task.cancel()
+            self._grace_task = None
+        if self._task is None or self._task.done():
+            self._stop_event.clear()
+            self._task = asyncio.create_task(self._run_loop(), name=f"tracker-{self.camera}")
+
+    def remove_subscriber(self, ws: WebSocket):
+        self._subscribers.discard(ws)
+        if not self._subscribers and (self._grace_task is None or self._grace_task.done()):
+            self._grace_task = asyncio.create_task(self._delayed_stop())
+
+    async def _delayed_stop(self):
+        try:
+            await asyncio.sleep(GRACE_SHUTDOWN_S)
+        except asyncio.CancelledError:
+            return
+        if not self._subscribers:
+            await self.stop()
+
+    async def stop(self):
+        self._stop_event.set()
+        if self._task and not self._task.done():
+            try:
+                await asyncio.wait_for(self._task, timeout=3.0)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+        self._task = None
+        # Keep the model loaded so a quick re-subscribe is fast. Drop only
+        # if we want to free RAM (left for ops).
+
+    async def _run_loop(self):
+        print(f"[tracker:{self.camera}] loop start fps={TARGET_FPS} h={SNAPSHOT_HEIGHT}", flush=True)
+        # Lazy-load the model on the loop coroutine so the FastAPI startup
+        # doesn't pay for it on import.
+        try:
+            self._load_model()
+        except Exception as exc:
+            print(f"[tracker:{self.camera}] model load failed: {exc}", flush=True)
+            return
+        consecutive_errors = 0
+        while not self._stop_event.is_set():
+            tick_started = time.monotonic()
+            payload = await self._tick()
+            if payload is not None:
+                self._latest = payload
+                await self._broadcast(payload)
+                consecutive_errors = 0
+            else:
+                consecutive_errors += 1
+                # Backoff on sustained errors so we don't flood logs.
+                if consecutive_errors >= 5:
+                    await asyncio.sleep(min(LOOP_INTERVAL_S * consecutive_errors, 5.0))
+                    continue
+            elapsed = time.monotonic() - tick_started
+            sleep_for = max(0.0, LOOP_INTERVAL_S - elapsed)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass  # expected — proceed to next tick
+        print(f"[tracker:{self.camera}] loop stopped", flush=True)
+
+    async def _tick(self) -> dict | None:
+        """One frame: fetch → decode → track → return broadcast payload.
+        Returns None on error (caller backs off).
+        """
+        try:
+            t_fetch = time.monotonic()
+            jpeg = await self.frigate.get_snapshot(self.camera, SNAPSHOT_HEIGHT)
+            t_fetched = time.monotonic()
+            pil = Image.open(io.BytesIO(jpeg))
+            pil = ImageOps.exif_transpose(pil).convert("RGB")
+            ow, oh = pil.size
+            t_decoded = time.monotonic()
+            # Run detection + tracker in a thread so we don't block the
+            # event loop on torch's GIL-holding work.
+            tracks = await asyncio.to_thread(self._infer_track, pil)
+            t_inferred = time.monotonic()
+            return {
+                "type": "tick",
+                "camera": self.camera,
+                "tick_at": int(time.time() * 1000),
+                "image_w": ow,
+                "image_h": oh,
+                "took_ms": {
+                    "fetch": int((t_fetched - t_fetch) * 1000),
+                    "decode": int((t_decoded - t_fetched) * 1000),
+                    "infer": int((t_inferred - t_decoded) * 1000),
+                    "total": int((t_inferred - t_fetch) * 1000),
+                },
+                "tracks": tracks,
+            }
+        except Exception as exc:
+            # Broadcast a heartbeat error so subscribers can show "tracker
+            # paused" instead of going silent.
+            err_payload = {
+                "type": "error",
+                "camera": self.camera,
+                "tick_at": int(time.time() * 1000),
+                "error": str(exc)[:200],
+            }
+            try:
+                await self._broadcast(err_payload)
+            except Exception:
+                pass
+            return None
+
+    def _infer_track(self, pil: Image.Image) -> list[dict]:
+        """Run YOLO + ByteTrack synchronously. Called from a worker thread."""
+        ow, oh = pil.size
+        if ow <= 0 or oh <= 0:
+            return []
+        results = self._model.track(
+            pil,
+            persist=True,
+            tracker="bytetrack.yaml",  # ultralytics ships this config
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            imgsz=IMGSZ,
+            verbose=False,
+            device="cpu",
+        )
+        if not results:
+            return []
+        r = results[0]
+        boxes = getattr(r, "boxes", None)
+        if boxes is None or len(boxes) == 0 or boxes.id is None:
+            return []
+        names = self._model.names
+        out = []
+        xyxy = boxes.xyxy.cpu().numpy()
+        ids = boxes.id.cpu().numpy().astype(int)
+        cls = boxes.cls.cpu().numpy().astype(int)
+        confs = boxes.conf.cpu().numpy()
+        for i in range(len(xyxy)):
+            label = str(names.get(int(cls[i]), str(int(cls[i])))).lower()
+            if ALLOWED_CLASSES and label not in ALLOWED_CLASSES:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in xyxy[i].tolist())
+            w = max(0.0, x2 - x1)
+            h = max(0.0, y2 - y1)
+            if w <= 0 or h <= 0:
+                continue
+            out.append(
+                {
+                    "id": int(ids[i]),
+                    "label": label,
+                    "conf": round(float(confs[i]), 3),
+                    "bbox": [
+                        round(x1 / ow, 5),
+                        round(y1 / oh, 5),
+                        round(w / ow, 5),
+                        round(h / oh, 5),
+                    ],
+                }
+            )
+        return out
+
+    async def _broadcast(self, payload: dict):
+        if not self._subscribers:
+            return
+        # Iterate over a copy because send() failures will mutate the set.
+        dead: list[WebSocket] = []
+        for ws in list(self._subscribers):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._subscribers.discard(ws)
+
+    def latest(self) -> dict | None:
+        return self._latest
+
+
+# ---- App -------------------------------------------------------------------
+app = FastAPI(title="auroraview-tracker", version="0.1.0")
+
+_state: dict[str, Any] = {
+    "trackers": {},  # camera -> CameraTracker
+    "frigate": None,
+    "model_loaded_at": None,
+}
+
+
+@app.on_event("startup")
+async def _startup():
+    if not FRIGATE_USER or not FRIGATE_PASS:
+        print("[tracker] WARNING: FRIGATE_USER/PASS not set — snapshot fetches will fail", flush=True)
+    _state["frigate"] = FrigateClient(FRIGATE_BASE, FRIGATE_USER, FRIGATE_PASS, FRIGATE_VERIFY)
+    print(f"[tracker] startup; model={MODEL_PATH} fps={TARGET_FPS} h={SNAPSHOT_HEIGHT} classes={sorted(ALLOWED_CLASSES)}", flush=True)
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    print("[tracker] shutting down all loops...", flush=True)
+    trackers: dict[str, CameraTracker] = _state["trackers"]
+    await asyncio.gather(*(t.stop() for t in trackers.values()), return_exceptions=True)
+    if _state.get("frigate"):
+        await _state["frigate"].aclose()
+    print("[tracker] shutdown complete.", flush=True)
+
+
+def _get_tracker(camera: str) -> CameraTracker:
+    trackers: dict[str, CameraTracker] = _state["trackers"]
+    if camera not in trackers:
+        trackers[camera] = CameraTracker(camera, MODEL_PATH, _state["frigate"])
+    return trackers[camera]
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    trackers: dict[str, CameraTracker] = _state["trackers"]
+    return JSONResponse(
+        {
+            "ok": True,
+            "model_path": MODEL_PATH,
+            "model_present": os.path.isfile(MODEL_PATH),
+            "fps": TARGET_FPS,
+            "snapshot_height": SNAPSHOT_HEIGHT,
+            "imgsz": IMGSZ,
+            "conf_threshold": CONF_THRESHOLD,
+            "iou_threshold": IOU_THRESHOLD,
+            "allowed_classes": sorted(ALLOWED_CLASSES),
+            "active_cameras": [
+                {
+                    "camera": c,
+                    "subscribers": len(t._subscribers),  # noqa: SLF001
+                    "running": t._task is not None and not t._task.done(),  # noqa: SLF001
+                    "has_latest": t.latest() is not None,
+                }
+                for c, t in trackers.items()
+            ],
+            "version": "0.1.0",
+        }
+    )
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket, camera: str = Query(..., min_length=1, max_length=64)):
+    """Subscribe to a camera's tracker stream.
+
+    On connect: sends the most recent payload (if any) immediately so a
+    late subscriber doesn't have to wait up to LOOP_INTERVAL_S for the
+    first frame.
+    """
+    await ws.accept()
+    tracker = _get_tracker(camera)
+    tracker.add_subscriber(ws)
+    # Replay last payload so the UI can render immediately.
+    last = tracker.latest()
+    if last is not None:
+        try:
+            await ws.send_json(last)
+        except Exception:
+            pass
+    try:
+        while True:
+            # Drop incoming frames silently; this is a one-way stream.
+            # await is required so disconnects propagate.
+            try:
+                await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+    finally:
+        tracker.remove_subscriber(ws)
+        try:
+            await ws.close()
+        except Exception:
+            pass

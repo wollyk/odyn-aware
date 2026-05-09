@@ -1,0 +1,59 @@
+[Unit]
+Description=AuroraView object tracker (YOLOv8s + ByteTrack persistent loop)
+After=network.target
+# Don't take the api server down with us.
+Wants=odyn-api.service
+
+[Service]
+Type=simple
+User=kamal
+Group=kamal
+WorkingDirectory=/var/www/odyn-aware/current/services/tracker
+# Reuse the api server's env file so we get FRIGATE_BASE / FRIGATE_USER /
+# FRIGATE_PASS without duplicating secrets. The tracker only consumes
+# those three keys; everything else is ignored.
+EnvironmentFile=/etc/odyn-aware/api.env
+Environment=TRACKER_HOST=127.0.0.1
+Environment=TRACKER_PORT=8767
+# Pre-downloaded by install.sh — see weapon-detector.service for why this
+# absolute path matters under ProtectSystem=strict.
+Environment=TRACKER_MODEL=/var/lib/auroraview-tracker/yolov8s.pt
+Environment=TRACKER_FPS=5
+# 720 is a meaningful upgrade over the 480 the polling path uses; YOLOv8s
+# benefits from the extra pixels on small/distant subjects (the original
+# "boxes too big on people walking around" complaint).
+Environment=TRACKER_SNAPSHOT_HEIGHT=720
+Environment=TRACKER_IMGSZ=640
+Environment=TRACKER_CONF=0.30
+Environment=TRACKER_IOU=0.45
+# Drop the COCO classes we don't care about (toilet, toaster, hairbrush, ...)
+Environment="TRACKER_CLASSES=person,bicycle,car,motorcycle,bus,truck,bird,cat,dog,horse,sheep,cow,backpack,umbrella,handbag,suitcase"
+# Frigate runs on a self-signed cert locally; allow it.
+Environment=FRIGATE_VERIFY=false
+# Ultralytics caches go under HOME / XDG_CONFIG_HOME — pin to a writable
+# absolute path because ProtectSystem=strict makes everything else r/o.
+Environment=HOME=/var/lib/auroraview-tracker
+Environment=XDG_CONFIG_HOME=/var/lib/auroraview-tracker/.config
+Environment=YOLO_CONFIG_DIR=/var/lib/auroraview-tracker/.config/Ultralytics
+ExecStart=/var/www/odyn-aware/current/services/tracker/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8767 --log-level info --ws websockets
+Restart=on-failure
+RestartSec=5
+# First boot loads torch + warms up YOLOv8s. 180s is generous; typical
+# warm restart is <10s.
+TimeoutStartSec=180
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Security hardening — sidecar is a single-purpose HTTP/WS service.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auroraview-tracker
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

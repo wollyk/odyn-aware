@@ -16,6 +16,7 @@ import type {
 } from "./types";
 import { useMseStream } from "./useMseStream";
 import { useDetections } from "./useDetections";
+import { useTracker, type TrackedBox } from "./useTracker";
 
 export function VideoTile({
   cam,
@@ -37,6 +38,10 @@ export function VideoTile({
 
   const live = useMseStream(cam?.name ?? null, mode === "live");
   const det = useDetections(cam);
+  // Phase-10: real-time tracker WS subscription. Drives the canvas
+  // overlay; det's boxes (face/weapon from the polling path) become a
+  // fallback for when the tracker is offline.
+  const trk = useTracker(cam);
 
   // Snapshot polling: 1Hz, cache-busted via ?t= (only in snapshot mode)
   useEffect(() => {
@@ -74,72 +79,94 @@ export function VideoTile({
     return () => clearInterval(t);
   }, []);
 
-  // Canvas overlay — AR-aware + age-fading.
+  // Canvas overlay — AR-aware + tracker-driven.
   //
-  // Two correctness fixes vs the previous overlay:
+  // Box source priority:
+  //   1. Tracker WS (real-time YOLOv8s + ByteTrack at ~5Hz). Tight
+  //      bboxes, persistent IDs, no pulsing. Used when trk.status ===
+  //      "open" and we have at least one fresh tick.
+  //   2. Polling fallback (face + weapon from /api/agent/detections,
+  //      already real-CV). Used when the tracker is offline so the
+  //      canvas isn't blank during sidecar restarts.
   //
-  //   1. The displayed video has `object-contain` and a fixed-AR tile
-  //      wrapper, so when source AR ≠ tile AR the video letterboxes.
-  //      Previously we projected normalized bboxes onto the FULL canvas
-  //      (the tile rect), which stretched them across the letterbox bars.
-  //      Now we compute the actual displayed video rect using the source
-  //      videoWidth/videoHeight (or naturalWidth/naturalHeight for
-  //      snapshots) and project bbox coords into THAT rect only.
+  // AR-aware: the displayed video has `object-contain`, so when source
+  // AR ≠ tile AR there are letterbox/pillarbox bars. We compute the
+  // ACTUAL displayed video rect using videoWidth/videoHeight (live) or
+  // naturalWidth/naturalHeight (snapshot) and project all bboxes into
+  // that rect — never into the tile/letterbox area.
   //
-  //   2. Boxes carry a `ts` (when the underlying CV detector saw the
-  //      object) and we fade opacity 1 → 0 over BOX_FADE_MS, then drop
-  //      them entirely after BOX_MAX_AGE_MS. So when an object leaves
-  //      the frame, its box gracefully decays instead of being held at
-  //      full strength until the next 5s poll arrives.
-  //
-  // The drawn boxes are real-CV only (face from InsightFace, weapon from
-  // YOLO). T3's hallucinated bboxes are intentionally not on the canvas
-  // — they were the source of the "boxes are way bigger than the object"
-  // complaint.
+  // Stale-fade: tracker payloads supersede each other every 200ms, so
+  // we fade based on (now - tickAt). If the WS goes silent, boxes
+  // gracefully decay over 1.5s instead of sticking around looking real.
   useEffect(() => {
     const canvas = canvasRef.current;
     const target: HTMLElement | null = mode === "live" ? live.videoRef.current : imgRef.current;
     if (!canvas || !target) return;
 
-    // Per-source visual styling. Alpha is the BASE alpha — fade multiplies it.
-    const STYLE: Record<
-      string,
-      { stroke: string; fill: string; chip: string; chipText: string }
-    > = {
-      face_known: {
-        stroke: "rgba(110, 231, 183, ALPHA)",     // emerald-300
-        fill: "rgba(110, 231, 183, FILL_A)",
-        chip: "rgba(0, 0, 0, ALPHA)",
-        chipText: "rgba(110, 231, 183, ALPHA)",
-      },
-      face_unknown: {
-        stroke: "rgba(251, 191, 36, ALPHA)",      // amber-400
-        fill: "rgba(251, 191, 36, FILL_A)",
-        chip: "rgba(0, 0, 0, ALPHA)",
-        chipText: "rgba(251, 191, 36, ALPHA)",
-      },
-      weapon_suspicious: {
-        stroke: "rgba(248, 113, 113, ALPHA)",     // red-400
-        fill: "rgba(248, 113, 113, FILL_A)",
-        chip: "rgba(0, 0, 0, ALPHA)",
-        chipText: "rgba(248, 113, 113, ALPHA)",
-      },
-      weapon_clear: {
-        stroke: "rgba(148, 163, 184, ALPHA)",     // slate-400
-        fill: "rgba(148, 163, 184, FILL_A)",
-        chip: "rgba(0, 0, 0, ALPHA)",
-        chipText: "rgba(148, 163, 184, ALPHA)",
-      },
+    // COCO-class palette. Picked to be distinct against typical security
+    // camera scenes (mostly browns, asphalt, foliage).
+    const colorForClass = (label: string): string => {
+      if (label === "person") return "110, 231, 183";          // emerald-300
+      if (["car","truck","bus","motorcycle","bicycle"].includes(label)) return "96, 165, 250"; // blue-400
+      if (["dog","cat","bird","horse","sheep","cow"].includes(label)) return "251, 191, 36";   // amber-400
+      if (["backpack","handbag","suitcase","umbrella"].includes(label)) return "192, 132, 252"; // purple-400
+      return "148, 163, 184"; // slate-400 fallback
     };
-    const BOX_FADE_MS = 2000;
-    const BOX_MAX_AGE_MS = 3000;
+
+    // Polling fallback styling — used only when tracker is offline.
+    const FALLBACK_STYLE: Record<string, string> = {
+      face_known: "110, 231, 183",
+      face_unknown: "251, 191, 36",
+      weapon_suspicious: "248, 113, 113",
+      weapon_clear: "148, 163, 184",
+    };
+
+    const BOX_FADE_MS = 1500;
+    const BOX_MAX_AGE_MS = 2500;
 
     let raf = 0;
 
-    const draw = () => {
+    type DrawBox = {
+      rgb: string;          // "R, G, B" string for color composition
+      bbox: [number, number, number, number];
+      label: string;
+      ts: number;           // when the upstream produced it
+    };
+
+    const computeDisplayedRect = (): { rectX: number; rectY: number; rectW: number; rectH: number; w: number; h: number } | null => {
       const w = target.clientWidth;
       const h = target.clientHeight;
-      if (!w || !h) return;
+      if (!w || !h) return null;
+      let srcW = 0;
+      let srcH = 0;
+      if (mode === "live" && target instanceof HTMLVideoElement) {
+        srcW = target.videoWidth || 0;
+        srcH = target.videoHeight || 0;
+      } else if (target instanceof HTMLImageElement) {
+        srcW = target.naturalWidth || 0;
+        srcH = target.naturalHeight || 0;
+      }
+      let rectX = 0, rectY = 0, rectW = w, rectH = h;
+      if (srcW > 0 && srcH > 0) {
+        const tileAR = w / h;
+        const srcAR = srcW / srcH;
+        if (srcAR > tileAR) {
+          rectW = w;
+          rectH = Math.round(w / srcAR);
+          rectY = Math.round((h - rectH) / 2);
+        } else if (srcAR < tileAR) {
+          rectH = h;
+          rectW = Math.round(h * srcAR);
+          rectX = Math.round((w - rectW) / 2);
+        }
+      }
+      return { rectX, rectY, rectW, rectH, w, h };
+    };
+
+    const draw = () => {
+      const rect = computeDisplayedRect();
+      if (!rect) return;
+      const { rectX, rectY, rectW, rectH, w, h } = rect;
 
       const dpr = window.devicePixelRatio || 1;
       if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
@@ -153,40 +180,22 @@ export function VideoTile({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
-      // Resolve the source's intrinsic dimensions so we can compute the
-      // real "displayed video rect" inside the letterboxed tile.
-      let srcW = 0;
-      let srcH = 0;
-      if (mode === "live" && target instanceof HTMLVideoElement) {
-        srcW = target.videoWidth || 0;
-        srcH = target.videoHeight || 0;
-      } else if (target instanceof HTMLImageElement) {
-        srcW = target.naturalWidth || 0;
-        srcH = target.naturalHeight || 0;
-      }
-      // Until metadata is available, fall back to filling the tile so the
-      // first ~ms post-load doesn't draw nothing.
-      let rectX = 0,
-        rectY = 0,
-        rectW = w,
-        rectH = h;
-      if (srcW > 0 && srcH > 0) {
-        const tileAR = w / h;
-        const srcAR = srcW / srcH;
-        if (srcAR > tileAR) {
-          // Source wider than tile → letterbox top/bottom.
-          rectW = w;
-          rectH = Math.round(w / srcAR);
-          rectX = 0;
-          rectY = Math.round((h - rectH) / 2);
-        } else if (srcAR < tileAR) {
-          // Source taller than tile → pillarbox left/right.
-          rectH = h;
-          rectW = Math.round(h * srcAR);
-          rectY = 0;
-          rectX = Math.round((w - rectW) / 2);
-        }
-      }
+      // Pick the box source.
+      const useTracker =
+        trk.status === "open" && trk.tickAt != null && trk.tracks.length >= 0;
+      const drawBoxes: DrawBox[] = useTracker
+        ? trk.tracks.map((t: TrackedBox) => ({
+            rgb: colorForClass(t.label),
+            bbox: t.bbox,
+            label: `${t.label} #${t.id} ${t.conf.toFixed(2)}`,
+            ts: trk.tickAt ?? Date.now(),
+          }))
+        : det.boxes.map((b) => ({
+            rgb: FALLBACK_STYLE[b.source] ?? "148, 163, 184",
+            bbox: b.bbox,
+            label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
+            ts: b.ts,
+          }));
 
       ctx.lineWidth = 1.5;
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
@@ -194,18 +203,16 @@ export function VideoTile({
 
       const nowTs = Date.now();
       let anyAlive = false;
-      for (const b of det.boxes) {
+      for (const b of drawBoxes) {
         const ageMs = Math.max(0, nowTs - (b.ts ?? 0));
         if (ageMs > BOX_MAX_AGE_MS) continue;
-        const alpha = ageMs <= BOX_FADE_MS ? 1 - ageMs / BOX_FADE_MS / 1.5 : 0.05;
-        if (alpha < 0.05) continue;
+        const alpha = ageMs <= BOX_FADE_MS ? 1 - (ageMs / BOX_FADE_MS) * 0.85 : 0.15;
+        if (alpha < 0.1) continue;
         anyAlive = true;
-        const style = STYLE[b.source] ?? STYLE.face_unknown;
-        const stroke = style.stroke
-          .replace("ALPHA", alpha.toFixed(2));
-        const fill = style.fill.replace("FILL_A", (alpha * 0.18).toFixed(2));
-        const chip = style.chip.replace("ALPHA", (alpha * 0.85).toFixed(2));
-        const chipText = style.chipText.replace("ALPHA", alpha.toFixed(2));
+        const stroke = `rgba(${b.rgb}, ${alpha.toFixed(2)})`;
+        const fill = `rgba(${b.rgb}, ${(alpha * 0.16).toFixed(2)})`;
+        const chip = `rgba(0, 0, 0, ${(alpha * 0.85).toFixed(2)})`;
+        const chipText = `rgba(${b.rgb}, ${alpha.toFixed(2)})`;
 
         const [x, y, ww, hh] = b.bbox;
         const rx = rectX + x * rectW;
@@ -216,22 +223,19 @@ export function VideoTile({
         ctx.fillStyle = fill;
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeRect(rx, ry, rw, rh);
-        const label =
-          b.confidence > 0
-            ? `${b.label} ${b.confidence.toFixed(2)}`
-            : b.label;
-        const textW = ctx.measureText(label).width + 8;
+        const textW = ctx.measureText(b.label).width + 8;
         const chipH = 16;
         const chipY = Math.max(rectY, ry - chipH);
         ctx.fillStyle = chip;
         ctx.fillRect(rx, chipY, textW, chipH);
         ctx.fillStyle = chipText;
-        ctx.fillText(label, rx + 4, chipY + 3);
+        ctx.fillText(b.label, rx + 4, chipY + 3);
       }
 
-      // Schedule the next frame ONLY while at least one box is still
-      // alive. Once everything has decayed past BOX_MAX_AGE_MS the
-      // canvas is empty and we can stop the loop until new state arrives.
+      // Keep the RAF loop alive only while we have something to fade.
+      // When the tracker is connected and ticking at 5Hz, this loop is
+      // effectively driven by message arrivals (re-running this effect)
+      // rather than rAF.
       if (anyAlive) raf = requestAnimationFrame(draw);
     };
 
@@ -243,7 +247,7 @@ export function VideoTile({
       ro.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [det.boxes, det.tickAt, imgUrl, mode, live.status]);
+  }, [trk.tracks, trk.tickAt, trk.status, det.boxes, det.tickAt, imgUrl, mode, live.status]);
 
   const camLabel = cam ? cam.label : "—";
   const wireName = cam ? cam.name : "";
@@ -314,8 +318,33 @@ export function VideoTile({
             />
             {mode === "live" ? "LIVE-MSE · AURORAVIEW" : "LIVE · AURORAVIEW"}
           </div>
-          <div className="bg-black/65 px-2.5 py-1 font-mono text-[10px] tracking-widest text-foreground/85">
-            {hudRight}
+          <div className="flex items-center gap-2">
+            {/* Tracker WS status pill — green dot+count when streaming,
+                amber while connecting/reconnecting, hidden when idle. */}
+            {trk.status !== "idle" && (
+              <div
+                className="bg-black/65 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-foreground/85"
+                title={
+                  trk.status === "open"
+                    ? `Tracker ${trk.tracks.length} active · ${trk.tookMs?.total ?? "—"}ms`
+                    : `Tracker ${trk.status}${trk.error ? ": " + trk.error : ""}`
+                }
+              >
+                <span
+                  className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${
+                    trk.status === "open"
+                      ? "bg-emerald-400"
+                      : trk.status === "error" || trk.status === "closed"
+                      ? "bg-red-500"
+                      : "bg-amber-400 animate-pulse"
+                  }`}
+                />
+                TRK{trk.status === "open" ? ` · ${trk.tracks.length}` : ""}
+              </div>
+            )}
+            <div className="bg-black/65 px-2.5 py-1 font-mono text-[10px] tracking-widest text-foreground/85">
+              {hudRight}
+            </div>
           </div>
         </div>
 

@@ -116,6 +116,11 @@ const server = http.createServer(async (req, res) => {
 // handler. Keeping it here means the route registry can stay
 // request/response-shaped.
 const camStreamWss = new WebSocketServer({ noServer: true });
+// Phase-10: tracker WS proxy server. Hands a client WS to the upstream
+// tracker sidecar at TRACKER_BASE/ws?camera=<name>. Behaves exactly like
+// the cam/stream proxy in terms of admin auth + drain on shutdown.
+const trackerWss = new WebSocketServer({ noServer: true });
+const TRACKER_BASE = process.env.TRACKER_BASE ?? "ws://127.0.0.1:8767";
 
 // Track every open (client, upstream) WS pair so we can drain them on
 // SIGTERM instead of waiting 90s for systemd to kill us.
@@ -124,6 +129,70 @@ const openStreamCloseFns = new CloserBag();
 server.on("upgrade", async (req, socket, head) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+
+    // Phase-10: object tracker stream — pass-through to the python sidecar.
+    if (url.pathname.startsWith("/api/tracker/")) {
+      const me = getCurrentUser(db, req);
+      if (!me || me.role !== "admin") {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      const cam = decodeURIComponent(url.pathname.slice("/api/tracker/".length));
+      if (!cam || !/^[A-Za-z0-9_\-]+$/.test(cam)) {
+        socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      const upstreamUrl = `${TRACKER_BASE}/ws?camera=${encodeURIComponent(cam)}`;
+      let upstream;
+      try {
+        const WS = (await import("ws")).default;
+        upstream = new WS(upstreamUrl);
+      } catch (err) {
+        console.error("[tracker] upstream open failed:", err.message);
+        socket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      upstream.once("open", () => {
+        trackerWss.handleUpgrade(req, socket, head, (client) => {
+          let unregister = null;
+          const closeBoth = (reason) => {
+            try { client.close(1011, reason); } catch { /* ignore */ }
+            try { upstream.close(); } catch { /* ignore */ }
+            if (unregister) unregister();
+          };
+          unregister = openStreamCloseFns.add(() => closeBoth("server_shutdown"));
+          // upstream -> client (the broadcast)
+          upstream.on("message", (data, isBinary) => {
+            if (client.readyState === client.OPEN) client.send(data, { binary: isBinary });
+          });
+          upstream.on("close", () => closeBoth("upstream_closed"));
+          upstream.on("error", (err) => {
+            console.error("[tracker] upstream error:", err.message);
+            closeBoth("upstream_error");
+          });
+          // client -> upstream (mostly empty; sidecar treats input as a no-op)
+          client.on("message", (data, isBinary) => {
+            if (upstream.readyState === upstream.OPEN) upstream.send(data, { binary: isBinary });
+          });
+          client.on("close", () => closeBoth("client_closed"));
+          client.on("error", (err) => {
+            console.error("[tracker] client error:", err.message);
+            closeBoth("client_error");
+          });
+          console.log(`[tracker] proxy open: ${me.email} -> sidecar(${cam})`);
+        });
+      });
+      upstream.once("error", (err) => {
+        console.error("[tracker] upstream early error:", err.message);
+        try { socket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); } catch { /* ignore */ }
+        socket.destroy();
+      });
+      return;
+    }
+
     if (!url.pathname.startsWith("/api/cam/stream/")) {
       socket.destroy();
       return;

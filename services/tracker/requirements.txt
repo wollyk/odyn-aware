@@ -1,0 +1,18 @@
+# AuroraView object-tracker sidecar.
+#
+# Pulls latest.jpg from Frigate at ~5Hz per active camera, runs
+# YOLOv8s + ByteTrack, and broadcasts per-camera tracker state over
+# a FastAPI websocket.
+#
+# Why these versions:
+#   - ultralytics 8.3+: stable .track(persist=True) tracker integration.
+#   - httpx: native async client for snapshot polling. Avoids blocking
+#     the event loop while uvicorn serves websockets.
+#   - websockets: required by uvicorn for WS support (uvicorn[standard]
+#     would also bring it but we avoid the heavyweight extra deps).
+fastapi
+uvicorn
+websockets
+httpx
+pillow
+ultralytics>=8.3.0,<9.0
