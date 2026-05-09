@@ -9,24 +9,31 @@
 //   - Camera placements live in IMAGE-PIXEL space and inherit the
 //     layer transform, so they pan/zoom with the image automatically.
 //
-// CRITICAL ISOLATION RULE — why this file is fussy about events:
+// PAN IMPLEMENTATION — read me before changing this file:
 //
-//   The visible-content layer is `draggable` (so empty-area drag pans).
-//   Each CameraNode body is ALSO `draggable` (so dot drag moves the
-//   camera). With nested draggables, Konva normally picks the deepest
-//   draggable hit by the cursor and starts only that one — the layer
-//   stays put. BUT if the operator's mousedown lands a few pixels off
-//   the dot (e.g. on the empty layer next to it), the layer drag wins
-//   and the entire map slides while the operator thinks they're moving
-//   the camera. Two defenses:
-//     1. CameraNode dots use a generous `hitStrokeWidth` so a near-miss
-//        still grabs the dot.
-//     2. Layer's `onDragStart` aborts the layer drag if the actual
-//        drag target turns out to be a child node — belt and suspenders
-//        in case Konva's hit-test still falls through.
+//   We do NOT make the content layer Konva-draggable. Two earlier
+//   attempts ran aground:
 //
-//   Operator request was explicit: "I should still be able to move the
-//   map, but moving the camera should not move the image of the map."
+//     attempt 1: layer.draggable = true. Worked, but a near-miss click
+//                on the small (8px) camera dot fell through to the
+//                pannable layer, so dragging "near a camera" panned the
+//                map and looked like the camera was hauling the map.
+//
+//     attempt 2: dragstart guard on the layer that called
+//                `layer.stopDrag()` if the actual drag target was a
+//                child node. Konva's drag is GLOBAL — only one node
+//                drags at a time — so `stopDrag()` aborted whatever
+//                drag was active, including the camera dot's. That
+//                killed camera dragging entirely.
+//
+//   Working approach: keep camera dots Konva-draggable (their own
+//   isolated drag), and implement layer pan at the STAGE level using
+//   plain mousedown/mousemove/mouseup. The pan handler only engages
+//   when `e.target === stage` — i.e. the cursor missed every listening
+//   shape. Clicking a camera dot or rotation handle reports
+//   `e.target === Circle`, the pan handler bails, and Konva runs the
+//   Circle's drag in the normal way. No nested draggables means no
+//   hierarchy conflict.
 
 import Konva from "konva";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -50,7 +57,6 @@ export function MapCanvas({
   onOpenLive,
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const layerRef = useRef<Konva.Layer | null>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const [bgImage, setBgImage] = useState<HTMLImageElement | null>(null);
@@ -58,6 +64,12 @@ export function MapCanvas({
   // True once the operator has manually panned/zoomed. Stops auto-fit
   // from yanking their view back when the container resizes.
   const userInteractedRef = useRef(false);
+
+  // Pan state lives in refs so we don't re-render on every mousemove
+  // event during a pan (we only re-render via setView with the
+  // committed delta).
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef({ mouseX: 0, mouseY: 0, viewX: 0, viewY: 0 });
 
   // ResizeObserver — keep the stage flush with its parent.
   useEffect(() => {
@@ -129,7 +141,69 @@ export function MapCanvas({
     [view],
   );
 
-  // Click on truly empty stage → deselect.
+  // Stage-level pan — see the file header for why this isn't a layer
+  // draggable. Engages only when the cursor missed every listening
+  // shape (camera dot, rotation handle), so camera drag and map pan
+  // never compete for the same gesture.
+  const onStageMouseDown = useCallback(
+    (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+      const stage = e.target.getStage();
+      if (!stage) return;
+      if (e.target !== stage) return; // a listening shape will handle it
+      const pt = stage.getPointerPosition();
+      if (!pt) return;
+      isPanningRef.current = true;
+      userInteractedRef.current = true;
+      panStartRef.current = {
+        mouseX: pt.x,
+        mouseY: pt.y,
+        viewX: view.x,
+        viewY: view.y,
+      };
+    },
+    [view.x, view.y],
+  );
+
+  const onStageMouseMove = useCallback(
+    (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+      if (!isPanningRef.current) return;
+      const stage = e.target.getStage();
+      if (!stage) return;
+      const pt = stage.getPointerPosition();
+      if (!pt) return;
+      const dx = pt.x - panStartRef.current.mouseX;
+      const dy = pt.y - panStartRef.current.mouseY;
+      setView((v) => ({
+        ...v,
+        x: panStartRef.current.viewX + dx,
+        y: panStartRef.current.viewY + dy,
+      }));
+    },
+    [],
+  );
+
+  const endPan = useCallback(() => {
+    isPanningRef.current = false;
+  }, []);
+
+  // Window-level safety net: if the operator releases the mouse off
+  // the stage (e.g. on the inspector panel), we still need to end the
+  // pan or the next mousemove over the stage would treat it as a
+  // continuation.
+  useEffect(() => {
+    window.addEventListener("mouseup", endPan);
+    window.addEventListener("touchend", endPan);
+    window.addEventListener("touchcancel", endPan);
+    return () => {
+      window.removeEventListener("mouseup", endPan);
+      window.removeEventListener("touchend", endPan);
+      window.removeEventListener("touchcancel", endPan);
+    };
+  }, [endPan]);
+
+  // Click on truly empty stage → deselect. Konva's onClick fires only
+  // when mousedown and mouseup land at the same point, so a pan won't
+  // accidentally clear the selection.
   const onStageClick = useCallback(
     (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
       if (e.target !== e.target.getStage()) return;
@@ -169,6 +243,12 @@ export function MapCanvas({
         width={size.w}
         height={size.h}
         onWheel={onWheel}
+        onMouseDown={onStageMouseDown}
+        onTouchStart={onStageMouseDown}
+        onMouseMove={onStageMouseMove}
+        onTouchMove={onStageMouseMove}
+        onMouseUp={endPan}
+        onTouchEnd={endPan}
         onClick={onStageClick}
         onTap={onStageClick}
       >
@@ -184,27 +264,9 @@ export function MapCanvas({
             />
           ))}
         </Layer>
-        <Layer
-          ref={layerRef}
-          x={view.x}
-          y={view.y}
-          scaleX={view.scale}
-          scaleY={view.scale}
-          draggable
-          // ISOLATION GUARD — see file header. If a CameraNode child is
-          // the actual drag target, abort the layer's drag so the map
-          // doesn't slide alongside the camera.
-          onDragStart={(e) => {
-            if (e.target !== layerRef.current) {
-              layerRef.current?.stopDrag();
-            }
-          }}
-          onDragEnd={(e) => {
-            if (e.target !== layerRef.current) return;
-            userInteractedRef.current = true;
-            setView((v) => ({ ...v, x: e.target.x(), y: e.target.y() }));
-          }}
-        >
+        {/* Content layer: NOT draggable. View transform comes from
+            stage-level pan/zoom handlers above. */}
+        <Layer x={view.x} y={view.y} scaleX={view.scale} scaleY={view.scale}>
           {bgImage && (
             <KonvaImage
               image={bgImage}
