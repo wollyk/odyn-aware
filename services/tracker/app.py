@@ -1061,6 +1061,12 @@ class CameraTracker:
 # ---- App -------------------------------------------------------------------
 app = FastAPI(title="auroraview-tracker", version="0.1.0")
 
+# Phase-13A eval endpoints live in a sibling module to keep this file under
+# the 1000-line refactor threshold. `eval_routes` imports nothing from app
+# (it depends only on eval.py + the stdlib), so wiring it here is safe.
+from eval_routes import router as _eval_router  # noqa: E402
+app.include_router(_eval_router)
+
 _state: dict[str, Any] = {
     "trackers": {},  # camera -> CameraTracker
     "frigate": None,

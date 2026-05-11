@@ -3,6 +3,7 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 import { applyAlertsSchema } from "./db/alerts.mjs";
 import { applyTracksSchema } from "./db/tracks.mjs";
+import { applyEvalsSchema } from "./db/evals.mjs";
 
 const DEFAULT_PATH = path.resolve(process.cwd(), "data/odyn.db");
 
@@ -220,6 +221,7 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
   `);
   applyAlertsSchema(db);
   applyTracksSchema(db);
+  applyEvalsSchema(db);
   return db;
 }
 

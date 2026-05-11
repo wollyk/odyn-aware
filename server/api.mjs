@@ -43,6 +43,7 @@ import * as agentSummaries from "./routes/agent-summaries.mjs";
 import * as agentDetections from "./routes/agent-detections.mjs";
 import * as agentAlerts from "./routes/agent-alerts.mjs";
 import * as agentTracks from "./routes/agent-tracks.mjs";
+import * as agentEvals from "./routes/agent-evals.mjs";
 import * as agentChat from "./routes/agent-chat.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -81,6 +82,7 @@ const ROUTES = [
   agentDetections,
   agentAlerts,
   agentTracks,
+  agentEvals,
   agentChat,
 ];
 

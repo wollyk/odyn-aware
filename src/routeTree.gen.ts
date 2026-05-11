@@ -17,6 +17,7 @@ import { Route as AdminMapRouteImport } from './routes/admin/map'
 import { Route as AdminLoginRouteImport } from './routes/admin/login'
 import { Route as AdminLiveRouteImport } from './routes/admin/live'
 import { Route as AdminFacesRouteImport } from './routes/admin/faces'
+import { Route as AdminEvalsRouteImport } from './routes/admin/evals'
 import { Route as AdminAlertsRouteImport } from './routes/admin/alerts'
 
 const LoginRoute = LoginRouteImport.update({
@@ -59,6 +60,11 @@ const AdminFacesRoute = AdminFacesRouteImport.update({
   path: '/admin/faces',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AdminEvalsRoute = AdminEvalsRouteImport.update({
+  id: '/admin/evals',
+  path: '/admin/evals',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AdminAlertsRoute = AdminAlertsRouteImport.update({
   id: '/admin/alerts',
   path: '/admin/alerts',
@@ -69,6 +75,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/admin/alerts': typeof AdminAlertsRoute
+  '/admin/evals': typeof AdminEvalsRoute
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
@@ -80,6 +87,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/admin/alerts': typeof AdminAlertsRoute
+  '/admin/evals': typeof AdminEvalsRoute
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
@@ -92,6 +100,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/admin/alerts': typeof AdminAlertsRoute
+  '/admin/evals': typeof AdminEvalsRoute
   '/admin/faces': typeof AdminFacesRoute
   '/admin/live': typeof AdminLiveRoute
   '/admin/login': typeof AdminLoginRoute
@@ -105,6 +114,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/admin/alerts'
+    | '/admin/evals'
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
@@ -116,6 +126,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/admin/alerts'
+    | '/admin/evals'
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
@@ -127,6 +138,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/admin/alerts'
+    | '/admin/evals'
     | '/admin/faces'
     | '/admin/live'
     | '/admin/login'
@@ -139,6 +151,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LoginRoute: typeof LoginRoute
   AdminAlertsRoute: typeof AdminAlertsRoute
+  AdminEvalsRoute: typeof AdminEvalsRoute
   AdminFacesRoute: typeof AdminFacesRoute
   AdminLiveRoute: typeof AdminLiveRoute
   AdminLoginRoute: typeof AdminLoginRoute
@@ -205,6 +218,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminFacesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/admin/evals': {
+      id: '/admin/evals'
+      path: '/admin/evals'
+      fullPath: '/admin/evals'
+      preLoaderRoute: typeof AdminEvalsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin/alerts': {
       id: '/admin/alerts'
       path: '/admin/alerts'
@@ -219,6 +239,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   LoginRoute: LoginRoute,
   AdminAlertsRoute: AdminAlertsRoute,
+  AdminEvalsRoute: AdminEvalsRoute,
   AdminFacesRoute: AdminFacesRoute,
   AdminLiveRoute: AdminLiveRoute,
   AdminLoginRoute: AdminLoginRoute,
