@@ -39,7 +39,10 @@ import Konva from "konva";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Image as KonvaImage, Layer, Rect, Stage } from "react-konva";
 import { CameraNode } from "./CameraNode";
+import { MapObjectsLayer } from "./MapObjectsLayer";
+import type { ProjectedDot } from "./projection";
 import type { CameraPlacement, MapLayout } from "./types";
+import type { MeasureController } from "./MeasureTool";
 
 export type MapCanvasProps = {
   layout: MapLayout;
@@ -47,6 +50,13 @@ export type MapCanvasProps = {
   onSelectCamera: (name: string | null) => void;
   onChangePlacement: (next: CameraPlacement) => void;
   onOpenLive: (name: string) => void;
+  /** Phase-13B: live projected tracker dots to overlay. */
+  dots?: ProjectedDot[];
+  /** Phase-13B: when false, suppresses static-class dots. */
+  showStaticDots?: boolean;
+  /** Phase-13B: when active in pick mode, stage clicks call
+   *  controller.pickPoint with map-pixel (not stage-pixel) coords. */
+  measure?: MeasureController;
 };
 
 export function MapCanvas({
@@ -55,6 +65,9 @@ export function MapCanvas({
   onSelectCamera,
   onChangePlacement,
   onOpenLive,
+  dots,
+  showStaticDots = false,
+  measure,
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
@@ -201,15 +214,29 @@ export function MapCanvas({
     };
   }, [endPan]);
 
-  // Click on truly empty stage → deselect. Konva's onClick fires only
-  // when mousedown and mouseup land at the same point, so a pan won't
-  // accidentally clear the selection.
+  // Click on truly empty stage → deselect (or, in measure mode, pick a
+  // point and convert stage-pixel → map-pixel using the current view
+  // transform). Konva's onClick fires only when mousedown and mouseup
+  // land at the same point, so a pan won't accidentally trigger this.
   const onStageClick = useCallback(
     (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
-      if (e.target !== e.target.getStage()) return;
+      const stage = e.target.getStage();
+      if (!stage) return;
+      if (e.target !== stage) return;
+      // Measure-tool pick mode wins over deselect.
+      const measureActive =
+        measure && (measure.state.phase === "pick-a" || measure.state.phase === "pick-b");
+      if (measureActive) {
+        const pt = stage.getPointerPosition();
+        if (!pt) return;
+        const mapX = (pt.x - view.x) / view.scale;
+        const mapY = (pt.y - view.y) / view.scale;
+        measure!.pickPoint(mapX, mapY);
+        return;
+      }
       onSelectCamera(null);
     },
-    [onSelectCamera],
+    [onSelectCamera, measure, view.x, view.y, view.scale],
   );
 
   // Reset back to fit-to-screen.
@@ -287,6 +314,9 @@ export function MapCanvas({
               onOpenLive={onOpenLive}
             />
           ))}
+          {dots && dots.length > 0 && (
+            <MapObjectsLayer dots={dots} showStatic={showStaticDots} />
+          )}
         </Layer>
       </Stage>
 
@@ -302,8 +332,13 @@ export function MapCanvas({
         </button>
       </div>
       <div className="pointer-events-none absolute bottom-3 left-3 max-w-md font-mono text-[10px] uppercase tracking-widest text-foreground/40">
-        drag empty area · pan map &nbsp;|&nbsp; scroll · pan &nbsp;|&nbsp; shift+scroll · zoom &nbsp;|&nbsp; drag dot · move camera &nbsp;|&nbsp; double-click · open live
+        drag empty area · pan &nbsp;|&nbsp; shift+scroll · zoom &nbsp;|&nbsp; drag dot · move &nbsp;|&nbsp; dbl-click dot · open live
       </div>
+      {measure &&
+        (measure.state.phase === "pick-a" ||
+          measure.state.phase === "pick-b") && (
+          <div className="pointer-events-none absolute inset-0 border-2 border-dashed border-amber-400/60" />
+        )}
     </div>
   );
 }

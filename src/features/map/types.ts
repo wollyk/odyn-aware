@@ -34,12 +34,27 @@ export type CameraPlacement = {
   fov_deg: number;
   /** Cone length in pixels — visual range, not real-world meters. */
   range_px: number;
-  /** Mounting height in meters. Operator data only in V1; used for
-   *  ground-plane projection in V1.5. */
+  /** Mounting height in meters. Used by 13B auto-projection. */
   height_m: number;
+  /** Phase-13B: downward tilt in degrees (0 = perfectly horizontal, 90 =
+   *  straight down). Default 15° matches a typical eaves-mounted dome.
+   *  Optional so old layouts continue to load; the projection math
+   *  falls back to DEFAULT_TILT_DEG when absent. */
+  tilt_deg?: number;
+  /** Phase-13B.5 escape hatch: 3x3 row-major homography matrix that
+   *  overrides the pinhole projection. Populated by the (future)
+   *  manual calibration ritual. `null` and missing both mean "use
+   *  pinhole". 9 numbers, NOT a fixed-length tuple — `number[]` keeps
+   *  serialization simple and old layouts forward-compatible. */
+  homography?: number[] | null;
   /** Optional operator note (e.g. "back porch corner, 3m tripod"). */
   notes?: string;
 };
+
+/** Default tilt for auto-projection. Most outdoor domes sit at ~10-25°
+ *  below horizontal; 15° is a reasonable middle. Operator can override
+ *  per-camera with a slider in the inspector. */
+export const DEFAULT_TILT_DEG = 15;
 
 /**
  * One map layout. V1 supports a single active layout. `image_data`
@@ -76,6 +91,8 @@ export function defaultPlacement(name: string): CameraPlacement {
     fov_deg: 90,
     range_px: 120,
     height_m: 3.0,
+    tilt_deg: DEFAULT_TILT_DEG,
+    homography: null,
     notes: undefined,
   };
 }

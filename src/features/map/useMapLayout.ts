@@ -69,6 +69,9 @@ export type UseMapLayoutResult = {
   /** Convenience: ensure every cam in `cameraNames` has at least a
    *  placement (default at 40,40). Idempotent. */
   ensurePlacementsForCameras(cameraNames: string[]): void;
+  /** Phase-13B: patch top-level layout fields (e.g. `scale_m_per_px`).
+   *  Placements are untouched unless explicitly included in the patch. */
+  updateLayout(patch: Partial<MapLayout>): void;
 };
 
 export function useMapLayout(): UseMapLayoutResult {
@@ -200,6 +203,13 @@ export function useMapLayout(): UseMapLayoutResult {
     [mutate],
   );
 
+  const updateLayout = useCallback(
+    (patch: Partial<MapLayout>) => {
+      mutate((l) => ({ ...l, ...patch }));
+    },
+    [mutate],
+  );
+
   return useMemo(
     () => ({
       layout,
@@ -208,7 +218,16 @@ export function useMapLayout(): UseMapLayoutResult {
       removePlacement,
       resetLayout,
       ensurePlacementsForCameras,
+      updateLayout,
     }),
-    [layout, setBackground, upsertPlacement, removePlacement, resetLayout, ensurePlacementsForCameras],
+    [
+      layout,
+      setBackground,
+      upsertPlacement,
+      removePlacement,
+      resetLayout,
+      ensurePlacementsForCameras,
+      updateLayout,
+    ],
   );
 }
