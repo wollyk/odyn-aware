@@ -274,6 +274,61 @@ export async function register(req, res, url, ctx) {
     return true;
   }
 
+  // -- clip streaming (with HTTP Range pass-through) ----------------------
+  //
+  // The eval player <video> element needs to scrub the source MP4. We
+  // forward the browser's `Range` header to the tracker and proxy the
+  // partial-content response back, preserving Content-Range so
+  // HTMLMediaElement seeking works. No buffering — straight pipe.
+  const mClip = url.pathname.match(/^\/api\/agent\/evals\/([0-9a-f]{8,64})\/clip$/i);
+  if (req.method === "GET" && mClip) {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    if (!EVAL_SECRET) {
+      send(res, 503, { error: "eval_secret_unset" });
+      return true;
+    }
+    try {
+      const upstreamHeaders = { "x-eval-secret": EVAL_SECRET };
+      if (req.headers.range) upstreamHeaders.range = req.headers.range;
+      const upstream = await fetch(
+        `${TRACKER_HTTP_BASE}/eval/clip/${mClip[1]}`,
+        { headers: upstreamHeaders },
+      );
+      if (!upstream.ok && upstream.status !== 206) {
+        const txt = await upstream.text().catch(() => "");
+        send(res, upstream.status, {
+          error: "upstream",
+          status: upstream.status,
+          body: txt.slice(0, 200),
+        });
+        return true;
+      }
+      const outHeaders = {
+        "content-type":
+          upstream.headers.get("content-type") || "application/octet-stream",
+        "accept-ranges": "bytes",
+        "cache-control": "no-store",
+      };
+      const cl = upstream.headers.get("content-length");
+      if (cl) outHeaders["content-length"] = cl;
+      const cr = upstream.headers.get("content-range");
+      if (cr) outHeaders["content-range"] = cr;
+      res.writeHead(upstream.status, outHeaders);
+      const reader = upstream.body.getReader();
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+      res.end();
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
   // -- diff: create -------------------------------------------------------
   if (req.method === "POST" && url.pathname === "/api/agent/evals/diff") {
     const me = requireAdmin(db, req, res);

@@ -16,13 +16,14 @@
 //   [03] diff workbench (pick two runs, view the result)
 
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AdminHeader,
   AuthDeniedScreen,
   AuthLoadingScreen,
   useAdminAuth,
 } from "@/components/admin-shell";
+import { EvalPlayer } from "@/features/evals/EvalPlayer";
 
 export const Route = createFileRoute("/admin/evals")({
   component: AdminEvals,
@@ -181,6 +182,10 @@ function AdminEvals() {
   const [diffB, setDiffB] = useState<string>("");
   const [diff, setDiff] = useState<DiffJson | null>(null);
   const [diffBusy, setDiffBusy] = useState(false);
+
+  // -- player state: which run to play, scrolled-into-view container
+  const [viewingRunId, setViewingRunId] = useState<string | null>(null);
+  const playerRef = useRef<HTMLDivElement | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -477,6 +482,7 @@ function AdminEvals() {
                     <th className="py-2 pr-3">Infer p50/p95</th>
                     <th className="py-2 pr-3">Cfg</th>
                     <th className="py-2 pr-3">By</th>
+                    <th className="py-2 pr-3">Watch</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -522,6 +528,33 @@ function AdminEvals() {
                       <td className="py-2 pr-3 text-foreground/55">
                         {r.created_by ?? "—"}
                       </td>
+                      <td className="py-2 pr-3">
+                        {r.status === "ok" ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setViewingRunId(r.run_id);
+                              setTimeout(
+                                () =>
+                                  playerRef.current?.scrollIntoView({
+                                    behavior: "smooth",
+                                    block: "start",
+                                  }),
+                                40,
+                              );
+                            }}
+                            className={`border px-2 py-0.5 text-[10px] uppercase tracking-widest ${
+                              viewingRunId === r.run_id
+                                ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-300"
+                                : "border-foreground/30 bg-foreground/5 text-foreground/85 hover:border-foreground/60"
+                            }`}
+                          >
+                            {viewingRunId === r.run_id ? "▶ watching" : "▶ watch"}
+                          </button>
+                        ) : (
+                          <span className="text-foreground/40">—</span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -529,6 +562,40 @@ function AdminEvals() {
             </div>
           )}
         </section>
+
+        {/* [02b] player ----------------------------------------------- */}
+        {viewingRunId &&
+          (() => {
+            const r = rows.find((x) => x.run_id === viewingRunId);
+            if (!r) return null;
+            return (
+              <section
+                ref={playerRef}
+                className="border border-foreground/15 bg-foreground/[0.02] p-4"
+              >
+                <div className="mb-3 flex items-baseline justify-between">
+                  <h2 className="font-mono text-[10px] uppercase tracking-widest text-foreground/55">
+                    [02b] · player ·{" "}
+                    <span className="text-foreground/85">
+                      {r.name || r.clip}
+                    </span>
+                  </h2>
+                  <button
+                    type="button"
+                    onClick={() => setViewingRunId(null)}
+                    className="font-mono text-[10px] uppercase tracking-widest text-foreground/55 hover:text-foreground"
+                  >
+                    × close
+                  </button>
+                </div>
+                <EvalPlayer
+                  key={viewingRunId}
+                  runId={viewingRunId}
+                  clipName={r.clip}
+                />
+              </section>
+            );
+          })()}
 
         {/* [03] diff workbench -------------------------------------- */}
         <section className="border border-foreground/15 bg-foreground/[0.02] p-4">

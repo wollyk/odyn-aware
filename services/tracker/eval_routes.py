@@ -26,13 +26,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -293,6 +294,133 @@ async def run_result_raw(
     if not out_path.exists():
         raise HTTPException(404, "no_output")
     return FileResponse(str(out_path), media_type="application/x-ndjson")
+
+
+# ---- clip streaming (with HTTP Range support) ----------------------------
+#
+# The eval admin UI plays the source MP4 with overlaid bboxes from the
+# JSONL. <video> needs Range support so the browser can scrub without
+# re-downloading from byte 0. Starlette's FileResponse does NOT honor
+# Range automatically, so we implement the bytes=START-END math here.
+#
+# Source path is read from the run's JSONL header — that's the canonical
+# record of which clip this run was generated from, surviving file
+# renames in the corpus (header path is the resolved absolute path that
+# the eval CLI actually opened).
+#
+# Security: the resolved path MUST live under CORPUS_DIR. Without that
+# check, a malicious run_id holder who could write a JSONL with a
+# crafted header could potentially read arbitrary files. The tracker
+# runs under ProtectSystem=strict so the blast radius is small, but
+# defense in depth.
+
+_MIME_BY_SUFFIX = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".avi": "video/x-msvideo",
+}
+
+
+def _resolve_run_clip(run_id: str) -> Path:
+    """Return the absolute corpus path of the source clip for a run.
+
+    Raises HTTPException if the run is unknown, the header is missing,
+    or the clip path escapes CORPUS_DIR / is missing on disk.
+    """
+    out_path = RUNS_DIR / f"{run_id}.jsonl"
+    if not out_path.exists():
+        raise HTTPException(404, "no_output")
+    try:
+        with out_path.open("r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        header = json.loads(first_line) if first_line else {}
+    except Exception:
+        raise HTTPException(500, "bad_header")
+    if header.get("type") != "header":
+        raise HTTPException(500, "bad_header")
+    raw = header.get("video", "")
+    if not raw:
+        raise HTTPException(404, "no_clip_path_in_header")
+    video_path = Path(raw)
+    try:
+        video_path.resolve().relative_to(CORPUS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(403, "clip_outside_corpus")
+    if not video_path.is_file():
+        raise HTTPException(404, "clip_missing")
+    return video_path
+
+
+@router.get("/clip/{run_id}")
+async def run_clip(
+    run_id: str,
+    request: Request,
+    x_eval_secret: str | None = Header(default=None),
+) -> StreamingResponse | FileResponse:
+    """Stream the source MP4 with HTTP Range support so the player can
+    scrub without re-downloading the file."""
+    _require_secret(x_eval_secret)
+    video_path = _resolve_run_clip(run_id)
+    file_size = video_path.stat().st_size
+    suffix = video_path.suffix.lower()
+    media_type = _MIME_BY_SUFFIX.get(suffix, "application/octet-stream")
+
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    if not range_header:
+        # Full-file response. FileResponse handles ETag / Last-Modified.
+        return FileResponse(
+            str(video_path),
+            media_type=media_type,
+            headers={"Accept-Ranges": "bytes"},
+        )
+
+    # Parse "bytes=START-END" — END is optional and inclusive when present.
+    m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+    if not m:
+        raise HTTPException(416, "bad_range")
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s == "" and end_s == "":
+        raise HTTPException(416, "bad_range")
+    if start_s == "":
+        # "bytes=-N" → last N bytes.
+        suffix_len = int(end_s)
+        if suffix_len <= 0:
+            raise HTTPException(416, "bad_range")
+        start = max(0, file_size - suffix_len)
+        end = file_size - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else file_size - 1
+    end = min(end, file_size - 1)
+    if start < 0 or start > end:
+        raise HTTPException(416, "range_unsatisfiable")
+    chunk_size = end - start + 1
+
+    def iter_chunk():
+        with open(video_path, "rb") as f:
+            f.seek(start)
+            remaining = chunk_size
+            while remaining > 0:
+                read_size = min(64 * 1024, remaining)
+                data = f.read(read_size)
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(
+        iter_chunk(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_size),
+        },
+    )
 
 
 # ---- diff -----------------------------------------------------------------
