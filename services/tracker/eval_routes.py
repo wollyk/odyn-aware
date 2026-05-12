@@ -354,7 +354,7 @@ def _resolve_run_clip(run_id: str) -> Path:
     return video_path
 
 
-@router.get("/clip/{run_id}")
+@router.get("/clip/{run_id}", response_model=None)
 async def run_clip(
     run_id: str,
     request: Request,
