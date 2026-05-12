@@ -50,6 +50,15 @@ if (!EVAL_SECRET) {
   );
 }
 
+// Mirror the tracker's MAX_UPLOAD_BYTES. We could query it from the
+// tracker on boot, but a static mirror keeps the request flow simple
+// and lets us reject oversized uploads before opening a socket to the
+// tracker at all.
+const MAX_UPLOAD_BYTES = Number(
+  process.env.TRACKER_EVAL_MAX_UPLOAD_BYTES ?? 500 * 1024 * 1024,
+);
+const ALLOWED_VIDEO_EXTS = new Set([".mp4", ".mov", ".mkv", ".webm", ".avi"]);
+
 const runSchema = z.object({
   clip: z.string().min(1).max(512),
   name: z.string().max(120).optional(),
@@ -99,6 +108,100 @@ export async function register(req, res, url, ctx) {
     try {
       const upstream = await trackerFetch("/eval/corpus");
       send(res, upstream.status, upstream.body ?? { error: "no_body" });
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- corpus upload (raw body, streamed to tracker) ----------------------
+  //
+  // Client side: `xhr.send(file)` with `?name=<filename>` query param.
+  // Browser progress events come from the upload phase here, not from
+  // the tracker, so we get a live progress bar without any tracker
+  // changes. Body is piped straight to fetch with `duplex: "half"` so
+  // we never buffer 500 MB in Node memory.
+  if (req.method === "POST" && url.pathname === "/api/agent/evals/upload") {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    if (!EVAL_SECRET) {
+      send(res, 503, { error: "eval_secret_unset" });
+      return true;
+    }
+    const name = url.searchParams.get("name") ?? "";
+    if (!name) {
+      send(res, 400, { error: "missing_name" });
+      return true;
+    }
+    // Strip directory components defensively (the tracker also does this).
+    const safeName = name.replace(/^.*[\\/]/, "");
+    const dotIdx = safeName.lastIndexOf(".");
+    const ext = dotIdx > 0 ? safeName.slice(dotIdx).toLowerCase() : "";
+    if (!ALLOWED_VIDEO_EXTS.has(ext)) {
+      send(res, 415, { error: "unsupported_extension", got: ext });
+      return true;
+    }
+    const cl = Number(req.headers["content-length"] ?? "0");
+    if (!Number.isFinite(cl) || cl <= 0) {
+      send(res, 411, { error: "length_required" });
+      return true;
+    }
+    if (cl > MAX_UPLOAD_BYTES) {
+      send(res, 413, { error: "file_too_large", limit: MAX_UPLOAD_BYTES });
+      return true;
+    }
+    try {
+      const upstream = await fetch(
+        `${TRACKER_HTTP_BASE}/eval/corpus/upload?name=${encodeURIComponent(safeName)}`,
+        {
+          method: "POST",
+          headers: {
+            "x-eval-secret": EVAL_SECRET,
+            "content-type":
+              req.headers["content-type"] || "application/octet-stream",
+            "content-length": String(cl),
+          },
+          body: req,
+          duplex: "half",
+        },
+      );
+      const txt = await upstream.text();
+      let body;
+      try {
+        body = txt ? JSON.parse(txt) : null;
+      } catch {
+        body = { raw: txt };
+      }
+      send(res, upstream.status, body ?? { ok: upstream.ok });
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- corpus delete ------------------------------------------------------
+  //
+  // The clip name may contain URI-reserved characters, so we accept a
+  // wildcard tail and decode it before forwarding. The tracker validates
+  // that the resolved path lives inside CORPUS_DIR, so a malicious name
+  // can't escape via "../".
+  const mDelClip = url.pathname.match(/^\/api\/agent\/evals\/corpus\/(.+)$/);
+  if (req.method === "DELETE" && mDelClip) {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    let name;
+    try {
+      name = decodeURIComponent(mDelClip[1]);
+    } catch {
+      send(res, 400, { error: "bad_name" });
+      return true;
+    }
+    try {
+      const upstream = await trackerFetch(
+        `/eval/corpus/${encodeURIComponent(name)}`,
+        { method: "DELETE" },
+      );
+      send(res, upstream.status, upstream.body ?? { ok: upstream.ok });
     } catch (err) {
       send(res, 502, { error: "tracker_unreachable", detail: err.message });
     }

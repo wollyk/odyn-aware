@@ -49,6 +49,14 @@ RUNS_DIR = Path(
 EVAL_SECRET = os.environ.get("TRACKER_EVAL_SECRET", "").strip()
 EVAL_PY = Path(__file__).resolve().parent / "eval.py"
 
+# Hard cap on a single uploaded clip. Defaults to 500 MB so the admin UI
+# can upload typical 1080p test footage without surprises. Configurable
+# via env so we can shrink it on tiny instances.
+MAX_UPLOAD_BYTES = int(
+    os.environ.get("TRACKER_EVAL_MAX_UPLOAD_BYTES", str(500 * 1024 * 1024))
+)
+ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
 # ---- in-memory tracking ---------------------------------------------------
 _runs: dict[str, dict[str, Any]] = {}
 _diffs: dict[str, dict[str, Any]] = {}
@@ -83,7 +91,7 @@ async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONR
     for entry in sorted(CORPUS_DIR.rglob("*")):
         if not entry.is_file():
             continue
-        if entry.suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm", ".avi"}:
+        if entry.suffix.lower() not in ALLOWED_VIDEO_EXTS:
             continue
         st = entry.stat()
         clips.append(
@@ -94,6 +102,117 @@ async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONR
             }
         )
     return JSONResponse({"corpus_dir": str(CORPUS_DIR), "clips": clips})
+
+
+# ---- corpus upload --------------------------------------------------------
+#
+# Raw-body POST (NOT multipart) so we don't have to add python-multipart
+# to the tracker venv. The browser side uses `xhr.send(file)` with a
+# `?name=...` query parameter for the filename. Content-Type carries the
+# MIME from the file picker (informational only — we validate by suffix).
+#
+# Safety:
+#   - filename is reduced to its basename + must match an allowed suffix
+#   - duplicates are rejected (409) so re-uploading doesn't silently
+#     replace an existing clip that may already be referenced by runs
+#   - size is capped at MAX_UPLOAD_BYTES via early Content-Length check
+#     AND via streaming byte count (Content-Length can lie)
+#   - bytes are streamed to a hidden `.tmp.<uuid>.<name>` file then
+#     atomically renamed into place. A crash mid-upload leaves a tmp
+#     file but never a partial clip with the final name.
+
+@router.post("/corpus/upload", response_model=None)
+async def upload_corpus(
+    request: Request,
+    name: str = Query(..., min_length=1, max_length=255),
+    x_eval_secret: str | None = Header(default=None),
+) -> JSONResponse:
+    _require_secret(x_eval_secret)
+
+    safe_name = Path(name).name  # strip any directory components from name
+    if not safe_name or safe_name.startswith("."):
+        raise HTTPException(400, "invalid_filename")
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in ALLOWED_VIDEO_EXTS:
+        raise HTTPException(415, "unsupported_extension")
+
+    # Cheap up-front rejection from Content-Length. Browsers always send
+    # it for non-chunked uploads, so we can short-circuit oversized files
+    # before reading a single byte.
+    cl_raw = request.headers.get("content-length")
+    if cl_raw:
+        try:
+            cl = int(cl_raw)
+        except ValueError:
+            cl = -1
+        if cl == 0:
+            raise HTTPException(400, "empty_upload")
+        if cl > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "file_too_large")
+
+    CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CORPUS_DIR / safe_name
+    if dest.exists():
+        raise HTTPException(409, "clip_exists")
+
+    tmp = CORPUS_DIR / f".tmp.{uuid.uuid4().hex}.{safe_name}"
+    bytes_written = 0
+    try:
+        with open(tmp, "wb") as fout:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                bytes_written += len(chunk)
+                if bytes_written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "file_too_large")
+                fout.write(chunk)
+        if bytes_written == 0:
+            raise HTTPException(400, "empty_upload")
+        os.replace(tmp, dest)
+    except HTTPException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(500, f"write_failed: {exc}") from exc
+
+    st = dest.stat()
+    return JSONResponse(
+        {
+            "path": safe_name,
+            "size_bytes": st.st_size,
+            "mtime": st.st_mtime,
+        }
+    )
+
+
+@router.delete("/corpus/{name}")
+async def delete_corpus(
+    name: str,
+    x_eval_secret: str | None = Header(default=None),
+) -> JSONResponse:
+    """Delete a clip from CORPUS_DIR.
+
+    Runs that referenced this clip stay on disk and remain queryable
+    (their JSONL is unaffected), but `GET /eval/clip/{run_id}` will
+    start returning 404 once the source clip is gone. The admin UI
+    surfaces that with a "clip missing" badge.
+    """
+    _require_secret(x_eval_secret)
+    target = _safe_corpus_path(name)
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        raise HTTPException(404, "clip_not_found")
+    except OSError as exc:
+        raise HTTPException(500, f"delete_failed: {exc}") from exc
+    return JSONResponse({"deleted": name})
 
 
 # ---- run ------------------------------------------------------------------

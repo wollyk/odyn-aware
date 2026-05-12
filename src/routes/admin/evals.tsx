@@ -24,6 +24,7 @@ import {
   useAdminAuth,
 } from "@/components/admin-shell";
 import { EvalPlayer } from "@/features/evals/EvalPlayer";
+import { UploadDropzone } from "@/features/evals/UploadDropzone";
 
 export const Route = createFileRoute("/admin/evals")({
   component: AdminEvals,
@@ -176,6 +177,7 @@ function AdminEvals() {
   const [minFrames, setMinFrames] = useState<string>("");
   const [staticReq, setStaticReq] = useState<"" | "true" | "false">("");
   const [posting, setPosting] = useState(false);
+  const [deletingClip, setDeletingClip] = useState(false);
 
   // -- diff state
   const [diffA, setDiffA] = useState<string>("");
@@ -266,6 +268,37 @@ function AdminEvals() {
     }
   }
 
+  async function deleteSelectedClip() {
+    if (!clip) return;
+    const confirmed = window.confirm(
+      `Delete "${clip}" from the eval corpus?\n\nExisting runs that referenced this clip will keep their data but lose video playback.`,
+    );
+    if (!confirmed) return;
+    setDeletingClip(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/agent/evals/corpus/${encodeURIComponent(clip)}`,
+        { method: "DELETE", credentials: "include" },
+      );
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(
+          (detail && (detail.error || detail.detail)) ||
+            `delete ${res.status}`,
+        );
+      }
+      // After deletion, the dropdown auto-falls back to the first remaining
+      // clip via fetchAll(). Clear `clip` first so the auto-select kicks in.
+      setClip("");
+      await fetchAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "delete_failed");
+    } finally {
+      setDeletingClip(false);
+    }
+  }
+
   async function runDiff() {
     if (!diffA || !diffB || diffA === diffB) {
       setError("pick two different runs to diff");
@@ -309,8 +342,8 @@ function AdminEvals() {
       <AdminHeader active="evals" me={me} logout={logout} />
       <main className="mx-auto max-w-[1200px] px-6 py-6 space-y-6">
         {/* [01] new run --------------------------------------------- */}
-        <section className="border border-foreground/15 bg-foreground/[0.02] p-4">
-          <h2 className="mb-3 font-mono text-[10px] uppercase tracking-widest text-foreground/55">
+        <section className="border border-foreground/15 bg-foreground/[0.02] p-4 space-y-4">
+          <h2 className="font-mono text-[10px] uppercase tracking-widest text-foreground/55">
             [01] · new eval run
             {corpus && (
               <span className="ml-3 text-foreground/40">
@@ -318,10 +351,16 @@ function AdminEvals() {
               </span>
             )}
           </h2>
+          <UploadDropzone
+            existingPaths={corpus?.clips.map((c) => c.path) ?? []}
+            onUploaded={(c) => {
+              setClip(c.path);
+              void fetchAll();
+            }}
+          />
           {corpus && corpus.clips.length === 0 ? (
             <p className="font-mono text-xs text-foreground/55">
-              No clips in <code>{corpus.corpus_dir}</code>. Drop .mp4/.mkv/.mov
-              files there on the tracker host to populate the corpus.
+              No clips yet — drop one above to start your first eval run.
             </p>
           ) : (
             <form
@@ -329,18 +368,33 @@ function AdminEvals() {
               className="grid grid-cols-1 gap-3 md:grid-cols-2"
             >
               <Field label="Clip">
-                <select
-                  value={clip}
-                  onChange={(e) => setClip(e.target.value)}
-                  className="w-full border border-foreground/20 bg-background px-2 py-1 font-mono text-xs"
-                  required
-                >
-                  {corpus?.clips.map((c) => (
-                    <option key={c.path} value={c.path}>
-                      {c.path} · {formatBytes(c.size_bytes)}
-                    </option>
-                  ))}
-                </select>
+                <div className="flex gap-2">
+                  <select
+                    value={clip}
+                    onChange={(e) => setClip(e.target.value)}
+                    className="flex-1 border border-foreground/20 bg-background px-2 py-1 font-mono text-xs"
+                    required
+                  >
+                    {corpus?.clips.map((c) => (
+                      <option key={c.path} value={c.path}>
+                        {c.path} · {formatBytes(c.size_bytes)}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={deleteSelectedClip}
+                    disabled={!clip || deletingClip}
+                    title={
+                      clip
+                        ? `Delete "${clip}" from corpus`
+                        : "Pick a clip first"
+                    }
+                    className="shrink-0 border border-foreground/15 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-foreground/55 hover:border-red-400/40 hover:text-red-300 disabled:opacity-30 disabled:hover:border-foreground/15 disabled:hover:text-foreground/55"
+                  >
+                    {deletingClip ? "…" : "× delete"}
+                  </button>
+                </div>
               </Field>
               <Field label="Run name (optional)">
                 <input
