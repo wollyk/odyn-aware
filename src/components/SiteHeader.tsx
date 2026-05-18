@@ -7,14 +7,13 @@ export function SiteHeader() {
           <span className="hidden sm:inline label-mono">/ Real-Time Intelligence Layer</span>
         </a>
         <nav className="hidden items-center gap-8 md:flex">
-          <a href="#problem" className="label-mono hover:text-foreground transition-colors">Problem</a>
-          <a href="#solution" className="label-mono hover:text-foreground transition-colors">Solution</a>
-          <a href="#policy" className="label-mono hover:text-foreground transition-colors">Policy</a>
-          <a href="#product" className="label-mono hover:text-foreground transition-colors">Product</a>
-          <a href="#access" className="label-mono hover:text-foreground transition-colors">Access</a>
+          <a href="#live" className="label-mono hover:text-foreground transition-colors">Live</a>
+          <a href="#map" className="label-mono hover:text-foreground transition-colors">Map</a>
+          <a href="#tracking" className="label-mono hover:text-foreground transition-colors">Tracking</a>
+          <a href="#access" className="label-mono hover:text-foreground transition-colors">Deploy</a>
         </nav>
         <a href="#access" className="inline-flex items-center gap-2 border border-foreground/80 px-4 py-2 text-xs font-medium tracking-widest uppercase text-foreground hover:bg-foreground hover:text-background transition-colors">
-          Request Access
+          Book A Deployment
         </a>
       </div>
     </header>

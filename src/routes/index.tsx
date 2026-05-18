@@ -1,9 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
-import heroHangar from "@/assets/hero-hangar.jpg";
-import industrialImg from "@/assets/expansion-industrial.jpg";
+import liveCroatia from "@/assets/website_images/home_page_upgrade_2.PNG";
+import liveGarage from "@/assets/website_images/Image_rec_n.PNG";
+import mapShot from "@/assets/website_images/home_page_upgrade_1.PNG";
 import { SiteHeader } from "@/components/SiteHeader";
-import { CCTVPrototype } from "@/components/CCTVPrototype";
 import { AccessForm } from "@/components/AccessForm";
+
+// The home page is feature-led, not pitch-deck-led. Each section shows
+// the *actual* admin UI and pairs it with copy that mirrors what an
+// operator would do (ask a question, see coverage, watch tracks).
+//
+// Structure:
+//   00 hero        — product screenshot as backdrop, customer headline
+//   01 live + ask  — VLM answering "what do you see"
+//   02 map         — multi-camera spatial layout with FOV cones
+//   03 tracking    — persistent multi-camera object tracks
+//   04 how it runs — compact 4-stat tech bar (edge / latency / no cloud)
+//   05 access      — request a deployment (form unchanged)
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -19,234 +31,323 @@ function SectionLabel({ num, children }: { num: string; children: React.ReactNod
   );
 }
 
+// Compact pill showing live system state. Repeated in the hero + section
+// captions so the page feels alive.
+function StatusPill({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "good" | "alert" }) {
+  const valueColor =
+    tone === "good" ? "text-emerald-400" : tone === "alert" ? "text-alert" : "text-foreground/90";
+  return (
+    <span className="inline-flex items-center gap-2 border border-border/60 bg-background/40 px-2.5 py-1 font-mono text-[10px] uppercase tracking-widest backdrop-blur-sm">
+      <span className="text-foreground/40">{label}</span>
+      <span className={valueColor}>{value}</span>
+    </span>
+  );
+}
+
 function Index() {
   return (
     <div id="top" className="min-h-screen bg-background text-foreground">
       <SiteHeader />
 
-      {/* HERO */}
+      {/* 00 — HERO ----------------------------------------------------------
+          Product-led: the backdrop IS the product, dimmed enough that the
+          headline reads. No more stock-photo hangar. */}
       <section className="relative min-h-[100svh] w-full overflow-hidden">
         <img
-          src={heroHangar}
-          alt="Aircraft hangar interior at dusk"
+          src={liveCroatia}
+          alt="AuroraView admin live view"
           width={1920}
           height={1080}
-          className="absolute inset-0 h-full w-full object-cover"
+          className="absolute inset-0 h-full w-full object-cover opacity-55"
         />
         <div className="absolute inset-0 bg-gradient-to-r from-background via-background/85 to-background/30" />
-        <div className="absolute inset-0 bg-gradient-to-t from-background via-transparent to-background/40" />
+        <div className="absolute inset-0 bg-gradient-to-t from-background via-background/40 to-background/70" />
 
         <div className="relative mx-auto flex min-h-[100svh] max-w-7xl flex-col justify-end px-6 pb-20 pt-32">
-          <div className="mb-6 flex items-center gap-3">
-            <span className="h-1.5 w-1.5 animate-pulse bg-alert" />
-            <span className="label-mono">Real-Time Intelligence Layer · On-Site</span>
+          <div className="mb-6 flex flex-wrap items-center gap-2">
+            <StatusPill label="LIVE" value="ON-SITE" tone="good" />
+            <StatusPill label="LATENCY" value="< 2 S" />
+            <StatusPill label="CLOUD" value="NONE" tone="alert" />
           </div>
           <h1 className="max-w-4xl text-5xl font-light leading-[1.05] tracking-tight text-foreground sm:text-6xl md:text-7xl lg:text-8xl">
-            Awareness<br />
-            for <span className="italic font-serif text-foreground/95">Physical Spaces</span>
+            Your cameras can<br />
+            finally <span className="italic font-serif text-foreground/95">answer.</span>
           </h1>
-          <p className="mt-8 max-w-2xl text-base text-muted-foreground sm:text-lg">
-            AuroraView is an on-site intelligence layer. Policy-driven detection, natural language interaction, and behavior analysis — running locally beside your existing cameras.
+          <p className="mt-8 max-w-2xl text-base text-foreground/80 sm:text-lg">
+            AuroraView is an AI layer that runs next to your existing CCTV.
+            It watches in real time, tracks people and objects across cameras,
+            and answers questions in plain English — all on-site, with no
+            cloud round-trip.
           </p>
           <div className="mt-10 flex flex-wrap items-center gap-4">
-            <a href="#access" className="inline-flex items-center gap-3 bg-foreground px-7 py-4 text-xs font-medium uppercase tracking-[0.25em] text-background hover:bg-foreground/90 transition-colors">
-              Request Deployment <span aria-hidden>→</span>
+            <a
+              href="#live"
+              className="inline-flex items-center gap-3 bg-foreground px-7 py-4 text-xs font-medium uppercase tracking-[0.25em] text-background hover:bg-foreground/90 transition-colors"
+            >
+              See It Working <span aria-hidden>↓</span>
             </a>
-            <a href="#problem" className="inline-flex items-center gap-2 px-2 py-4 text-xs font-medium uppercase tracking-[0.25em] text-foreground/80 hover:text-foreground transition-colors">
-              ↓ Read More
+            <a
+              href="#access"
+              className="inline-flex items-center gap-3 border border-foreground/40 px-7 py-4 text-xs font-medium uppercase tracking-[0.25em] text-foreground hover:bg-foreground hover:text-background transition-colors"
+            >
+              Book A Deployment <span aria-hidden>→</span>
             </a>
           </div>
 
-          {/* footer hud */}
+          {/* HUD: same shape as the admin shell footer so the page feels
+              continuous with the product. */}
           <div className="mt-20 grid grid-cols-2 gap-6 border-t border-border/60 pt-6 font-mono text-[10px] tracking-widest text-muted-foreground sm:grid-cols-4">
-            <div><div className="text-foreground/40">v.</div><div className="mt-1 text-foreground/80">AV-01</div></div>
-            <div><div className="text-foreground/40">RUNTIME</div><div className="mt-1 text-foreground/80">ON-DEVICE</div></div>
-            <div><div className="text-foreground/40">LATENCY</div><div className="mt-1 text-foreground/80">&lt; 2 S</div></div>
-            <div><div className="text-foreground/40">STATUS</div><div className="mt-1 text-alert">DEPLOYING</div></div>
+            <div><div className="text-foreground/40">RUNTIME</div><div className="mt-1 text-foreground/85">ON-DEVICE</div></div>
+            <div><div className="text-foreground/40">CAMERAS</div><div className="mt-1 text-foreground/85">EXISTING IP</div></div>
+            <div><div className="text-foreground/40">AGENT</div><div className="mt-1 text-foreground/85">NATURAL LANGUAGE</div></div>
+            <div><div className="text-foreground/40">DEPLOY</div><div className="mt-1 text-alert">2 WEEKS</div></div>
           </div>
         </div>
       </section>
 
-      {/* PROBLEM */}
-      <section id="problem" className="border-t border-border">
+      {/* 01 — LIVE + AGENT --------------------------------------------------
+          The big sell. The agent literally answers what's in the scene. */}
+      <section id="live" className="border-t border-border">
         <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="01">The Problem</SectionLabel>
-          <div className="grid gap-12 md:grid-cols-12">
-            <h2 className="md:col-span-5 text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-              Cameras capture<br />everything.<br />
-              <span className="text-muted-foreground">They understand nothing.</span>
-            </h2>
-            <div className="md:col-span-6 md:col-start-7 space-y-6 text-base leading-relaxed text-muted-foreground">
-              <p>High-value environments are already covered by cameras. But no one is watching them in real time.</p>
-              <p className="text-foreground">Incidents are discovered after the fact. Response is delayed. Loss happens in the gap between detection and action.</p>
-              <p>The infrastructure exists. What's missing is awareness.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* SOLUTION */}
-      <section id="solution" className="border-t border-border bg-card/40">
-        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="02">The Solution</SectionLabel>
-          <div className="grid gap-12 md:grid-cols-12">
-            <h2 className="md:col-span-5 text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-              From footage<br />to <span className="italic font-serif">awareness.</span>
-            </h2>
-            <div className="md:col-span-6 md:col-start-7 space-y-6 text-base leading-relaxed text-muted-foreground">
-              <p>AuroraView runs locally on-site and analyzes video in real time.</p>
-              <p>It detects people, movement, and activity as it happens. It applies environment-specific rules to determine what matters. It alerts immediately when something requires attention.</p>
-              <ul className="grid grid-cols-3 gap-4 pt-4 font-mono text-[11px] uppercase tracking-widest">
-                <li className="border-l-2 border-alert pl-3 text-foreground">No constant<br/>monitoring</li>
-                <li className="border-l-2 border-alert pl-3 text-foreground">No cloud<br/>dependency</li>
-                <li className="border-l-2 border-alert pl-3 text-foreground">No<br/>delay</li>
-              </ul>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* POLICY */}
-      <section id="policy" className="border-t border-border">
-        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="03">Policy-Driven</SectionLabel>
-          <div className="grid gap-12 md:grid-cols-12">
-            <h2 className="md:col-span-5 text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-              Define what<br />matters.<br />
-              <span className="text-muted-foreground">From presence to behavior.</span>
-            </h2>
-            <div className="md:col-span-6 md:col-start-7 space-y-6 text-base leading-relaxed text-muted-foreground">
-              <p>AuroraView detects patterns, not just movement.</p>
-              <ul className="border-y border-border divide-y divide-border font-mono text-xs">
-                <li className="py-4">— Loitering in restricted areas</li>
-                <li className="py-4">— Unauthorized access during closed hours</li>
-                <li className="py-4">— Abnormal or aggressive activity</li>
-                <li className="py-4">— Policy violations specific to the environment</li>
-              </ul>
-              <p className="text-foreground">Each deployment is tuned to what matters in that space.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* INTERACTION */}
-      <section className="border-t border-border bg-card/40">
-        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="04">Interaction</SectionLabel>
-          <div className="grid gap-12 md:grid-cols-12">
-            <h2 className="md:col-span-5 text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-              Speak to<br />the system.
-            </h2>
-            <div className="md:col-span-6 md:col-start-7 space-y-6 text-base leading-relaxed text-muted-foreground">
-              <p>Natural language interaction. No dashboards, no consoles to learn.</p>
-              <p className="text-foreground">Ask in plain language: <span className="italic">"Was the hangar entered after 10 PM last night?"</span> The system answers from on-device context.</p>
-              <p>Define policies the same way. The system understands the environment and adapts.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* PROTOTYPE / PRODUCT VIEW */}
-      <section id="product" className="border-t border-border">
-        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="05">Live Detection</SectionLabel>
+          <SectionLabel num="01">Live View · Ask Anything</SectionLabel>
           <div className="grid gap-12 lg:grid-cols-12">
             <div className="lg:col-span-5">
               <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-                Built for real<br />environments.
+                Watch it.<br />
+                Then <span className="italic font-serif">ask</span> about it.
               </h2>
               <p className="mt-6 text-base leading-relaxed text-muted-foreground">
-                AuroraView runs on a local edge device connected to existing camera systems.
+                Click any camera. The video plays in real time. On the right, the
+                agent is sitting there, ready. Type a question.
+              </p>
+              <div className="mt-8 space-y-3 border-y border-border py-5 font-mono text-xs">
+                <div className="flex items-baseline gap-3">
+                  <span className="shrink-0 text-alert">you →</span>
+                  <span className="text-foreground/90">what do you see</span>
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span className="shrink-0 text-emerald-400">agent →</span>
+                  <span className="text-foreground/80">
+                    urns of different sizes are scattered throughout a backyard,
+                    with trees and a building in the background.
+                    <span className="text-foreground/50"> · severity normal · confidence 55%</span>
+                  </span>
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span className="shrink-0 text-alert">you →</span>
+                  <span className="text-foreground/90">what have you seen today</span>
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span className="shrink-0 text-emerald-400">agent →</span>
+                  <span className="text-foreground/80">
+                    734 normal events, 0 critical. Garage camera was busiest. A
+                    person was seen 7 times between 00:12 and 06:29.
+                  </span>
+                </div>
+              </div>
+              <ul className="mt-6 grid grid-cols-2 gap-3 font-mono text-[10px] uppercase tracking-widest text-foreground/70">
+                <li className="border-l-2 border-alert pl-3">Local VLM<br/>no cloud</li>
+                <li className="border-l-2 border-alert pl-3">Tool calls<br/>rename, alert, summarize</li>
+                <li className="border-l-2 border-alert pl-3">Per-camera<br/>context window</li>
+                <li className="border-l-2 border-alert pl-3">Vision tick<br/>every 5 s</li>
+              </ul>
+            </div>
+            <figure className="lg:col-span-7">
+              <div className="overflow-hidden border border-border bg-card/30 shadow-2xl">
+                <img
+                  src={liveGarage}
+                  alt="Live view of the Garage camera with the agent answering questions"
+                  width={2048}
+                  height={1126}
+                  className="h-auto w-full"
+                />
+              </div>
+              <figcaption className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                <span>FIG. 01 — Live MSE stream · Garage · agent answering</span>
+                <span>real screenshot · not mocked</span>
+              </figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      {/* 02 — MAP -----------------------------------------------------------
+          Spatial awareness across the whole site. */}
+      <section id="map" className="border-t border-border bg-card/40">
+        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
+          <SectionLabel num="02">Map · Every Camera On One Plan</SectionLabel>
+          <div className="grid gap-12 lg:grid-cols-12">
+            <figure className="lg:col-span-7">
+              <div className="overflow-hidden border border-border bg-card/30 shadow-2xl">
+                <img
+                  src={mapShot}
+                  alt="Property map with two camera FOV cones overlaid"
+                  width={2048}
+                  height={1126}
+                  className="h-auto w-full"
+                />
+              </div>
+              <figcaption className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                <span>FIG. 02 — Property map · 2 cameras · FOV cones</span>
+                <span>drag dots to move · drag handle to rotate</span>
+              </figcaption>
+            </figure>
+            <div className="lg:col-span-5">
+              <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
+                See coverage.<br />
+                See <span className="italic font-serif">gaps.</span>
+              </h2>
+              <p className="mt-6 text-base leading-relaxed text-muted-foreground">
+                Drop a satellite tile or a floor plan. Place each camera. Drag the
+                handle to set its field of view. Find blind spots before someone
+                else does.
               </p>
               <ul className="mt-8 divide-y divide-border border-y border-border font-mono text-xs">
                 {[
-                  ["EDGE", "On-device processing"],
-                  ["LATENCY", "Real-time detection (< 2s)"],
-                  ["INTEGRATION", "Works with standard IP cameras"],
-                  ["DEPLOY", "No infrastructure changes required"],
+                  ["BG", "Replace with any image — satellite, floor plan, hand-drawn"],
+                  ["CAMERAS", "Click a dot to edit. Rotate, widen, narrow."],
+                  ["MEASURE", "Two-click distance · pixel-accurate"],
+                  ["AGENT", "Ask: \u201Cwhich cameras cover the workshop?\u201D"],
                 ].map(([k, v]) => (
                   <li key={k} className="grid grid-cols-12 gap-4 py-4">
-                    <span className="col-span-4 text-alert tracking-widest">{k}</span>
-                    <span className="col-span-8 text-foreground/85 normal-case tracking-normal font-sans">{v}</span>
+                    <span className="col-span-3 text-alert tracking-widest">{k}</span>
+                    <span className="col-span-9 normal-case tracking-normal font-sans text-foreground/85">
+                      {v}
+                    </span>
                   </li>
                 ))}
               </ul>
-              <p className="mt-8 text-sm text-muted-foreground">
-                <span className="text-foreground">This is not a dashboard.</span> It is an on-site intelligence system.
-              </p>
-            </div>
-            <div className="lg:col-span-7">
-              <CCTVPrototype />
-              <div className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                <span>FIG. 01 — Detection Overlay, Hangar-A / Cam 04</span>
-                <span>Simulated view</span>
-              </div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* USE CASE — HANGARS */}
+      {/* 03 — TRACKING -------------------------------------------------------
+          Persistent tracks across cameras. Showcase using the Croatia
+          marina shot — it's a busy scene that makes the point. */}
+      <section id="tracking" className="border-t border-border">
+        <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
+          <SectionLabel num="03">Tracking · People &amp; Objects</SectionLabel>
+          <div className="grid gap-12 lg:grid-cols-12">
+            <div className="lg:col-span-5">
+              <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
+                Follow every<br />
+                <span className="italic font-serif">moving thing.</span>
+              </h2>
+              <p className="mt-6 text-base leading-relaxed text-muted-foreground">
+                A person walks across the lot, into the garage, then over to the
+                workshop. AuroraView keeps the same ID on them the entire time —
+                even as they cross camera boundaries.
+              </p>
+              <div className="mt-8 grid grid-cols-3 gap-3 border-y border-border py-6 text-center">
+                <div>
+                  <div className="font-mono text-3xl text-foreground">734</div>
+                  <div className="mt-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">events / day</div>
+                </div>
+                <div className="border-x border-border">
+                  <div className="font-mono text-3xl text-foreground">7</div>
+                  <div className="mt-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">person sightings</div>
+                </div>
+                <div>
+                  <div className="font-mono text-3xl text-alert">0</div>
+                  <div className="mt-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">missed today</div>
+                </div>
+              </div>
+              <ul className="mt-6 space-y-3 font-mono text-xs text-muted-foreground">
+                <li>— YOLOv8 detector + ByteTrack persistent IDs</li>
+                <li>— Cross-camera re-ID via embedding similarity</li>
+                <li>— Static vs. moving auto-tagged · de-duped against props</li>
+                <li>— Tagged events streamed to alerts &amp; the agent</li>
+              </ul>
+            </div>
+            <figure className="lg:col-span-7">
+              <div className="overflow-hidden border border-border bg-card/30 shadow-2xl">
+                <img
+                  src={liveCroatia}
+                  alt="Croatia marina live feed with tracking overlay"
+                  width={2048}
+                  height={1126}
+                  className="h-auto w-full"
+                />
+              </div>
+              <figcaption className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                <span>FIG. 03 — Croatia marina · live tracking · 2842 kbps</span>
+                <span>Frigate: on · vision/chat: on</span>
+              </figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      {/* 04 — HOW IT RUNS ----------------------------------------------------
+          Less philosophy, more deployment specifics. */}
       <section className="border-t border-border bg-card/40">
         <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="06">Initial Deployment</SectionLabel>
-          <div className="grid gap-12 md:grid-cols-12">
-            <h2 className="md:col-span-5 text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-              Starting with<br />aircraft hangars.
-            </h2>
-            <div className="md:col-span-6 md:col-start-7 space-y-6 text-base leading-relaxed text-muted-foreground">
-              <p>High-value environments with minimal daily activity.</p>
-              <div className="border-l-2 border-alert pl-5">
-                <div className="label-mono mb-3">AuroraView Detects</div>
-                <ul className="space-y-2 text-foreground">
-                  <li>— Entry into the hangar</li>
-                  <li>— Movement near aircraft</li>
-                  <li>— Unexpected door activity</li>
-                </ul>
-              </div>
-              <p>Configured to alert only when it matters. <span className="text-foreground">Awareness in seconds instead of hours.</span></p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* EXPANSION */}
-      <section className="relative overflow-hidden border-t border-border">
-        <img src={industrialImg} alt="Industrial facility at night" loading="lazy" width={1600} height={900} className="absolute inset-0 h-full w-full object-cover opacity-30" />
-        <div className="absolute inset-0 bg-gradient-to-r from-background via-background/95 to-background/70" />
-        <div className="relative mx-auto max-w-7xl px-6 py-24 sm:py-32">
-          <SectionLabel num="07">Expansion</SectionLabel>
-          <h2 className="max-w-3xl text-4xl font-light leading-tight tracking-tight sm:text-5xl md:text-6xl">
-            Same problem.<br /><span className="italic font-serif">Different scale.</span>
-          </h2>
-          <p className="mt-8 max-w-xl text-muted-foreground">After hangars, AuroraView expands to environments where delayed awareness leads to loss.</p>
-          <div className="mt-12 grid grid-cols-2 gap-px bg-border md:grid-cols-4">
-            {["Industrial sites", "Oil & gas facilities", "Logistics environments", "Private high-value properties"].map((label, i) => (
-              <div key={label} className="bg-background p-6">
-                <div className="font-mono text-[10px] text-alert">0{i + 1}</div>
-                <div className="mt-6 text-lg font-light text-foreground">{label}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* ACCESS / CTA */}
-      <section id="access" className="border-t border-border bg-card/40">
-        <div className="mx-auto max-w-5xl px-6 py-24 sm:py-32">
-          <SectionLabel num="08">Deployment Access</SectionLabel>
+          <SectionLabel num="04">How It Runs</SectionLabel>
           <div className="grid gap-12 md:grid-cols-12">
             <div className="md:col-span-5">
               <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-                Request<br />deployment.
+                One box.<br />
+                <span className="italic font-serif">Your network.</span>
               </h2>
               <p className="mt-6 text-base leading-relaxed text-muted-foreground">
-                Initial systems are being deployed with select operators. Request access to participate in the next deployment cohort.
+                AuroraView ships as a single appliance you plug into your camera
+                VLAN. It speaks RTSP to your existing IP cameras, runs detection
+                and the language model locally, and exposes a web UI on your LAN.
+              </p>
+              <p className="mt-4 text-base leading-relaxed text-foreground">
+                Nothing leaves your site unless you say so.
+              </p>
+            </div>
+            <div className="md:col-span-7 grid grid-cols-2 gap-px border border-border bg-border">
+              {[
+                ["EDGE", "GPU-accelerated · runs on-site"],
+                ["LATENCY", "< 2 s detection to alert"],
+                ["CAMERAS", "Any RTSP / ONVIF feed"],
+                ["MODELS", "YOLOv8 + Moondream + ByteTrack"],
+                ["INTEGRATION", "Webhooks · Slack · email"],
+                ["DATA", "Stays on your LAN by default"],
+              ].map(([k, v]) => (
+                <div key={k} className="bg-background p-6">
+                  <div className="font-mono text-[10px] uppercase tracking-widest text-alert">{k}</div>
+                  <div className="mt-3 text-sm leading-snug text-foreground/85">{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 05 — ACCESS / CTA --------------------------------------------------- */}
+      <section id="access" className="relative overflow-hidden border-t border-border">
+        {/* Subtle scan-line atmosphere via CSS only — no big PNG payload. */}
+        <div
+          aria-hidden
+          className="absolute inset-0 opacity-[0.08]"
+          style={{
+            backgroundImage:
+              "repeating-linear-gradient(0deg, currentColor 0 1px, transparent 1px 4px)",
+            color: "var(--foreground)",
+          }}
+        />
+        <div className="absolute inset-0 bg-gradient-to-b from-background via-background to-background" />
+        <div className="relative mx-auto max-w-5xl px-6 py-24 sm:py-32">
+          <SectionLabel num="05">Get It Running On Your Site</SectionLabel>
+          <div className="grid gap-12 md:grid-cols-12">
+            <div className="md:col-span-5">
+              <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
+                Tell us about<br />
+                your <span className="italic font-serif">site.</span>
+              </h2>
+              <p className="mt-6 text-base leading-relaxed text-muted-foreground">
+                Drop your details below. We'll come back with a sizing estimate,
+                what cameras you'd need, and a deployment timeline.
               </p>
               <div className="mt-10 space-y-3 font-mono text-xs text-muted-foreground">
-                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Limited cohort</div>
-                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Direct deployment support</div>
-                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Priority hardware allocation</div>
+                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Typical site online in 2 weeks</div>
+                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Works with cameras you already own</div>
+                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> No per-camera cloud fees</div>
+                <div className="flex items-center gap-3"><span className="h-1 w-1 bg-alert" /> Direct line to the engineers building it</div>
               </div>
             </div>
             <div className="md:col-span-7">
@@ -261,7 +362,7 @@ function Index() {
         <div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-6 px-6 py-10 sm:flex-row sm:items-center">
           <div className="flex items-center gap-3">
             <span className="font-mono text-sm font-semibold tracking-[0.3em]">AURORAVIEW</span>
-            <span className="label-mono">Real-Time Intelligence Layer</span>
+            <span className="label-mono">Awareness for physical sites</span>
           </div>
           <div className="flex flex-col items-start gap-2 sm:items-end">
             <div className="flex items-center gap-4 font-mono text-[10px] uppercase tracking-widest">
