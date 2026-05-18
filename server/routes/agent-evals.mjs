@@ -57,7 +57,13 @@ if (!EVAL_SECRET) {
 const MAX_UPLOAD_BYTES = Number(
   process.env.TRACKER_EVAL_MAX_UPLOAD_BYTES ?? 500 * 1024 * 1024,
 );
-const ALLOWED_VIDEO_EXTS = new Set([".mp4", ".mov", ".mkv", ".webm", ".avi"]);
+// `.zip` is for image-sequence uploads — the tracker extracts them
+// into a sequence directory inside the corpus. See
+// services/tracker/eval_routes.py::_extract_sequence_zip for the
+// allowed images inside (.tif/.jpg/.png/etc).
+const ALLOWED_UPLOAD_EXTS = new Set([
+  ".mp4", ".mov", ".mkv", ".webm", ".avi", ".zip",
+]);
 
 const runSchema = z.object({
   clip: z.string().min(1).max(512),
@@ -137,7 +143,7 @@ export async function register(req, res, url, ctx) {
     const safeName = name.replace(/^.*[\\/]/, "");
     const dotIdx = safeName.lastIndexOf(".");
     const ext = dotIdx > 0 ? safeName.slice(dotIdx).toLowerCase() : "";
-    if (!ALLOWED_VIDEO_EXTS.has(ext)) {
+    if (!ALLOWED_UPLOAD_EXTS.has(ext)) {
       send(res, 415, { error: "unsupported_extension", got: ext });
       return true;
     }
@@ -426,6 +432,63 @@ export async function register(req, res, url, ctx) {
         res.write(value);
       }
       res.end();
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- sequence manifest (per-frame playback metadata) -------------------
+  const mSeqManifest = url.pathname.match(
+    /^\/api\/agent\/evals\/([0-9a-f]{8,64})\/sequence$/i,
+  );
+  if (req.method === "GET" && mSeqManifest) {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    try {
+      const upstream = await trackerFetch(`/eval/sequence/${mSeqManifest[1]}/manifest`);
+      send(res, upstream.status, upstream.body ?? { error: "no_body" });
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- sequence frame (per-frame JPEG for image-sequence runs) -----------
+  //
+  // Server-decoded JPEG so the browser doesn't need a TIFF decoder.
+  // Frames are immutable for the lifetime of a run, so we let the
+  // tracker set Cache-Control: immutable and forward it.
+  const mSeqFrame = url.pathname.match(
+    /^\/api\/agent\/evals\/([0-9a-f]{8,64})\/frame\/(\d+)$/i,
+  );
+  if (req.method === "GET" && mSeqFrame) {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    if (!EVAL_SECRET) {
+      send(res, 503, { error: "eval_secret_unset" });
+      return true;
+    }
+    try {
+      const upstream = await fetch(
+        `${TRACKER_HTTP_BASE}/eval/sequence/${mSeqFrame[1]}/frame/${mSeqFrame[2]}`,
+        { headers: { "x-eval-secret": EVAL_SECRET } },
+      );
+      if (!upstream.ok) {
+        send(res, upstream.status, {
+          error: "upstream",
+          status: upstream.status,
+        });
+        return true;
+      }
+      const ab = await upstream.arrayBuffer();
+      const cc = upstream.headers.get("cache-control") || "public, max-age=86400, immutable";
+      res.writeHead(200, {
+        "content-type": upstream.headers.get("content-type") || "image/jpeg",
+        "content-length": String(ab.byteLength),
+        "cache-control": cc,
+      });
+      res.end(Buffer.from(ab));
     } catch (err) {
       send(res, 502, { error: "tracker_unreachable", detail: err.message });
     }

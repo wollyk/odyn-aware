@@ -17,12 +17,18 @@
 import { useCallback, useRef, useState } from "react";
 
 export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB
-const ALLOWED_EXTS = new Set(["mp4", "mov", "mkv", "webm", "avi"]);
+// `.zip` is for image-sequence uploads (e.g. UCSD dataset folders).
+// The tracker extracts the zip into a sequence directory under the
+// corpus dir. Production inference uses single JPEG snapshots, so a
+// frame sequence is the most representative offline input shape.
+const ALLOWED_EXTS = new Set(["mp4", "mov", "mkv", "webm", "avi", "zip"]);
 
 export type UploadedClip = {
   path: string;
+  kind?: "video" | "sequence";
   size_bytes: number;
   mtime: number;
+  frames?: number;
 };
 
 export type UploadDropzoneProps = {
@@ -262,14 +268,14 @@ export function UploadDropzone({
             : "drop video clips here · or click to pick"}
         </span>
         <span className="text-[10px] normal-case tracking-normal text-foreground/40">
-          .mp4 .mov .mkv .webm .avi · max {formatBytes(MAX_UPLOAD_BYTES)} ·
-          uploads run sequentially
+          .mp4 .mov .mkv .webm .avi · or .zip of image frames (.tif .jpg .png) ·
+          max {formatBytes(MAX_UPLOAD_BYTES)} · uploads run sequentially
         </span>
         <input
           ref={inputRef}
           type="file"
           multiple
-          accept=".mp4,.mov,.mkv,.webm,.avi,video/*"
+          accept=".mp4,.mov,.mkv,.webm,.avi,.zip,video/*,application/zip"
           className="hidden"
           onChange={(e) => {
             if (e.target.files && e.target.files.length > 0) {

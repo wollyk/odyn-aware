@@ -1,31 +1,35 @@
-// /admin/evals video player + bbox overlay.
+// /admin/evals player + bbox overlay.
+//
+// Handles BOTH source kinds the eval can produce:
+//   - "video"    → <video src=/clip> streamed with HTTP Range, overlay
+//                  driven by requestAnimationFrame against currentTime
+//   - "sequence" → <img src=/frame/N> swapped by a setInterval driven
+//                  at the header's target_fps; overlay drawn from
+//                  frames[N] (frame N is BOTH the canvas frame and the
+//                  source image index — there's exactly one image per
+//                  emitted eval frame for sequence runs)
 //
 // The eval CLI writes a JSONL with one `frame` line per processed frame,
 // each carrying the bboxes the production pipeline would have emitted
-// at that timestamp. This component plays the source MP4 (streamed via
-// the /api/agent/evals/<id>/clip proxy with HTTP Range) and overlays
-// those bboxes on a <canvas> sized to match the <video>.
+// at that timestamp. The JSONL header's `source_kind` field tells this
+// component which playback strategy to use; older runs without that
+// field default to "video".
 //
-// Why a <video> + <canvas> instead of re-encoding the clip with bboxes
-// burnt in:
-//   - No server CPU spent re-encoding.
-//   - The operator can scrub freely, change config, and re-run; the
-//     overlay updates instantly with no extra work.
-//   - Bbox colors / labels / motion indicators can be tuned in CSS-time
-//     without touching the tracker.
+// Why a separate playback strategy for sequences instead of re-encoding
+// to MP4 server-side:
+//   - No ffmpeg dependency in the tracker venv
+//   - The display is identical visually (paint frame N + draw overlay)
+//   - Browser-side caching (Cache-Control: immutable on /frame/N) makes
+//     re-scrubbing instant after the first pass
 //
-// Sync model: the source video plays at native fps. Eval frames carry
-// `ts_s` (synthetic monotonic clock at target_fps). With the default
-// fps_cap=null, target_fps=native_fps and frame_skip=1, ts_s ≡
-// video.currentTime. With a lower fps_cap, ts_s still maps cleanly to
-// video time because frame_skip * frame_idx / native_fps = ts_s.
-//
-// We drive overlay redraws via requestAnimationFrame so the overlay
-// stays smooth at 60fps even while the video plays at 30. Lookup uses
-// a linear scan keyed by ts_s — for typical eval lengths (<10k frames)
-// this is plenty fast.
+// Sync model:
+//   - Video: source plays at native fps; eval frames carry `ts_s`
+//     (synthetic monotonic clock at target_fps). With default fps_cap
+//     and frame_skip=1, ts_s ≡ video.currentTime.
+//   - Sequence: there's no "real" clock; we advance currentFrameIdx at
+//     1000/target_fps ms intervals while playing.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type TrackEmit = {
   id: number;
@@ -49,6 +53,7 @@ type Frame = {
 
 type Header = {
   type: "header";
+  source_kind?: "video" | "sequence"; // missing on pre-13B runs ⇒ video
   video_fps: number;
   target_fps: number;
   frame_skip: number;
@@ -70,6 +75,7 @@ export function EvalPlayer({
   const [error, setError] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
 
@@ -77,6 +83,10 @@ export function EvalPlayer({
   const [videoTime, setVideoTime] = useState(0);
   const [showLabels, setShowLabels] = useState(true);
   const [showStatic, setShowStatic] = useState(true);
+  // Sequence-mode playback state. Ignored when source_kind === "video".
+  const [seqIdx, setSeqIdx] = useState(0);
+  const [seqPlaying, setSeqPlaying] = useState(false);
+  const isSequence = header?.source_kind === "sequence";
 
   // -- fetch JSONL ---------------------------------------------------------
   useEffect(() => {
@@ -134,8 +144,9 @@ export function EvalPlayer({
   const showStaticRef = useRef(showStatic);
   showStaticRef.current = showStatic;
 
+  // -- video-mode overlay loop --------------------------------------------
   useEffect(() => {
-    if (!header || frames.length === 0) return;
+    if (!header || frames.length === 0 || isSequence) return;
     const v = videoRef.current;
     const c = canvasRef.current;
     if (!v || !c) return;
@@ -166,7 +177,66 @@ export function EvalPlayer({
     return () => {
       cancelAnimationFrame(raf);
     };
-  }, [header, frames]);
+  }, [header, frames, isSequence]);
+
+  // -- sequence-mode playback loop ---------------------------------------
+  // Advances seqIdx at the header's target_fps while playing. The image
+  // element loads /frame/N on each idx change; the overlay redraw runs
+  // on every rAF so it stays glued even mid-image-load.
+  useEffect(() => {
+    if (!header || !isSequence || !seqPlaying) return;
+    const fps = header.target_fps || 10;
+    const stepMs = 1000 / Math.max(1, fps);
+    const interval = window.setInterval(() => {
+      setSeqIdx((prev) => {
+        const next = prev + 1;
+        if (next >= frames.length) {
+          // Auto-pause at end. User can press play to loop from 0.
+          setSeqPlaying(false);
+          return frames.length - 1;
+        }
+        return next;
+      });
+    }, stepMs);
+    return () => window.clearInterval(interval);
+  }, [header, isSequence, seqPlaying, frames.length]);
+
+  // -- sequence-mode overlay redraw --------------------------------------
+  // The img <-> canvas size sync is the same as video; we just key off
+  // the img instead of the video element.
+  useEffect(() => {
+    if (!header || frames.length === 0 || !isSequence) return;
+    const img = imgRef.current;
+    const c = canvasRef.current;
+    if (!img || !c) return;
+    const frame = frames[Math.max(0, Math.min(frames.length - 1, seqIdx))] ?? null;
+    setCurrentFrame(frame);
+
+    // rAF so the overlay updates after the img has laid out (the
+    // src change triggers a load+paint; we want to redraw the next
+    // tick to match).
+    let raf = 0;
+    const tick = () => {
+      drawOverlay(c, img, frame, {
+        showLabels: showLabelsRef.current,
+        showStatic: showStaticRef.current,
+      });
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [header, frames, isSequence, seqIdx]);
+
+  // -- sequence controls --------------------------------------------------
+  const seqStep = useCallback(
+    (delta: number) => {
+      setSeqPlaying(false);
+      setSeqIdx((prev) =>
+        Math.max(0, Math.min(frames.length - 1, prev + delta)),
+      );
+    },
+    [frames.length],
+  );
 
   // Per-track summary across the whole run — useful below the player.
   const trackSummary = useMemo(() => {
@@ -225,9 +295,16 @@ export function EvalPlayer({
         </span>
         <span className="text-foreground/85">{clipName}</span>
         <span className="text-foreground/40">
-          · {header.video_w}×{header.video_h} · native{" "}
-          {Number(header.video_fps).toFixed(1)}fps · processed{" "}
-          {Number(header.target_fps).toFixed(1)}fps · {frames.length} frames
+          · {header.video_w}×{header.video_h} ·{" "}
+          {isSequence ? (
+            <>image sequence · {Number(header.target_fps).toFixed(1)}fps</>
+          ) : (
+            <>
+              native {Number(header.video_fps).toFixed(1)}fps · processed{" "}
+              {Number(header.target_fps).toFixed(1)}fps
+            </>
+          )}{" "}
+          · {frames.length} frames
         </span>
       </div>
 
@@ -235,20 +312,97 @@ export function EvalPlayer({
         ref={wrapRef}
         className="relative inline-block max-w-full overflow-hidden border border-foreground/15 bg-black"
       >
-        <video
-          ref={videoRef}
-          src={`/api/agent/evals/${runId}/clip`}
-          controls
-          playsInline
-          preload="metadata"
-          className="block max-w-full"
-          style={{ maxHeight: 640 }}
-        />
+        {isSequence ? (
+          <img
+            ref={imgRef}
+            src={`/api/agent/evals/${runId}/frame/${seqIdx}`}
+            alt={`frame ${seqIdx}`}
+            // Hint the layout engine so the canvas overlay knows what
+            // CSS pixel size to draw into before the first frame loads.
+            width={header.video_w || undefined}
+            height={header.video_h || undefined}
+            draggable={false}
+            className="block max-w-full select-none"
+            style={{ maxHeight: 640 }}
+          />
+        ) : (
+          <video
+            ref={videoRef}
+            src={`/api/agent/evals/${runId}/clip`}
+            controls
+            playsInline
+            preload="metadata"
+            className="block max-w-full"
+            style={{ maxHeight: 640 }}
+          />
+        )}
         <canvas
           ref={canvasRef}
           className="pointer-events-none absolute left-0 top-0"
         />
       </div>
+
+      {isSequence && (
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-foreground/70">
+          <button
+            type="button"
+            onClick={() => seqStep(-10)}
+            disabled={seqIdx === 0}
+            className="border border-foreground/20 px-2 py-0.5 text-foreground/85 hover:border-foreground/45 disabled:opacity-30"
+          >
+            ⏮ −10
+          </button>
+          <button
+            type="button"
+            onClick={() => seqStep(-1)}
+            disabled={seqIdx === 0}
+            className="border border-foreground/20 px-2 py-0.5 text-foreground/85 hover:border-foreground/45 disabled:opacity-30"
+          >
+            ◀ −1
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (seqIdx >= frames.length - 1) setSeqIdx(0);
+              setSeqPlaying((p) => !p);
+            }}
+            className="border border-foreground/30 bg-foreground/5 px-3 py-0.5 text-foreground/85 hover:bg-foreground/10"
+          >
+            {seqPlaying ? "⏸ pause" : "▶ play"}
+          </button>
+          <button
+            type="button"
+            onClick={() => seqStep(1)}
+            disabled={seqIdx >= frames.length - 1}
+            className="border border-foreground/20 px-2 py-0.5 text-foreground/85 hover:border-foreground/45 disabled:opacity-30"
+          >
+            ▶ +1
+          </button>
+          <button
+            type="button"
+            onClick={() => seqStep(10)}
+            disabled={seqIdx >= frames.length - 1}
+            className="border border-foreground/20 px-2 py-0.5 text-foreground/85 hover:border-foreground/45 disabled:opacity-30"
+          >
+            ⏭ +10
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, frames.length - 1)}
+            value={seqIdx}
+            onChange={(e) => {
+              setSeqPlaying(false);
+              setSeqIdx(Number(e.target.value));
+            }}
+            className="flex-1 min-w-[200px]"
+            aria-label="frame scrubber"
+          />
+          <span className="text-foreground/55 tabular-nums">
+            {seqIdx + 1} / {frames.length}
+          </span>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-3 font-mono text-[11px] text-foreground/70">
         <div className="flex items-center gap-4">
@@ -270,7 +424,12 @@ export function EvalPlayer({
           </label>
         </div>
         <div className="text-foreground/55">
-          t = {videoTime.toFixed(2)}s
+          t ={" "}
+          {(isSequence
+            ? currentFrame?.ts_s ?? 0
+            : videoTime
+          ).toFixed(2)}
+          s
           {currentFrame ? (
             <>
               {" · "}
@@ -398,16 +557,17 @@ function findClosestFrame(frames: Frame[], t: number): number {
 
 function drawOverlay(
   canvas: HTMLCanvasElement,
-  video: HTMLVideoElement,
+  source: HTMLVideoElement | HTMLImageElement,
   frame: Frame | null,
   opts: { showLabels: boolean; showStatic: boolean },
 ) {
-  // Size the canvas to match the video's displayed size so coordinates
+  // Size the canvas to match the source's displayed size so coordinates
   // line up. Internal canvas size is set to the displayed CSS size in
-  // device pixels for crispness on HiDPI.
+  // device pixels for crispness on HiDPI. Works for both <video> and
+  // <img> — both expose clientWidth/clientHeight in CSS pixels.
   const dpr = window.devicePixelRatio || 1;
-  const w = video.clientWidth;
-  const h = video.clientHeight;
+  const w = source.clientWidth;
+  const h = source.clientHeight;
   if (w === 0 || h === 0) return;
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);

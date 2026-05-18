@@ -110,32 +110,136 @@ def hash_config(cfg: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Frame source
 # ---------------------------------------------------------------------------
-def _open_video(path: str) -> tuple[Any, float, int, int, int]:
-    """Open a video file with OpenCV. Returns (cap, fps, width, height, n_frames).
+# The eval reads frames from either:
+#   1. A video file (cv2.VideoCapture path) — native fps from container
+#   2. A directory of images (.tif / .jpg / .png in sorted order) — synthetic
+#      fps because image-sequence datasets like UCSD don't carry one.
+#
+# The directory branch is what makes pictures-as-input work: production
+# inference already runs on snapshots from Frigate, so an image sequence
+# is the more representative input shape. Both branches yield PIL.Image
+# objects so the rest of the pipeline is source-agnostic.
 
-    cv2 is pulled transitively by ultralytics, so it's always present in
-    the tracker venv. We import locally so the rest of the module can
-    be imported in environments without cv2 (e.g. unit tests).
+_IMAGE_EXTS = (".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp", ".webp")
+# Default fps assumed for image-sequence sources when the user doesn't
+# pass --fps. UCSD is recorded at 10 Hz; most surveillance datasets sit
+# in the 5-15 Hz range. 10 is a safe middle.
+DEFAULT_SEQUENCE_FPS = 10.0
+
+
+class _FrameSource:
+    """Common interface over video file + image-sequence sources.
+
+    Attributes:
+      kind       — "video" or "sequence" (recorded in JSONL header for the UI)
+      native_fps — float; container fps for videos, DEFAULT_SEQUENCE_FPS for sequences
+      width/height — measured from the first frame
+      n_frames   — total count when known (0 for live-style video w/o index)
     """
-    import cv2  # type: ignore
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"video_open_failed: {path}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    return cap, fps, width, height, n_frames
+    kind: str
+    native_fps: float
+    width: int
+    height: int
+    n_frames: int
+
+    def read(self):  # -> PIL.Image | None
+        raise NotImplementedError
+
+    def release(self) -> None:
+        raise NotImplementedError
 
 
-def _frame_to_pil(frame_bgr: Any):
-    """cv2 hands back BGR ndarray; PIL wants RGB."""
-    import cv2  # type: ignore
-    from PIL import Image
+class _VideoFrameSource(_FrameSource):
+    def __init__(self, path: str):
+        import cv2  # type: ignore  # cv2 is pulled by ultralytics, always present
 
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
+        self.kind = "video"
+        self._cv2 = cv2
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"video_open_failed: {path}")
+        self._cap = cap
+        self.native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        self.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    def read(self):
+        ok, frame_bgr = self._cap.read()
+        if not ok:
+            return None
+        from PIL import Image
+
+        rgb = self._cv2.cvtColor(frame_bgr, self._cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+
+    def release(self) -> None:
+        self._cap.release()
+
+
+class _SequenceFrameSource(_FrameSource):
+    """Read a directory of images in sorted-filename order.
+
+    Hidden files and .gt/_gt folders (UCSD groundtruth masks) are
+    skipped. PIL handles TIFF natively — same code path as JPEG.
+    """
+
+    def __init__(self, path: str):
+        self.kind = "sequence"
+        root = Path(path)
+        if not root.is_dir():
+            raise RuntimeError(f"sequence_dir_not_found: {path}")
+        # Skip groundtruth folders next door — UCSD ships them as
+        # `Test004_gt/` siblings of `Test004/`. Operator shouldn't see
+        # those as candidates.
+        files = sorted(
+            p for p in root.iterdir()
+            if p.is_file()
+            and not p.name.startswith(".")
+            and p.suffix.lower() in _IMAGE_EXTS
+        )
+        if not files:
+            raise RuntimeError(f"no_images_in_dir: {path}")
+        self._files = files
+        self._i = 0
+        self.n_frames = len(files)
+        self.native_fps = DEFAULT_SEQUENCE_FPS
+        # Probe the first frame for dimensions. PIL is lazy so we have
+        # to .load() (or read width/height which forces decode of the
+        # IFD only — cheap).
+        from PIL import Image
+
+        with Image.open(files[0]) as probe:
+            self.width = int(probe.width)
+            self.height = int(probe.height)
+
+    def read(self):
+        if self._i >= len(self._files):
+            return None
+        from PIL import Image
+
+        p = self._files[self._i]
+        self._i += 1
+        with Image.open(p) as im:
+            # convert("RGB") forces full decode + drops alpha/palette
+            # quirks so YOLO sees a plain HxWx3 ndarray downstream.
+            return im.convert("RGB")
+
+    def release(self) -> None:
+        pass
+
+
+def _open_source(path: str) -> _FrameSource:
+    """Pick the right frame source based on what `path` points to.
+
+    A directory → image sequence; a file with a video extension or
+    anything else → video (cv2 will raise if it really can't decode).
+    """
+    p = Path(path)
+    if p.is_dir():
+        return _SequenceFrameSource(str(p))
+    return _VideoFrameSource(str(p))
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +265,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     started_at = time.time()
     print(f"[eval:{run_id}] starting · video={args.video} cfg={hash_config(cfg)}", flush=True)
 
-    cap, native_fps, vw, vh, n_frames = _open_video(args.video)
+    src = _open_source(args.video)
+    native_fps = src.native_fps
+    vw, vh, n_frames = src.width, src.height, src.n_frames
     target_fps = cfg["fps_cap"] or native_fps
     frame_skip = max(1, round(native_fps / target_fps)) if target_fps and native_fps > target_fps else 1
 
@@ -187,6 +293,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             "version": 1,
             "run_id": run_id,
             "video": str(Path(args.video).resolve()),
+            # `source_kind` lets the player decide between <video> + Range
+            # streaming (for "video") and per-frame canvas drawing (for
+            # "sequence"). Older runs without this field default to "video".
+            "source_kind": src.kind,
             "video_fps": round(native_fps, 3),
             "target_fps": round(target_fps, 3),
             "frame_skip": frame_skip,
@@ -206,8 +316,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_frames = cfg["max_frames"]
         try:
             while True:
-                ok, frame_bgr = cap.read()
-                if not ok:
+                pil = src.read()
+                if pil is None:
                     break
                 if frame_idx % frame_skip != 0:
                     frame_idx += 1
@@ -215,7 +325,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if max_frames and kept_idx >= max_frames:
                     break
 
-                pil = _frame_to_pil(frame_bgr)
                 ow, oh = pil.size
                 t0 = time.monotonic()
                 results = model.track(
@@ -363,7 +472,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 kept_idx += 1
                 frame_idx += 1
         finally:
-            cap.release()
+            src.release()
 
         # Trailer summary line.
         finished_at = time.time()

@@ -31,6 +31,12 @@ tsconfig.tsbuildinfo
 api.out.log
 api.err.log
 
+# Local test datasets (UCSD, etc) — do NOT commit; they're 100s of MB
+# and we upload smaller selected subsets to the server via /admin/evals.
+UCSD_Anomaly_Dataset*/
+*.tar
+*.tar.gz
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

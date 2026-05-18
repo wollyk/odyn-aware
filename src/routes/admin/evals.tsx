@@ -34,6 +34,10 @@ export const Route = createFileRoute("/admin/evals")({
 
 type CorpusClip = {
   path: string;
+  // `kind` distinguishes single videos from extracted image sequences.
+  // Older tracker builds don't return this field; we default to "video".
+  kind?: "video" | "sequence";
+  frames?: number;
   size_bytes: number;
   mtime: number;
 };
@@ -377,7 +381,10 @@ function AdminEvals() {
                   >
                     {corpus?.clips.map((c) => (
                       <option key={c.path} value={c.path}>
-                        {c.path} · {formatBytes(c.size_bytes)}
+                        {c.path}
+                        {c.kind === "sequence"
+                          ? ` · seq · ${c.frames ?? "?"} frames · ${formatBytes(c.size_bytes)}`
+                          : ` · ${formatBytes(c.size_bytes)}`}
                       </option>
                     ))}
                   </select>
