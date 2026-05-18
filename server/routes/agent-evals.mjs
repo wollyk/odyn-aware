@@ -91,10 +91,13 @@ const ALLOWED_UPLOAD_EXTS = new Set([
 // retry-after-failure deterministic — the client can re-POST chunk N if it
 // times out — and avoids any seek/seek/seek race shape on the server.
 const CHUNK_UPLOAD_DIR = path.join(os.tmpdir(), "auroraview-uploads");
-// Cap each chunk body. Set well above the client's 512 KB target so
-// retransmits with slightly-different sizes still pass, but well below
-// the upstream nginx 1 MB ceiling so chunks themselves never trigger a 413.
-const MAX_CHUNK_BYTES = 768 * 1024;
+// Cap each chunk body. The public TLS proxy in front of auroraview.tech
+// is configured with client_max_body_size ~64 KB, so anything above that
+// gets a 413 from nginx BEFORE the request reaches Node. We allow a
+// comfortable bit of headroom over the client's 48 KB default so an
+// occasional larger chunk (e.g. last partial chunk of a file) doesn't
+// trip a 413 from us, but stay well under 64 KB.
+const MAX_CHUNK_BYTES = 60 * 1024;
 // Sessions older than this with no activity are GC'd on the next sweep.
 const CHUNK_SESSION_TTL_MS = 60 * 60 * 1000;
 const CHUNK_GC_INTERVAL_MS = 5 * 60 * 1000;

@@ -22,10 +22,14 @@
 import { useCallback, useRef, useState } from "react";
 
 export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB
-// Chunk size on the wire. Kept well below the 1 MB upstream nginx ceiling
-// (with headroom for HTTP overhead and TLS framing) so no individual
-// request can ever trigger a 413 on the public proxy.
-const CHUNK_BYTES = 512 * 1024;
+// Chunk size on the wire. The public TLS proxy in front of
+// auroraview.tech is configured with client_max_body_size ~64KB
+// (verified by probing chunk sizes against /upload/chunk), so every
+// individual request body has to land below that. 48 KB gives ample
+// headroom for HTTP+TLS framing overhead. The server advertises its
+// own ceiling via /upload/start's max_chunk_bytes; we clamp to the
+// smaller of the two below.
+const CHUNK_BYTES = 48 * 1024;
 // `.zip` is for image-sequence uploads (e.g. UCSD dataset folders).
 // The tracker extracts the zip into a sequence directory under the
 // corpus dir. Production inference uses single JPEG snapshots, so a
