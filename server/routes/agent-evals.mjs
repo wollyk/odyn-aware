@@ -23,6 +23,12 @@
 //   - "Who started this run" attribution lives only in the Node session.
 
 import { z } from "zod";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import {
   upsertEvalRun,
   listEvalRuns,
@@ -64,6 +70,102 @@ const MAX_UPLOAD_BYTES = Number(
 const ALLOWED_UPLOAD_EXTS = new Set([
   ".mp4", ".mov", ".mkv", ".webm", ".avi", ".zip",
 ]);
+
+// -- chunked upload state ----------------------------------------------------
+//
+// Why this exists: the public TLS proxy in front of auroraview.tech enforces
+// a 1 MB client_max_body_size on POSTs. The single-shot /upload route works
+// only for tiny files (and is unreachable for anything bigger). Chunking
+// keeps every individual request under that ceiling while still landing a
+// 500 MB file end-to-end. The server reassembles into a single .part file
+// on the DL380's local disk, then streams that file to the tracker's
+// /eval/corpus/upload endpoint over loopback (no nginx in the path) so the
+// full size limit applies only once and only for the local hop.
+//
+// Storage layout:
+//   /tmp/auroraview-uploads/<upload_id>.part
+//
+// Each .part file is the raw concatenation of received chunks. Strict
+// sequential ordering is enforced: chunk N must arrive after chunk N-1 with
+// the running byte count matching what the server already wrote. That makes
+// retry-after-failure deterministic — the client can re-POST chunk N if it
+// times out — and avoids any seek/seek/seek race shape on the server.
+const CHUNK_UPLOAD_DIR = path.join(os.tmpdir(), "auroraview-uploads");
+// Cap each chunk body. Set well above the client's 512 KB target so
+// retransmits with slightly-different sizes still pass, but well below
+// the upstream nginx 1 MB ceiling so chunks themselves never trigger a 413.
+const MAX_CHUNK_BYTES = 768 * 1024;
+// Sessions older than this with no activity are GC'd on the next sweep.
+const CHUNK_SESSION_TTL_MS = 60 * 60 * 1000;
+const CHUNK_GC_INTERVAL_MS = 5 * 60 * 1000;
+
+const _chunkSessions = new Map(); // upload_id -> session record
+
+async function _ensureChunkDir() {
+  await fsp.mkdir(CHUNK_UPLOAD_DIR, { recursive: true });
+}
+
+async function _gcChunkSessions() {
+  const now = Date.now();
+  // First clear out in-memory sessions that exceeded the TTL.
+  for (const [id, s] of _chunkSessions) {
+    if (now - s.lastSeenAt > CHUNK_SESSION_TTL_MS) {
+      _chunkSessions.delete(id);
+      try {
+        await fsp.unlink(s.partPath);
+      } catch {
+        /* already gone or never created */
+      }
+    }
+  }
+  // Then sweep orphan files on disk (server restart leaves files behind).
+  try {
+    const entries = await fsp.readdir(CHUNK_UPLOAD_DIR);
+    for (const f of entries) {
+      if (!f.endsWith(".part")) continue;
+      const p = path.join(CHUNK_UPLOAD_DIR, f);
+      try {
+        const st = await fsp.stat(p);
+        if (now - st.mtimeMs > CHUNK_SESSION_TTL_MS) {
+          await fsp.unlink(p);
+        }
+      } catch {
+        /* race with another GC pass */
+      }
+    }
+  } catch {
+    /* dir not created yet */
+  }
+}
+
+let _gcStarted = false;
+function _startGcOnce() {
+  if (_gcStarted) return;
+  _gcStarted = true;
+  // unref() so the interval doesn't block a graceful shutdown.
+  const t = setInterval(() => {
+    _gcChunkSessions().catch(() => {});
+  }, CHUNK_GC_INTERVAL_MS);
+  if (typeof t.unref === "function") t.unref();
+}
+
+async function _readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      total += c.length;
+      if (total > limit) {
+        reject(Object.assign(new Error("chunk_too_large"), { code: "chunk_too_large" }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
 
 const runSchema = z.object({
   clip: z.string().min(1).max(512),
@@ -180,6 +282,227 @@ export async function register(req, res, url, ctx) {
       }
       send(res, upstream.status, body ?? { ok: upstream.ok });
     } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- chunked upload: start ----------------------------------------------
+  //
+  // Mints an upload_id, creates an empty .part file under CHUNK_UPLOAD_DIR,
+  // and records a session in memory. The client then sends N chunks via
+  // /upload/chunk and finally /upload/complete which streams the assembled
+  // file to the tracker. Body is small — no rate limiting needed here.
+  if (req.method === "POST" && url.pathname === "/api/agent/evals/upload/start") {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    let body;
+    try {
+      body = await readJson(req, 4 * 1024);
+    } catch {
+      body = {};
+    }
+    const rawName = String(body?.name ?? "");
+    const safeName = rawName.replace(/^.*[\\/]/, "");
+    const dotIdx = safeName.lastIndexOf(".");
+    const ext = dotIdx > 0 ? safeName.slice(dotIdx).toLowerCase() : "";
+    if (!safeName || !ALLOWED_UPLOAD_EXTS.has(ext)) {
+      send(res, 415, { error: "unsupported_extension", got: ext });
+      return true;
+    }
+    const totalSize = Number(body?.size ?? 0);
+    if (!Number.isFinite(totalSize) || totalSize <= 0) {
+      send(res, 400, { error: "bad_size" });
+      return true;
+    }
+    if (totalSize > MAX_UPLOAD_BYTES) {
+      send(res, 413, { error: "file_too_large", limit: MAX_UPLOAD_BYTES });
+      return true;
+    }
+    try {
+      await _ensureChunkDir();
+      _startGcOnce();
+      const uploadId = randomUUID();
+      const partPath = path.join(CHUNK_UPLOAD_DIR, `${uploadId}.part`);
+      // Touch the file so we can append later.
+      await fsp.writeFile(partPath, Buffer.alloc(0));
+      _chunkSessions.set(uploadId, {
+        name: safeName,
+        ext,
+        totalSize,
+        partPath,
+        receivedBytes: 0,
+        nextChunkIndex: 0,
+        createdAt: Date.now(),
+        lastSeenAt: Date.now(),
+        owner: me.email,
+      });
+      send(res, 200, {
+        upload_id: uploadId,
+        max_chunk_bytes: MAX_CHUNK_BYTES,
+      });
+    } catch (err) {
+      send(res, 500, { error: "start_failed", detail: err.message });
+    }
+    return true;
+  }
+
+  // -- chunked upload: append one chunk -----------------------------------
+  //
+  // Body is the raw chunk (octet-stream). Query params:
+  //   id  — upload_id minted by /start
+  //   n   — chunk index, strictly sequential starting at 0
+  //
+  // The server appends the body to the .part file. If `n` doesn't match
+  // the expected next-index we return 409 with the expected number so the
+  // client can rewind. This makes retries deterministic.
+  if (req.method === "POST" && url.pathname === "/api/agent/evals/upload/chunk") {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    const id = url.searchParams.get("id") ?? "";
+    const n = Number(url.searchParams.get("n") ?? "-1");
+    if (!id || !Number.isInteger(n) || n < 0) {
+      send(res, 400, { error: "bad_params" });
+      return true;
+    }
+    const session = _chunkSessions.get(id);
+    if (!session) {
+      send(res, 404, { error: "unknown_upload" });
+      return true;
+    }
+    if (session.owner !== me.email) {
+      send(res, 403, { error: "not_your_upload" });
+      return true;
+    }
+    if (n !== session.nextChunkIndex) {
+      send(res, 409, {
+        error: "out_of_order",
+        expected: session.nextChunkIndex,
+        got: n,
+      });
+      return true;
+    }
+    const cl = Number(req.headers["content-length"] ?? "0");
+    if (Number.isFinite(cl) && cl > MAX_CHUNK_BYTES) {
+      send(res, 413, { error: "chunk_too_large", limit: MAX_CHUNK_BYTES });
+      return true;
+    }
+    let buf;
+    try {
+      buf = await _readBody(req, MAX_CHUNK_BYTES);
+    } catch (err) {
+      if (err?.code === "chunk_too_large") {
+        send(res, 413, { error: "chunk_too_large", limit: MAX_CHUNK_BYTES });
+      } else {
+        send(res, 400, { error: "bad_body", detail: err?.message });
+      }
+      return true;
+    }
+    if (buf.length === 0) {
+      send(res, 400, { error: "empty_chunk" });
+      return true;
+    }
+    if (session.receivedBytes + buf.length > session.totalSize) {
+      send(res, 413, {
+        error: "exceeds_declared_size",
+        declared: session.totalSize,
+        received: session.receivedBytes,
+        chunk: buf.length,
+      });
+      return true;
+    }
+    try {
+      await fsp.appendFile(session.partPath, buf);
+    } catch (err) {
+      send(res, 500, { error: "append_failed", detail: err.message });
+      return true;
+    }
+    session.receivedBytes += buf.length;
+    session.nextChunkIndex += 1;
+    session.lastSeenAt = Date.now();
+    send(res, 200, {
+      received_bytes: session.receivedBytes,
+      next_chunk_index: session.nextChunkIndex,
+    });
+    return true;
+  }
+
+  // -- chunked upload: complete -------------------------------------------
+  //
+  // Streams the assembled .part file to the tracker's /eval/corpus/upload
+  // endpoint (loopback, no public-proxy nginx in the path). Returns whatever
+  // the tracker returns, then deletes the .part file. On any failure we
+  // keep the .part file in place so the GC can clean it up after the TTL.
+  if (req.method === "POST" && url.pathname === "/api/agent/evals/upload/complete") {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    if (!EVAL_SECRET) {
+      send(res, 503, { error: "eval_secret_unset" });
+      return true;
+    }
+    const id = url.searchParams.get("id") ?? "";
+    const session = _chunkSessions.get(id);
+    if (!session) {
+      send(res, 404, { error: "unknown_upload" });
+      return true;
+    }
+    if (session.owner !== me.email) {
+      send(res, 403, { error: "not_your_upload" });
+      return true;
+    }
+    if (session.receivedBytes !== session.totalSize) {
+      send(res, 400, {
+        error: "size_mismatch",
+        declared: session.totalSize,
+        received: session.receivedBytes,
+      });
+      return true;
+    }
+    const overrideName = (url.searchParams.get("name") ?? "").trim();
+    const finalName = (overrideName || session.name).replace(/^.*[\\/]/, "");
+    const dotIdx = finalName.lastIndexOf(".");
+    const ext = dotIdx > 0 ? finalName.slice(dotIdx).toLowerCase() : "";
+    if (!ALLOWED_UPLOAD_EXTS.has(ext)) {
+      send(res, 415, { error: "unsupported_extension", got: ext });
+      return true;
+    }
+    const partPath = session.partPath;
+    try {
+      // Drop in-memory session now; even if the upstream upload fails we
+      // don't want the client to retry the same id (it would re-stream
+      // bytes we already consumed). The .part file is cleaned up below.
+      _chunkSessions.delete(id);
+
+      const fileStream = fs.createReadStream(partPath);
+      const upstream = await fetch(
+        `${TRACKER_HTTP_BASE}/eval/corpus/upload?name=${encodeURIComponent(finalName)}`,
+        {
+          method: "POST",
+          headers: {
+            "x-eval-secret": EVAL_SECRET,
+            "content-type": "application/octet-stream",
+            "content-length": String(session.totalSize),
+          },
+          body: Readable.toWeb(fileStream),
+          duplex: "half",
+        },
+      );
+      const txt = await upstream.text();
+      let upBody;
+      try {
+        upBody = txt ? JSON.parse(txt) : null;
+      } catch {
+        upBody = { raw: txt };
+      }
+      try {
+        await fsp.unlink(partPath);
+      } catch {
+        /* GC will clean up later */
+      }
+      send(res, upstream.status, upBody ?? { ok: upstream.ok });
+    } catch (err) {
+      // Leave .part file for the GC sweep so a transient tracker hiccup
+      // doesn't lose 500 MB of bytes mid-upload.
       send(res, 502, { error: "tracker_unreachable", detail: err.message });
     }
     return true;

@@ -40,6 +40,12 @@ type CorpusClip = {
   frames?: number;
   size_bytes: number;
   mtime: number;
+  // Set true by the tracker while an ffmpeg transcode is in flight
+  // (e.g. .avi → .mp4 so the HTML5 player can decode it). The UI greys
+  // out the Start Eval button and shows a "transcoding…" badge until
+  // the flag clears.
+  transcoding?: boolean;
+  transcode_error?: string;
 };
 
 type CorpusResp = {
@@ -219,18 +225,34 @@ function AdminEvals() {
   useEffect(() => {
     if (state !== "ok") return;
     fetchAll();
-    // Poll the list while anything is running. The list endpoint hydrates
-    // running rows lazily, so this is the only refresh we need.
+    // Poll while anything is running OR while any clip is mid-transcode.
+    // Eval rows hydrate themselves lazily; corpus transcoding state only
+    // updates on a corpus list, so we have to drive the refresh from
+    // either side. 5s is a balance between snappy UI and tracker load.
     const t = setInterval(() => {
       const anyRunning = rowsRef.current.some((r) => r.status === "running");
-      if (anyRunning) fetchAll();
+      const anyTranscoding = (corpusRef.current?.clips ?? []).some(
+        (c) => c.transcoding === true,
+      );
+      if (anyRunning || anyTranscoding) fetchAll();
     }, 5_000);
     return () => clearInterval(t);
   }, [state, fetchAll]);
 
-  // Keep a ref of rows so the interval closure sees fresh data.
+  // Keep refs of rows + corpus so the interval closure sees fresh data
+  // without having to retrigger setInterval on every state change.
   const rowsRef = useMemo(() => ({ current: rows }), [rows]);
   rowsRef.current = rows;
+  const corpusRef = useMemo(() => ({ current: corpus }), [corpus]);
+  corpusRef.current = corpus;
+
+  // Resolve the currently-selected corpus clip record (or null). Used to
+  // disable Start Eval + Delete while an ffmpeg transcode is in flight.
+  const selectedClipRecord = useMemo(
+    () => corpus?.clips.find((c) => c.path === clip) ?? null,
+    [corpus, clip],
+  );
+  const selectedClipTranscoding = selectedClipRecord?.transcoding === true;
 
   async function submitRun(e: React.FormEvent) {
     e.preventDefault();
@@ -385,23 +407,39 @@ function AdminEvals() {
                         {c.kind === "sequence"
                           ? ` · seq · ${c.frames ?? "?"} frames · ${formatBytes(c.size_bytes)}`
                           : ` · ${formatBytes(c.size_bytes)}`}
+                        {c.transcoding ? " · transcoding…" : ""}
                       </option>
                     ))}
                   </select>
                   <button
                     type="button"
                     onClick={deleteSelectedClip}
-                    disabled={!clip || deletingClip}
+                    disabled={!clip || deletingClip || selectedClipTranscoding}
                     title={
-                      clip
-                        ? `Delete "${clip}" from corpus`
-                        : "Pick a clip first"
+                      selectedClipTranscoding
+                        ? "Wait for transcode to finish before deleting"
+                        : clip
+                          ? `Delete "${clip}" from corpus`
+                          : "Pick a clip first"
                     }
                     className="shrink-0 border border-foreground/15 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-foreground/55 hover:border-red-400/40 hover:text-red-300 disabled:opacity-30 disabled:hover:border-foreground/15 disabled:hover:text-foreground/55"
                   >
                     {deletingClip ? "…" : "× delete"}
                   </button>
                 </div>
+                {selectedClipTranscoding && (
+                  <p className="mt-1 font-mono text-[10px] uppercase tracking-widest text-amber-300/85">
+                    transcoding to mp4 for in-browser playback — eval will be available shortly
+                  </p>
+                )}
+                {selectedClipRecord?.transcode_error && (
+                  <p
+                    className="mt-1 font-mono text-[10px] uppercase tracking-widest text-red-300/85"
+                    title={selectedClipRecord.transcode_error}
+                  >
+                    transcode failed — eval will run on source but Watch may be blank
+                  </p>
+                )}
               </Field>
               <Field label="Run name (optional)">
                 <input
@@ -495,10 +533,19 @@ function AdminEvals() {
               <div className="flex items-center justify-end md:col-span-2">
                 <button
                   type="submit"
-                  disabled={posting || !clip}
+                  disabled={posting || !clip || selectedClipTranscoding}
+                  title={
+                    selectedClipTranscoding
+                      ? "Wait for transcode to finish before running eval"
+                      : ""
+                  }
                   className="border border-foreground/30 bg-foreground/5 px-3 py-1.5 font-mono text-xs uppercase tracking-widest text-foreground/85 hover:bg-foreground/10 disabled:opacity-40"
                 >
-                  {posting ? "starting…" : "▶ start eval"}
+                  {posting
+                    ? "starting…"
+                    : selectedClipTranscoding
+                      ? "transcoding…"
+                      : "▶ start eval"}
                 </button>
               </div>
             </form>

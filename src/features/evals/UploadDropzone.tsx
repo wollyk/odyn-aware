@@ -1,22 +1,31 @@
 // Browser-side eval-corpus uploader.
 //
-// Drop one or more video files (or click to pick). Each file is sent as
-// a raw-body POST to /api/agent/evals/upload with ?name=<filename>.
-// Uploads run sequentially so an admin uploading several clips on a
-// slow connection doesn't saturate the link or compete for tracker disk
-// throughput.
+// Files are uploaded in CHUNKS to /api/agent/evals/upload/{start,chunk,
+// complete}. The single-shot /upload route still exists but is bypassed
+// here because the public TLS proxy in front of auroraview.tech enforces
+// a 1 MB body limit on POSTs, which silently breaks anything bigger than
+// a 1 MB file. Chunking sidesteps that ceiling by sending many small
+// requests instead of one large one, with the server reassembling them
+// on disk before forwarding to the tracker.
 //
-// XHR (not fetch) is used because we need upload-progress events for
-// the per-file progress bar, which the fetch() API still doesn't expose
-// in any browser. The tracker doesn't care which client we use.
+// Flow per file:
+//   1. POST /upload/start { name, size } → { upload_id, max_chunk_bytes }
+//   2. For each CHUNK_BYTES slice of the file, POST /upload/chunk?id&n
+//      with the binary slice as the body. The server enforces strict
+//      sequential ordering (n must equal nextChunkIndex), and 409s with
+//      the expected number on mismatch so retries are deterministic.
+//   3. POST /upload/complete?id&name → tracker JSON
 //
-// Validation happens twice on the client (extension + size) so the user
-// gets immediate feedback before bytes go on the wire. The tracker
-// re-validates everything authoritatively.
+// Uploads run sequentially across files so an admin uploading several
+// clips on a slow connection doesn't saturate the link.
 
 import { useCallback, useRef, useState } from "react";
 
 export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB
+// Chunk size on the wire. Kept well below the 1 MB upstream nginx ceiling
+// (with headroom for HTTP overhead and TLS framing) so no individual
+// request can ever trigger a 413 on the public proxy.
+const CHUNK_BYTES = 512 * 1024;
 // `.zip` is for image-sequence uploads (e.g. UCSD dataset folders).
 // The tracker extracts the zip into a sequence directory under the
 // corpus dir. Production inference uses single JPEG snapshots, so a
@@ -60,46 +69,95 @@ function extOf(name: string) {
   return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
-function uploadOne(
+type StartResponse = { upload_id: string; max_chunk_bytes?: number };
+
+async function _postJson<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    /* not JSON — likely an upstream nginx error page (413, 502, …) */
+  }
+  if (!res.ok) {
+    const errObj = (parsed ?? {}) as { error?: string; detail?: string };
+    const msg = errObj.error || errObj.detail || `HTTP_${res.status}`;
+    throw new Error(msg);
+  }
+  return parsed as T;
+}
+
+async function _putChunk(
+  uploadId: string,
+  n: number,
+  chunk: Blob,
+): Promise<void> {
+  const res = await fetch(
+    `/api/agent/evals/upload/chunk?id=${encodeURIComponent(uploadId)}&n=${n}`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/octet-stream" },
+      body: chunk,
+    },
+  );
+  if (!res.ok) {
+    let msg = `HTTP_${res.status}`;
+    try {
+      const j = (await res.json()) as { error?: string; detail?: string };
+      msg = j.error || j.detail || msg;
+    } catch {
+      /* keep msg */
+    }
+    throw new Error(msg);
+  }
+}
+
+async function uploadOne(
   file: File,
   onProgress: (frac: number) => void,
 ): Promise<UploadedClip> {
-  return new Promise<UploadedClip>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) onProgress(e.loaded / e.total);
-    });
-    xhr.addEventListener("load", () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText) as UploadedClip);
-        } catch {
-          reject(new Error("bad_response"));
-        }
-      } else {
-        let msg = `http_${xhr.status}`;
-        try {
-          const j = JSON.parse(xhr.responseText);
-          msg = j.error || j.detail || msg;
-        } catch {
-          /* keep msg */
-        }
-        reject(new Error(msg));
-      }
-    });
-    xhr.addEventListener("error", () => reject(new Error("network_error")));
-    xhr.addEventListener("abort", () => reject(new Error("aborted")));
-    xhr.open(
-      "POST",
-      `/api/agent/evals/upload?name=${encodeURIComponent(file.name)}`,
-    );
-    xhr.withCredentials = true;
-    xhr.setRequestHeader(
-      "content-type",
-      file.type || "application/octet-stream",
-    );
-    xhr.send(file);
-  });
+  // 1. Start the chunked session so we have an upload_id.
+  const start = await _postJson<StartResponse>(
+    "/api/agent/evals/upload/start",
+    { name: file.name, size: file.size, content_type: file.type || null },
+  );
+  const uploadId = start.upload_id;
+  if (!uploadId) throw new Error("no_upload_id");
+
+  // The server advertises its own max chunk size; honor it if it's
+  // smaller than our default. Larger is fine — we just clamp to our
+  // safe default to keep individual requests below the proxy ceiling.
+  const chunkSize = Math.min(start.max_chunk_bytes ?? CHUNK_BYTES, CHUNK_BYTES);
+  const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+
+  // 2. Push each chunk sequentially. Progress is reported on chunk
+  // boundaries — finer than per-chunk byte counts would buy us, given
+  // 512 KB chunks and a typical ~10 MB/s wifi link.
+  let sent = 0;
+  for (let i = 0; i < totalChunks; i += 1) {
+    const start_b = i * chunkSize;
+    const end_b = Math.min(file.size, start_b + chunkSize);
+    const slice = file.slice(start_b, end_b);
+    await _putChunk(uploadId, i, slice);
+    sent = end_b;
+    onProgress(file.size > 0 ? sent / file.size : 1);
+  }
+
+  // 3. Finalize. The server streams the assembled file to the tracker
+  // over loopback (no public-proxy nginx) and returns the tracker's
+  // UploadedClip JSON verbatim.
+  const final = await _postJson<UploadedClip>(
+    `/api/agent/evals/upload/complete?id=${encodeURIComponent(uploadId)}&name=${encodeURIComponent(file.name)}`,
+    {},
+  );
+  return final;
 }
 
 export function UploadDropzone({

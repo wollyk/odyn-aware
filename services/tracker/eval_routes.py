@@ -59,6 +59,11 @@ MAX_UPLOAD_BYTES = int(
     os.environ.get("TRACKER_EVAL_MAX_UPLOAD_BYTES", str(500 * 1024 * 1024))
 )
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+# Browsers can decode MP4 (H.264) and WebM natively. Everything else
+# we transcode on upload so /admin/evals' Watch player Just Works. MOV
+# is in here on purpose — Chrome plays most MOVs but iOS Safari is
+# strict, and the eval pipeline is happy with either source.
+BROWSER_PLAYABLE_EXTS = {".mp4", ".webm"}
 # Image-sequence support: a .zip upload is extracted to a directory
 # under CORPUS_DIR, and that directory then behaves as a single "clip"
 # in the corpus listing. The image extensions below are the ones we
@@ -71,9 +76,19 @@ ALLOWED_UPLOAD_EXTS = ALLOWED_VIDEO_EXTS | {".zip"}
 # clip while preventing a malicious zip from spawning a million files.
 MAX_SEQUENCE_FRAMES = int(os.environ.get("TRACKER_EVAL_MAX_SEQUENCE_FRAMES", "5000"))
 
+FFMPEG_BIN = os.environ.get("TRACKER_FFMPEG", "ffmpeg")
+
 # ---- in-memory tracking ---------------------------------------------------
 _runs: dict[str, dict[str, Any]] = {}
 _diffs: dict[str, dict[str, Any]] = {}
+# Transcode state keyed by the CURRENT clip name on disk (e.g.
+# "foo.avi"). While a clip is in `_transcoding`, the UI shows a
+# "transcoding…" badge and disables Start Eval. After a successful
+# transcode the original (.avi) is unlinked and a sibling .mp4 takes
+# its place in CORPUS_DIR. On failure we keep the original and stash
+# the error so the UI can surface it.
+_transcoding: dict[str, dict[str, Any]] = {}   # name -> {started_at, target_name}
+_transcode_errors: dict[str, str] = {}         # name -> last error string
 
 
 def _require_secret(x_eval_secret: str | None) -> None:
@@ -128,6 +143,143 @@ def _dir_size_bytes(dir_path: Path) -> int:
     return total
 
 
+# ---- transcode ------------------------------------------------------------
+async def _transcode_to_mp4(src: Path) -> None:
+    """Transcode `src` to an H.264/AAC MP4 next to it, then unlink src.
+
+    Runs ffmpeg as an asyncio subprocess so the tracker event loop is
+    never blocked. While the task is in flight, `_transcoding[src.name]`
+    holds a dict with `started_at` and `target_name`; that's what the
+    UI polls via list_corpus.
+
+    On success:
+      - source is unlinked
+      - the MP4 lands at  <stem>.mp4  in CORPUS_DIR (if a .mp4 with
+        the same stem already exists we suffix the new one with a
+        short uuid to avoid clobbering an unrelated clip)
+      - the _transcoding entry is removed
+
+    On failure:
+      - source stays put (so the AVI is still browsable from list_corpus
+        and the eval CLI can still process it via OpenCV)
+      - `_transcode_errors[name]` is populated with stderr tail
+      - _transcoding entry is removed
+    """
+    name = src.name
+    stem = src.stem
+    target = CORPUS_DIR / f"{stem}.mp4"
+    if target.exists():
+        # Caller already guarded against the destination existing, but
+        # double-check: if a .mp4 with this stem snuck in between
+        # checks we land at a uuid-suffixed name. Better than clobbering.
+        target = CORPUS_DIR / f"{stem}.{uuid.uuid4().hex[:6]}.mp4"
+
+    tmp = CORPUS_DIR / f".tmp.transcode.{uuid.uuid4().hex}.mp4"
+    _transcoding[name] = {
+        "started_at": time.time(),
+        "target_name": target.name,
+    }
+    _transcode_errors.pop(name, None)
+    print(
+        f"[transcode] starting {src} -> {target.name}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    # Standard CCTV-friendly preset: H.264 baseline-ish + AAC + faststart
+    # so the browser can begin playback before the whole file is buffered.
+    # -an would drop audio entirely but UCF101 clips do have audio that's
+    # occasionally useful for context, so we keep it (silent track is fine
+    # too — ffmpeg handles that automatically).
+    args = [
+        FFMPEG_BIN,
+        "-y",
+        "-i", str(src),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-loglevel", "error",
+        str(tmp),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_b = await proc.communicate()
+        rc = proc.returncode or 0
+        if rc != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            err_tail = (stderr_b or b"").decode("utf-8", errors="replace")[-400:]
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _transcode_errors[name] = err_tail or f"ffmpeg exit {rc}"
+            print(
+                f"[transcode] FAILED {name}: rc={rc} err={err_tail!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        # Atomic-ish swap: rename tmp into final name, then unlink src.
+        # If the rename succeeds but the unlink fails we leak the .avi —
+        # that's the safer failure mode (two copies, no missing data).
+        os.replace(tmp, target)
+        try:
+            src.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                f"[transcode] swap ok but unlink failed for {src}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            f"[transcode] done {name} -> {target.name}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except FileNotFoundError:
+        _transcode_errors[name] = "ffmpeg_not_installed"
+        print(
+            "[transcode] ffmpeg binary not found on PATH (set TRACKER_FFMPEG)",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _transcode_errors[name] = f"unexpected: {exc}"
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(
+            f"[transcode] crashed for {name}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        _transcoding.pop(name, None)
+
+
+def _is_transcoding(name: str) -> bool:
+    return name in _transcoding
+
+
+def _spawn_transcode(src: Path) -> None:
+    """Fire-and-forget: schedule _transcode_to_mp4 on the running loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Called outside an event loop (shouldn't happen from a route
+        # handler but guard anyway). Skip; user can re-upload.
+        return
+    loop.create_task(_transcode_to_mp4(src))
+
+
 # ---- corpus listing -------------------------------------------------------
 @router.get("/corpus")
 async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONResponse:
@@ -154,14 +306,18 @@ async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONR
             continue
         if entry.is_file() and entry.suffix.lower() in ALLOWED_VIDEO_EXTS:
             st = entry.stat()
-            clips.append(
-                {
-                    "path": entry.name,
-                    "kind": "video",
-                    "size_bytes": st.st_size,
-                    "mtime": st.st_mtime,
-                }
-            )
+            rec = {
+                "path": entry.name,
+                "kind": "video",
+                "size_bytes": st.st_size,
+                "mtime": st.st_mtime,
+            }
+            if _is_transcoding(entry.name):
+                rec["transcoding"] = True
+            err = _transcode_errors.get(entry.name)
+            if err:
+                rec["transcode_error"] = err
+            clips.append(rec)
         elif entry.is_dir():
             n = _count_sequence_frames(entry)
             if n == 0:
@@ -304,14 +460,24 @@ async def upload_corpus(
         raise HTTPException(500, f"write_failed: {exc}") from exc
 
     st = dest.stat()
-    return JSONResponse(
-        {
-            "path": safe_name,
-            "kind": "video",
-            "size_bytes": st.st_size,
-            "mtime": st.st_mtime,
-        }
-    )
+    # If this is a format browsers can't natively play (AVI, MKV, MOV),
+    # kick off an ffmpeg transcode in the background. The endpoint
+    # returns immediately so the UI can update; subsequent list_corpus
+    # responses include `transcoding: true` until the .mp4 is in place.
+    transcoding = False
+    if suffix in ALLOWED_VIDEO_EXTS and suffix not in BROWSER_PLAYABLE_EXTS:
+        _spawn_transcode(dest)
+        transcoding = True
+
+    body: dict[str, Any] = {
+        "path": safe_name,
+        "kind": "video",
+        "size_bytes": st.st_size,
+        "mtime": st.st_mtime,
+    }
+    if transcoding:
+        body["transcoding"] = True
+    return JSONResponse(body)
 
 
 def _extract_sequence_zip(zip_path: Path, out_dir: Path) -> int:
@@ -384,6 +550,12 @@ async def delete_corpus(
     """
     _require_secret(x_eval_secret)
     target = _safe_corpus_path(name)
+    # Refuse to delete while a transcode is mid-flight: ffmpeg has the
+    # source open and racing with rmdir would just produce confusing
+    # half-deletes. The UI disables the delete button in this state too,
+    # but the API guard is the source of truth.
+    if target.is_file() and _is_transcoding(target.name):
+        raise HTTPException(409, "clip_transcoding")
     try:
         if target.is_dir():
             shutil.rmtree(target)
@@ -393,6 +565,7 @@ async def delete_corpus(
         raise HTTPException(404, "clip_not_found")
     except OSError as exc:
         raise HTTPException(500, f"delete_failed: {exc}") from exc
+    _transcode_errors.pop(target.name, None)
     return JSONResponse({"deleted": name})
 
 
@@ -414,6 +587,12 @@ async def run_eval(
 ) -> JSONResponse:
     _require_secret(x_eval_secret)
     clip = _safe_corpus_path(req.clip)
+    # Block runs against a file whose ffmpeg transcode hasn't landed yet.
+    # The clip is still readable by OpenCV in theory, but if the rename
+    # races with the run the path becomes invalid mid-eval. Cheaper to
+    # just ask the user to wait a few seconds.
+    if clip.is_file() and _is_transcoding(clip.name):
+        raise HTTPException(409, "clip_transcoding")
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
     out_path = RUNS_DIR / f"{run_id}.jsonl"
