@@ -83,10 +83,36 @@ export function EvalPlayer({
   const [videoTime, setVideoTime] = useState(0);
   const [showLabels, setShowLabels] = useState(true);
   const [showStatic, setShowStatic] = useState(true);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   // Sequence-mode playback state. Ignored when source_kind === "video".
   const [seqIdx, setSeqIdx] = useState(0);
   const [seqPlaying, setSeqPlaying] = useState(false);
   const isSequence = header?.source_kind === "sequence";
+
+  // Track document fullscreen so we can swap the player's layout
+  // class. The native <video> fullscreen button would take JUST the
+  // video into the OS fullscreen layer and leave our overlay <canvas>
+  // (a sibling in the DOM) behind, which is exactly the bug the user
+  // hit. We disable that button via controlsList="nofullscreen" and
+  // expose our own button that fullscreens the wrap div instead, so
+  // video + canvas travel together.
+  useEffect(() => {
+    const onChange = () => {
+      setIsFullscreen(document.fullscreenElement === wrapRef.current);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      el.requestFullscreen().catch(() => {});
+    }
+  }, []);
 
   // -- fetch JSONL ---------------------------------------------------------
   useEffect(() => {
@@ -310,7 +336,16 @@ export function EvalPlayer({
 
       <div
         ref={wrapRef}
-        className="relative inline-block max-w-full overflow-hidden border border-foreground/15 bg-black"
+        // In fullscreen the wrap becomes a flex container so the media
+        // can fill the viewport while preserving aspect (object-contain
+        // on the <video>/<img>). The overlay canvas tracks the media's
+        // rendered area via the letterbox math in drawOverlay below.
+        className={[
+          "relative overflow-hidden border border-foreground/15 bg-black",
+          isFullscreen
+            ? "flex h-screen w-screen items-center justify-center"
+            : "inline-block max-w-full",
+        ].join(" ")}
       >
         {isSequence ? (
           <img
@@ -322,24 +357,49 @@ export function EvalPlayer({
             width={header.video_w || undefined}
             height={header.video_h || undefined}
             draggable={false}
-            className="block max-w-full select-none"
-            style={{ maxHeight: 640 }}
+            className={
+              isFullscreen
+                ? "block h-full w-full select-none object-contain"
+                : "block max-w-full select-none"
+            }
+            style={isFullscreen ? undefined : { maxHeight: 640 }}
           />
         ) : (
           <video
             ref={videoRef}
             src={`/api/agent/evals/${runId}/clip`}
             controls
+            // Drop the native fullscreen button — see comment on
+            // toggleFullscreen above. Picture-in-picture and download
+            // are also off; they'd take the media out of the wrap and
+            // strand the overlay.
+            controlsList="nofullscreen nodownload noplaybackrate"
+            disablePictureInPicture
             playsInline
             preload="metadata"
-            className="block max-w-full"
-            style={{ maxHeight: 640 }}
+            className={
+              isFullscreen
+                ? "block h-full w-full object-contain"
+                : "block max-w-full"
+            }
+            style={isFullscreen ? undefined : { maxHeight: 640 }}
           />
         )}
         <canvas
           ref={canvasRef}
+          // Cover the full wrap; the overlay code positions individual
+          // boxes inside the letterbox area via offsetX/offsetY.
           className="pointer-events-none absolute left-0 top-0"
         />
+        <button
+          type="button"
+          onClick={toggleFullscreen}
+          aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          className="absolute right-2 top-2 z-10 border border-white/30 bg-black/55 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-white/85 hover:bg-black/75"
+        >
+          {isFullscreen ? "⤓ exit" : "⛶ fullscreen"}
+        </button>
       </div>
 
       {isSequence && (
@@ -561,14 +621,67 @@ function drawOverlay(
   frame: Frame | null,
   opts: { showLabels: boolean; showStatic: boolean },
 ) {
-  // Size the canvas to match the source's displayed size so coordinates
-  // line up. Internal canvas size is set to the displayed CSS size in
-  // device pixels for crispness on HiDPI. Works for both <video> and
-  // <img> — both expose clientWidth/clientHeight in CSS pixels.
+  // The canvas covers the wrap container's full client box (so it
+  // works whether the video is at intrinsic size with no letterboxing
+  // OR fullscreened with object-fit:contain producing letterbox bars).
+  // Bbox coords are then mapped to the RENDERED MEDIA area inside that
+  // box, computed from intrinsic media dimensions vs. element size.
+  //
+  // Without this, fullscreening a 320×240 source onto a 1920×1080
+  // viewport draws boxes against the whole 1920×1080 — they'd appear
+  // off-image (or never within the letterbox bars).
   const dpr = window.devicePixelRatio || 1;
-  const w = source.clientWidth;
-  const h = source.clientHeight;
+  // Canvas's parent is the wrap div. Read its size, falling back to
+  // the source's clientWidth/clientHeight if the parent isn't laid
+  // out yet (rare; first paint).
+  const parent = canvas.parentElement;
+  const w = parent?.clientWidth || source.clientWidth;
+  const h = parent?.clientHeight || source.clientHeight;
   if (w === 0 || h === 0) return;
+
+  // Intrinsic media size — used to compute the letterboxed rendered area.
+  let mediaW = 0;
+  let mediaH = 0;
+  if (source instanceof HTMLVideoElement) {
+    mediaW = source.videoWidth;
+    mediaH = source.videoHeight;
+  } else {
+    mediaW = source.naturalWidth;
+    mediaH = source.naturalHeight;
+  }
+  // If metadata hasn't loaded yet, fall back to the element box —
+  // boxes will be slightly off until the first metadata tick, then
+  // self-correct on the next rAF.
+  if (!mediaW || !mediaH) {
+    mediaW = w;
+    mediaH = h;
+  }
+
+  // object-fit: contain math. In non-fullscreen the source element is
+  // at intrinsic size and `renderedW === w, renderedH === h, offsets 0`
+  // — i.e. identical to the old code path. In fullscreen the source
+  // is `width:100% height:100% object-contain` and we compute the
+  // letterbox bars.
+  const elemAR = w / h;
+  const mediaAR = mediaW / mediaH;
+  let renderedW: number;
+  let renderedH: number;
+  let offsetX: number;
+  let offsetY: number;
+  if (elemAR > mediaAR) {
+    // Pillarbox (bars on left/right).
+    renderedH = h;
+    renderedW = h * mediaAR;
+    offsetX = (w - renderedW) / 2;
+    offsetY = 0;
+  } else {
+    // Letterbox (bars on top/bottom).
+    renderedW = w;
+    renderedH = w / mediaAR;
+    offsetX = 0;
+    offsetY = (h - renderedH) / 2;
+  }
+
   if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
     canvas.width = Math.round(w * dpr);
     canvas.height = Math.round(h * dpr);
@@ -581,16 +694,22 @@ function drawOverlay(
   ctx.clearRect(0, 0, w, h);
   if (!frame) return;
 
+  // Scale line + label sizing with the rendered media height so boxes
+  // stay legible on fullscreen 4K and tiny intrinsic 320×240 alike.
+  const lineW = Math.max(2, Math.round(renderedH / 240));
+  const labelFontPx = Math.max(11, Math.round(renderedH / 50));
+  ctx.font = `${labelFontPx}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+
   for (const t of frame.tracks) {
     if (!opts.showStatic && t.motion === "static") continue;
     const [bx, by, bw, bh] = t.bbox;
-    const x = bx * w;
-    const y = by * h;
-    const ww = bw * w;
-    const hh = bh * h;
+    const x = offsetX + bx * renderedW;
+    const y = offsetY + by * renderedH;
+    const ww = bw * renderedW;
+    const hh = bh * renderedH;
     const color = colorForLabel(t.label);
 
-    ctx.lineWidth = 2;
+    ctx.lineWidth = lineW;
     ctx.strokeStyle = color;
     if (t.motion === "static") {
       // Dashed border for static, solid for moving — matches the map's
@@ -606,9 +725,8 @@ function drawOverlay(
       const lbl = `${t.label} #${t.id} ${(t.conf * 100).toFixed(0)}%${
         t.verified === true ? " ✓" : t.verified === false ? " ✗" : ""
       }`;
-      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
       const metrics = ctx.measureText(lbl);
-      const textH = 14;
+      const textH = labelFontPx + 2;
       const padX = 4;
       const labelY = y > textH ? y - textH : y + hh;
       ctx.fillStyle = color;

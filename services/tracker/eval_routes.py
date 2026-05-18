@@ -153,10 +153,14 @@ async def _transcode_to_mp4(src: Path) -> None:
     UI polls via list_corpus.
 
     On success:
-      - source is unlinked
       - the MP4 lands at  <stem>.mp4  in CORPUS_DIR (if a .mp4 with
         the same stem already exists we suffix the new one with a
         short uuid to avoid clobbering an unrelated clip)
+      - the source IS PRESERVED next to the .mp4. list_corpus hides
+        the original from the dropdown (showing the .mp4 alone), but
+        the original stays on disk so run_eval can read it as the
+        higher-fidelity inference source. The .mp4 only exists to
+        make HTML5 <video> playback work in the Watch panel.
       - the _transcoding entry is removed
 
     On failure:
@@ -186,17 +190,20 @@ async def _transcode_to_mp4(src: Path) -> None:
         flush=True,
     )
 
-    # Standard CCTV-friendly preset: H.264 baseline-ish + AAC + faststart
-    # so the browser can begin playback before the whole file is buffered.
-    # -an would drop audio entirely but UCF101 clips do have audio that's
-    # occasionally useful for context, so we keep it (silent track is fine
-    # too — ffmpeg handles that automatically).
+    # Visual-quality preset for the Watch panel. The eval pipeline reads
+    # the ORIGINAL source (see run_eval), so this output only needs to
+    # look good in the browser — it's never fed back into YOLO. CRF 20
+    # is slightly above visually-transparent for 1080p but cleaner than
+    # the default 23 for low-res UCF-101 clips. `preset slow` improves
+    # rate-distortion at the cost of ~3x wall-clock; that's fine since
+    # transcode runs out-of-band on upload.
     args = [
         FFMPEG_BIN,
         "-y",
         "-i", str(src),
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "slow",
+        "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-c:a", "aac",
@@ -226,20 +233,14 @@ async def _transcode_to_mp4(src: Path) -> None:
             )
             return
 
-        # Atomic-ish swap: rename tmp into final name, then unlink src.
-        # If the rename succeeds but the unlink fails we leak the .avi —
-        # that's the safer failure mode (two copies, no missing data).
+        # Drop the .mp4 into place. We intentionally keep the original
+        # alongside it: the eval pipeline prefers the source for
+        # inference (better fidelity), and list_corpus hides the
+        # original from the dropdown so the user only sees one entry
+        # per stem.
         os.replace(tmp, target)
-        try:
-            src.unlink(missing_ok=True)
-        except OSError as exc:
-            print(
-                f"[transcode] swap ok but unlink failed for {src}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
         print(
-            f"[transcode] done {name} -> {target.name}",
+            f"[transcode] done {name} -> {target.name} (source preserved for eval)",
             file=sys.stderr,
             flush=True,
         )
@@ -267,6 +268,26 @@ async def _transcode_to_mp4(src: Path) -> None:
 
 def _is_transcoding(name: str) -> bool:
     return name in _transcoding
+
+
+def _same_stem_sibling(target: Path, exts: set[str]) -> Path | None:
+    """Return the first file with the same stem as `target` whose suffix
+    is in `exts`. Used to:
+      - find the higher-fidelity master for eval inference (target=.mp4,
+        exts={.avi,.mkv,.mov} → return foo.avi if present)
+      - find the browser-playable companion for /clip (target=.avi,
+        exts={.mp4,.webm} → return foo.mp4 if present)
+    Returns None if no sibling exists or the parent dir is gone.
+    """
+    parent = target.parent
+    stem = target.stem
+    if not parent.is_dir():
+        return None
+    for ext in exts:
+        cand = parent / f"{stem}{ext}"
+        if cand.is_file():
+            return cand
+    return None
 
 
 def _spawn_transcode(src: Path) -> None:
@@ -301,10 +322,27 @@ async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONR
         entries = sorted(CORPUS_DIR.iterdir(), key=lambda p: p.name.lower())
     except OSError:
         entries = []
+    # Pre-compute the set of stems that have a browser-playable file in
+    # the corpus. Any non-browser-playable file (foo.avi) whose stem is
+    # in this set is hidden from the listing: its .mp4 sibling is the
+    # canonical UI entry. The .avi master is still on disk and is what
+    # run_eval feeds to YOLO (better fidelity than the re-compressed mp4).
+    browser_stems: set[str] = set()
+    for entry in entries:
+        if (
+            entry.is_file()
+            and entry.suffix.lower() in BROWSER_PLAYABLE_EXTS
+        ):
+            browser_stems.add(entry.stem)
+
     for entry in entries:
         if entry.name.startswith("."):
             continue
         if entry.is_file() and entry.suffix.lower() in ALLOWED_VIDEO_EXTS:
+            suffix = entry.suffix.lower()
+            # Hide originals when the .mp4 sibling exists (one entry per stem).
+            if suffix not in BROWSER_PLAYABLE_EXTS and entry.stem in browser_stems:
+                continue
             st = entry.stat()
             rec = {
                 "path": entry.name,
@@ -312,11 +350,21 @@ async def list_corpus(x_eval_secret: str | None = Header(default=None)) -> JSONR
                 "size_bytes": st.st_size,
                 "mtime": st.st_mtime,
             }
+            # Surface transcoding state under whichever name the user
+            # sees: while ffmpeg is converting foo.avi the .mp4 doesn't
+            # exist yet, so list_corpus shows the .avi with the badge.
             if _is_transcoding(entry.name):
                 rec["transcoding"] = True
             err = _transcode_errors.get(entry.name)
             if err:
                 rec["transcode_error"] = err
+            # Tell the UI which clips have a higher-fidelity master
+            # backing them (purely informational).
+            if suffix in BROWSER_PLAYABLE_EXTS:
+                master = _same_stem_sibling(entry, ALLOWED_VIDEO_EXTS - BROWSER_PLAYABLE_EXTS)
+                if master is not None:
+                    rec["has_master"] = True
+                    rec["master_suffix"] = master.suffix.lower()
             clips.append(rec)
         elif entry.is_dir():
             n = _count_sequence_frames(entry)
@@ -556,11 +604,33 @@ async def delete_corpus(
     # but the API guard is the source of truth.
     if target.is_file() and _is_transcoding(target.name):
         raise HTTPException(409, "clip_transcoding")
+    # If the user is deleting the browser-facing .mp4, also drop the
+    # higher-fidelity master sibling so the corpus stays tidy. Same
+    # the other way around: deleting an .avi removes its .mp4 too.
+    siblings_to_drop: list[Path] = []
+    if target.is_file():
+        suffix = target.suffix.lower()
+        if suffix in BROWSER_PLAYABLE_EXTS:
+            master = _same_stem_sibling(target, ALLOWED_VIDEO_EXTS - BROWSER_PLAYABLE_EXTS)
+            if master is not None and not _is_transcoding(master.name):
+                siblings_to_drop.append(master)
+        elif suffix in ALLOWED_VIDEO_EXTS:
+            browser = _same_stem_sibling(target, BROWSER_PLAYABLE_EXTS)
+            if browser is not None:
+                siblings_to_drop.append(browser)
     try:
         if target.is_dir():
             shutil.rmtree(target)
         else:
             target.unlink()
+        for sib in siblings_to_drop:
+            try:
+                sib.unlink(missing_ok=True)
+            except OSError:
+                # Sibling cleanup is best-effort; the primary file is gone
+                # and that's what the UI shows. Stale sibling will hide
+                # behind the new .mp4 next time someone re-uploads.
+                pass
     except FileNotFoundError:
         raise HTTPException(404, "clip_not_found")
     except OSError as exc:
@@ -593,6 +663,21 @@ async def run_eval(
     # just ask the user to wait a few seconds.
     if clip.is_file() and _is_transcoding(clip.name):
         raise HTTPException(409, "clip_transcoding")
+    # When the user picked a transcoded .mp4 (e.g. foo.mp4), prefer
+    # the original master sibling (foo.avi/.mov/.mkv) for inference —
+    # the .mp4 was re-compressed at CRF 20 specifically for browser
+    # playback, while the master is the bytes the user originally
+    # uploaded. Falling back to the .mp4 if no master exists is fine
+    # (it's still the file the user picked).
+    if clip.is_file() and clip.suffix.lower() in BROWSER_PLAYABLE_EXTS:
+        master = _same_stem_sibling(clip, ALLOWED_VIDEO_EXTS - BROWSER_PLAYABLE_EXTS)
+        if master is not None and not _is_transcoding(master.name):
+            print(
+                f"[eval] using master {master.name} instead of {clip.name} for inference",
+                file=sys.stderr,
+                flush=True,
+            )
+            clip = master
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
     out_path = RUNS_DIR / f"{run_id}.jsonl"
@@ -820,16 +905,21 @@ def _read_run_header(run_id: str) -> dict:
 
 
 def _resolve_run_clip(run_id: str) -> Path:
-    """Return the absolute corpus path of the source VIDEO file for a run.
+    """Return the absolute corpus path of the VIDEO file to serve to the
+    browser's <video> element for a given run.
 
-    For image-sequence runs this raises 404 with code "clip_is_sequence"
-    so the player knows to switch to the sequence-frame endpoints.
+    Important: this is the playback path, NOT the inference path. Eval
+    inference reads `header.video` directly (the file YOLO actually saw).
+    For Watch we prefer a browser-playable sibling because:
 
-    Sibling-stem fallback: if the recorded path on disk is gone (e.g.
-    because we transcoded foo.avi → foo.mp4 after this run completed),
-    try any video file with the same stem in the same directory and
-    prefer browser-playable extensions. That way past runs against an
-    AVI keep working after the AVI is rotated out.
+      1. If the run was against foo.avi (the higher-fidelity master),
+         the browser can't decode it natively. There's a foo.mp4
+         sibling sitting right there from the upload-time transcode;
+         we'd rather serve that than 200 OK an unplayable AVI.
+      2. If the run was against foo.mp4 directly, we just return it.
+
+    For image-sequence runs we still raise 404 with code
+    "clip_is_sequence" so the player switches to /sequence/{run_id}/...
     """
     header = _read_run_header(run_id)
     raw = header.get("video", "")
@@ -841,29 +931,26 @@ def _resolve_run_clip(run_id: str) -> Path:
     except ValueError:
         raise HTTPException(403, "clip_outside_corpus")
     if video_path.is_dir():
-        # Sequences can't be served via <video>; tell the player
-        # explicitly so it falls back to /sequence/{run_id}/frame/{N}.
         raise HTTPException(404, "clip_is_sequence")
+    suffix = video_path.suffix.lower()
+    # Recorded path is browser-playable AND on disk → serve it directly.
+    if video_path.is_file() and suffix in BROWSER_PLAYABLE_EXTS:
+        return video_path
+    # Recorded path is a master format (.avi/.mkv/.mov) — prefer the
+    # sibling .mp4/.webm if one exists, fall back to the master itself
+    # only if no playable sibling is available (browser will probably
+    # show a blank player but at least we return 200).
+    sibling = _same_stem_sibling(video_path, BROWSER_PLAYABLE_EXTS)
+    if sibling is not None:
+        return sibling
     if video_path.is_file():
         return video_path
-    # Original file is gone — look for a sibling with the same stem.
-    parent = video_path.parent
-    stem = video_path.stem
-    if parent.is_dir():
-        # Browser-playable first so Watch Just Works after a transcode;
-        # any remaining video extensions as last-ditch.
-        prefer = (".mp4", ".webm")
-        candidates: list[Path] = []
-        for ext in prefer:
-            cand = parent / f"{stem}{ext}"
-            if cand.is_file():
-                return cand
-        for ext in ALLOWED_VIDEO_EXTS - set(prefer):
-            cand = parent / f"{stem}{ext}"
-            if cand.is_file():
-                candidates.append(cand)
-        if candidates:
-            return candidates[0]
+    # Original is gone AND no browser sibling — last-ditch: any video
+    # with the same stem in the dir (likely a uuid-suffixed transcode
+    # from the clobber-avoidance path).
+    any_sib = _same_stem_sibling(video_path, ALLOWED_VIDEO_EXTS)
+    if any_sib is not None:
+        return any_sib
     raise HTTPException(404, "clip_missing")
 
 

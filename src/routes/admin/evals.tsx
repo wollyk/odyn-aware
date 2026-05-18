@@ -612,6 +612,21 @@ function AdminEvals() {
                       </td>
                       <td className="py-2 pr-3 text-foreground/70">
                         {r.summary?.unique_tracks ?? "—"}
+                        {r.status === "ok" &&
+                          r.summary?.unique_tracks === 0 && (
+                            <span
+                              className="ml-2 inline-flex items-center border border-amber-400/40 bg-amber-400/[0.06] px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-amber-300/85"
+                              title={
+                                "Zero tracks passed suppression. Likely causes:\n" +
+                                "  • all raw detections were below the conf floor\n" +
+                                "  • detected classes weren't in allowed_classes (e.g. horse, boat)\n" +
+                                "  • tracks didn't survive min_track_frames\n\n" +
+                                "Try lowering conf_threshold/per_class_default_conf, or widen allowed_classes."
+                              }
+                            >
+                              ! no detections
+                            </span>
+                          )}
                       </td>
                       <td className="py-2 pr-3 text-foreground/70">
                         {r.summary?.tracks_with_label_switches ?? "—"}
