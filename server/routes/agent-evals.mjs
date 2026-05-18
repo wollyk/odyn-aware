@@ -601,8 +601,8 @@ export async function register(req, res, url, ctx) {
         stillRunning.map(async (r) => {
           try {
             const s = await trackerFetch(`/eval/status/${r.run_id}`);
-            if (!s.ok || !s.body) return;
-            if (s.body.status && s.body.status !== "running") {
+            // Happy path: tracker still has the in-memory _runs entry.
+            if (s.ok && s.body && s.body.status && s.body.status !== "running") {
               const result = await trackerFetch(`/eval/result/${r.run_id}`);
               const header = result.body?.header ?? null;
               const summary = result.body?.summary ?? null;
@@ -619,6 +619,39 @@ export async function register(req, res, url, ctx) {
                 startedAtMs: r.started_at_ms,
                 finishedAtMs: s.body.finished_at
                   ? Math.round(s.body.finished_at * 1000)
+                  : Date.now(),
+                createdBy: r.created_by,
+              });
+              return;
+            }
+            if (s.ok && s.body && s.body.status === "running") {
+              // Genuinely still running. Skip the disk fallback.
+              return;
+            }
+            // Fallback: tracker doesn't know this run (likely restarted
+            // after the eval finished, dropping the in-memory dict).
+            // /eval/result reads the JSONL straight off disk, so if the
+            // run actually completed before the restart we can recover
+            // its summary here. Without this an eval row stays "Running"
+            // forever after a tracker restart even though the data is
+            // on disk and the Watch view works.
+            const diskResult = await trackerFetch(`/eval/result/${r.run_id}`);
+            if (diskResult.ok && diskResult.body?.summary) {
+              const header = diskResult.body.header ?? null;
+              const summary = diskResult.body.summary;
+              upsertEvalRun(db, {
+                runId: r.run_id,
+                name: r.name,
+                clip: r.clip,
+                configJson: JSON.stringify(r.config ?? {}),
+                configHash: header?.config_hash ?? null,
+                status: "ok",
+                outPath: r.out_path,
+                summaryJson: JSON.stringify(summary),
+                headerJson: header ? JSON.stringify(header) : null,
+                startedAtMs: r.started_at_ms,
+                finishedAtMs: summary?.finished_at
+                  ? Math.round(summary.finished_at * 1000)
                   : Date.now(),
                 createdBy: r.created_by,
               });

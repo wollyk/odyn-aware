@@ -824,6 +824,12 @@ def _resolve_run_clip(run_id: str) -> Path:
 
     For image-sequence runs this raises 404 with code "clip_is_sequence"
     so the player knows to switch to the sequence-frame endpoints.
+
+    Sibling-stem fallback: if the recorded path on disk is gone (e.g.
+    because we transcoded foo.avi → foo.mp4 after this run completed),
+    try any video file with the same stem in the same directory and
+    prefer browser-playable extensions. That way past runs against an
+    AVI keep working after the AVI is rotated out.
     """
     header = _read_run_header(run_id)
     raw = header.get("video", "")
@@ -838,9 +844,27 @@ def _resolve_run_clip(run_id: str) -> Path:
         # Sequences can't be served via <video>; tell the player
         # explicitly so it falls back to /sequence/{run_id}/frame/{N}.
         raise HTTPException(404, "clip_is_sequence")
-    if not video_path.is_file():
-        raise HTTPException(404, "clip_missing")
-    return video_path
+    if video_path.is_file():
+        return video_path
+    # Original file is gone — look for a sibling with the same stem.
+    parent = video_path.parent
+    stem = video_path.stem
+    if parent.is_dir():
+        # Browser-playable first so Watch Just Works after a transcode;
+        # any remaining video extensions as last-ditch.
+        prefer = (".mp4", ".webm")
+        candidates: list[Path] = []
+        for ext in prefer:
+            cand = parent / f"{stem}{ext}"
+            if cand.is_file():
+                return cand
+        for ext in ALLOWED_VIDEO_EXTS - set(prefer):
+            cand = parent / f"{stem}{ext}"
+            if cand.is_file():
+                candidates.append(cand)
+        if candidates:
+            return candidates[0]
+    raise HTTPException(404, "clip_missing")
 
 
 def _resolve_run_sequence(run_id: str) -> tuple[Path, list[Path]]:
