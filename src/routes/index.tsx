@@ -261,18 +261,30 @@ function Index() {
               </ul>
             </div>
             <figure className="lg:col-span-7">
-              <div className="overflow-hidden border border-border bg-card/30 shadow-2xl">
-                <img
-                  src={liveCroatia}
-                  alt="Croatia marina live feed with tracking overlay"
-                  width={2048}
-                  height={1126}
-                  className="h-auto w-full"
+              <div className="relative overflow-hidden border border-border bg-card/30 shadow-2xl">
+                {/* Real eval-run output, baked once via tools/bake_demo_overlay.py.
+                    Plays from /demo/ which is an nginx alias to a directory that
+                    sits outside dist/ so npm run build can't blow it away. The
+                    <img> stays as a poster so users on browsers that block
+                    autoplay still see something tracking-ish. */}
+                <video
+                  src="/demo/aurora-tracking.mp4"
+                  poster={liveCroatia}
+                  autoPlay
+                  loop
+                  muted
+                  playsInline
+                  preload="metadata"
+                  aria-label="People being tracked in real time on a street with persistent IDs"
+                  className="block h-auto w-full"
                 />
+                <span className="pointer-events-none absolute left-3 top-3 inline-flex items-center gap-2 bg-background/70 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-emerald-400 backdrop-blur-sm">
+                  <span className="h-1.5 w-1.5 bg-emerald-400" /> LIVE TRACKS · 40 IDs
+                </span>
               </div>
               <figcaption className="mt-3 flex items-center justify-between font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                <span>FIG. 03 — Croatia marina · live tracking · 2842 kbps</span>
-                <span>Frigate: on · vision/chat: on</span>
+                <span>FIG. 03 — Street scene · 40 persistent person tracks · 248 frames</span>
+                <span>real eval output · not mocked</span>
               </figcaption>
             </figure>
           </div>
