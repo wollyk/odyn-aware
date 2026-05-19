@@ -81,13 +81,10 @@ export function VideoTile({
 
   // Canvas overlay — AR-aware + tracker-driven.
   //
-  // Box source priority:
-  //   1. Tracker WS (real-time YOLOv8s + ByteTrack at ~5Hz). Tight
-  //      bboxes, persistent IDs, no pulsing. Used when trk.status ===
-  //      "open" and we have at least one fresh tick.
-  //   2. Polling fallback (face + weapon from /api/agent/detections,
-  //      already real-CV). Used when the tracker is offline so the
-  //      canvas isn't blank during sidecar restarts.
+  // Box sources (can compose):
+  //   1. Tracker WS — person/object boxes at ~5Hz.
+  //   2. Detection poll — face boxes (always layered when present) plus
+  //      weapon/face fallback when the tracker is offline.
   //
   // AR-aware: the displayed video has `object-contain`, so when source
   // AR ≠ tile AR there are letterbox/pillarbox bars. We compute the
@@ -131,7 +128,11 @@ export function VideoTile({
       bbox: [number, number, number, number];
       label: string;
       ts: number;           // when the upstream produced it
+      lineWidth?: number;
+      dashed?: boolean;
     };
+
+    const FACE_SOURCES = new Set(["face_known", "face_unknown"]);
 
     const computeDisplayedRect = (): { rectX: number; rectY: number; rectW: number; rectH: number; w: number; h: number } | null => {
       const w = target.clientWidth;
@@ -180,24 +181,34 @@ export function VideoTile({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
-      // Pick the box source.
-      const useTracker =
-        trk.status === "open" && trk.tickAt != null && trk.tracks.length >= 0;
-      const drawBoxes: DrawBox[] = useTracker
+      const useTracker = trk.status === "open" && trk.tickAt != null;
+      const trackerBoxes: DrawBox[] = useTracker
         ? trk.tracks.map((t: TrackedBox) => ({
             rgb: colorForClass(t.label),
             bbox: t.bbox,
             label: `${t.label} #${t.id} ${t.conf.toFixed(2)}`,
             ts: trk.tickAt ?? Date.now(),
+            lineWidth: 2,
           }))
+        : [];
+      const faceBoxes: DrawBox[] = det.boxes
+        .filter((b) => FACE_SOURCES.has(b.source))
+        .map((b) => ({
+          rgb: b.source === "face_known" ? "56, 189, 248" : "251, 191, 36",
+          bbox: b.bbox,
+          label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
+          ts: b.ts,
+          lineWidth: 1,
+          dashed: true,
+        }));
+      const drawBoxes: DrawBox[] = useTracker
+        ? [...trackerBoxes, ...faceBoxes]
         : det.boxes.map((b) => ({
             rgb: FALLBACK_STYLE[b.source] ?? "148, 163, 184",
             bbox: b.bbox,
             label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
             ts: b.ts,
           }));
-
-      ctx.lineWidth = 1.5;
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.textBaseline = "top";
 
@@ -219,10 +230,14 @@ export function VideoTile({
         const ry = rectY + y * rectH;
         const rw = ww * rectW;
         const rh = hh * rectH;
+        ctx.lineWidth = b.lineWidth ?? 1.5;
+        if (b.dashed) ctx.setLineDash([4, 3]);
+        else ctx.setLineDash([]);
         ctx.strokeStyle = stroke;
         ctx.fillStyle = fill;
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeRect(rx, ry, rw, rh);
+        ctx.setLineDash([]);
         const textW = ctx.measureText(b.label).width + 8;
         const chipH = 16;
         const chipY = Math.max(rectY, ry - chipH);

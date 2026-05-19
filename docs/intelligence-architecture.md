@@ -11,6 +11,7 @@ Last updated: Phase-13A (eval bench + image-sequence support).
 ---
 
 ## Table of contents
+
 1. [The big picture](#the-big-picture)
 2. [Live path — Frigate to browser, real time](#live-path--frigate-to-browser-real-time)
 3. [Tracker decision pipeline (per frame)](#tracker-decision-pipeline-per-frame)
@@ -59,12 +60,14 @@ Last updated: Phase-13A (eval bench + image-sequence support).
 
 There are **three** processes and **one** external GPU service:
 
-| process | binary | port | what it owns |
-|---|---|---|---|
-| `tracker.service` | uvicorn + Python | 8767 | YOLO + ByteTrack inference, motion + VLM decisions, eval CLI subprocess |
-| `odyn-api.service` | Node | 3001 | Admin auth, WS proxies, REST APIs, SQLite, agent chat, eval orchestrator |
-| nginx | system | 80 | TLS termination + path-based routing |
-| Ollama (external) | container on `192.168.0.137:11434` | — | Moondream 1.6B VLM (yes/no verification) |
+
+| process            | binary                             | port | what it owns                                                             |
+| ------------------ | ---------------------------------- | ---- | ------------------------------------------------------------------------ |
+| `tracker.service`  | uvicorn + Python                   | 8767 | YOLO + ByteTrack inference, motion + VLM decisions, eval CLI subprocess  |
+| `odyn-api.service` | Node                               | 3001 | Admin auth, WS proxies, REST APIs, SQLite, agent chat, eval orchestrator |
+| nginx              | system                             | 80   | TLS termination + path-based routing                                     |
+| Ollama (external)  | container on `192.168.0.137:11434` | —    | Moondream 1.6B VLM (yes/no verification)                                 |
+
 
 ---
 
@@ -139,13 +142,15 @@ C. Map dots                        src/features/map/useAllTrackers.ts
 
 ### Network hops on the live path
 
-| hop | from | to | protocol | auth |
-|---|---|---|---|---|
-| 0 | browser | nginx :443 | HTTPS | session cookie |
-| 1 | nginx | Node :3001 | HTTP (Upgrade) | passes through |
-| 2 | Node WS proxy | tracker :8767 | WS | none (loopback) |
-| 3 | tracker | Frigate :3000 | HTTPS | JWT cookie (per-camera) |
-| 4 | tracker | Ollama :11434 | HTTP | none (LAN) |
+
+| hop | from          | to            | protocol       | auth                    |
+| --- | ------------- | ------------- | -------------- | ----------------------- |
+| 0   | browser       | nginx :443    | HTTPS          | session cookie          |
+| 1   | nginx         | Node :3001    | HTTP (Upgrade) | passes through          |
+| 2   | Node WS proxy | tracker :8767 | WS             | none (loopback)         |
+| 3   | tracker       | Frigate :3000 | HTTPS          | JWT cookie (per-camera) |
+| 4   | tracker       | Ollama :11434 | HTTP           | none (LAN)              |
+
 
 The WS proxy is `server/routes/cameras.mjs` (see `wsHandler` exports
 hooked in `server/api.mjs`). Admin auth is enforced at the upgrade
@@ -210,6 +215,7 @@ Step  Function / file                                  Drops?  Reason
 ```
 
 After the per-detection loop, GC runs every frame:
+
 - `_TrackVoter.gc(now)` — drops tracks unseen for `TRACK_TTL_S` (5 s)
 - `_BBoxHistory.gc(now)` — same
 - `_VLMVerifier.gc(now)` — drops cache entries older than `4*TRACK_TTL_S`
@@ -217,24 +223,26 @@ After the per-detection loop, GC runs every frame:
 
 ### Key constants and where to tune them
 
-| constant | default | env var | controls |
-|---|---|---|---|
-| `CONF_THRESHOLD` | 0.30 | `TRACKER_CONF` | YOLO raw conf gate (cheap up-front filter) |
-| `IOU_THRESHOLD` | 0.45 | `TRACKER_IOU` | ByteTrack assignment IoU |
-| `IMGSZ` | 640 | `TRACKER_IMGSZ` | YOLO input image size |
-| `MIN_TRACK_FRAMES` | 3 | `TRACKER_MIN_FRAMES` | flicker gate |
-| `VOTE_WINDOW` | 8 | `TRACKER_VOTE_WINDOW` | voter ring buffer size |
-| `VOTE_MAJORITY` | 0.6 | `TRACKER_VOTE_MAJORITY` | modal-class threshold |
-| `PER_CLASS_DEFAULT_CONF` | 0.55 | `TRACKER_PER_CLASS_DEFAULT_CONF` | voted conf floor (fallback) |
-| `PER_CLASS_CONF[person]` | 0.50 | `TRACKER_PER_CLASS_CONF` | per-class voted conf floor |
-| `MOTION_WINDOW` | 8 | `TRACKER_MOTION_WINDOW` | motion ring buffer size |
-| `MIN_MOTION_FRAMES` | 5 | `TRACKER_MIN_MOTION_FRAMES` | min samples before is_static returns non-None |
-| `STATIC_IOU_THRESHOLD` | 0.85 | `TRACKER_STATIC_IOU` | IoU(oldest,newest) above this = "static" |
-| `MIN_STATIC_DWELL_S` | 2.0 | `TRACKER_MIN_STATIC_DWELL_S` | wait this long before triggering VLM |
-| `STATIC_REQUIRE_VERIFY` | true | `TRACKER_STATIC_REQUIRE_VERIFY` | suppress unverified statics |
-| `VLM_VERDICT_TTL_S` | 300 | `TRACKER_VLM_VERDICT_TTL_S` | how long a yes/no verdict stays valid |
-| `VLM_RETRY_COOLDOWN_S` | 30 | `TRACKER_VLM_RETRY_COOLDOWN_S` | min gap between VLM retries for same (tid, label) |
-| `VLM_CONCURRENCY` | 2 | `TRACKER_VLM_CONCURRENCY` | semaphore on simultaneous Moondream calls |
+
+| constant                 | default | env var                          | controls                                          |
+| ------------------------ | ------- | -------------------------------- | ------------------------------------------------- |
+| `CONF_THRESHOLD`         | 0.30    | `TRACKER_CONF`                   | YOLO raw conf gate (cheap up-front filter)        |
+| `IOU_THRESHOLD`          | 0.45    | `TRACKER_IOU`                    | ByteTrack assignment IoU                          |
+| `IMGSZ`                  | 640     | `TRACKER_IMGSZ`                  | YOLO input image size                             |
+| `MIN_TRACK_FRAMES`       | 3       | `TRACKER_MIN_FRAMES`             | flicker gate                                      |
+| `VOTE_WINDOW`            | 8       | `TRACKER_VOTE_WINDOW`            | voter ring buffer size                            |
+| `VOTE_MAJORITY`          | 0.6     | `TRACKER_VOTE_MAJORITY`          | modal-class threshold                             |
+| `PER_CLASS_DEFAULT_CONF` | 0.55    | `TRACKER_PER_CLASS_DEFAULT_CONF` | voted conf floor (fallback)                       |
+| `PER_CLASS_CONF[person]` | 0.50    | `TRACKER_PER_CLASS_CONF`         | per-class voted conf floor                        |
+| `MOTION_WINDOW`          | 8       | `TRACKER_MOTION_WINDOW`          | motion ring buffer size                           |
+| `MIN_MOTION_FRAMES`      | 5       | `TRACKER_MIN_MOTION_FRAMES`      | min samples before is_static returns non-None     |
+| `STATIC_IOU_THRESHOLD`   | 0.85    | `TRACKER_STATIC_IOU`             | IoU(oldest,newest) above this = "static"          |
+| `MIN_STATIC_DWELL_S`     | 2.0     | `TRACKER_MIN_STATIC_DWELL_S`     | wait this long before triggering VLM              |
+| `STATIC_REQUIRE_VERIFY`  | true    | `TRACKER_STATIC_REQUIRE_VERIFY`  | suppress unverified statics                       |
+| `VLM_VERDICT_TTL_S`      | 300     | `TRACKER_VLM_VERDICT_TTL_S`      | how long a yes/no verdict stays valid             |
+| `VLM_RETRY_COOLDOWN_S`   | 30      | `TRACKER_VLM_RETRY_COOLDOWN_S`   | min gap between VLM retries for same (tid, label) |
+| `VLM_CONCURRENCY`        | 2       | `TRACKER_VLM_CONCURRENCY`        | semaphore on simultaneous Moondream calls         |
+
 
 ---
 
@@ -267,6 +275,7 @@ The tracker does **not** open the DB directly. It POSTs batches every
 ```
 
 ### Admin reads
+
 - `GET /api/agent/tracks` — server/routes/agent-tracks.mjs → DB → JSON
 - `/admin/tracks` page — src/routes/admin/tracks.tsx fetches above, renders table
 
@@ -369,21 +378,23 @@ If you change app.py's pipeline, the eval reflects it on the next run.
 ### Eval ↔ prod symmetry — what differs?
 
 The eval pipeline matches prod **exactly** in:
+
 - model + tracker (YOLOv8s + ByteTrack), conf/IoU/imgsz
 - voter + motion classifier + VLM cache shape
 - suppression order and labels
 
 It differs from prod in:
+
 - **VLM verification is counted but never actually called.** The eval
-  records `suppression_reasons["vlm_pending:<label>"]` for each box
-  that *would* have queued a VLM call, but doesn't open a socket to
-  Moondream. To smoke the live VLM you have to run against a real
-  camera.
+records `suppression_reasons["vlm_pending:<label>"]` for each box
+that *would* have queued a VLM call, but doesn't open a socket to
+Moondream. To smoke the live VLM you have to run against a real
+camera.
 - **Per-frame "now" is synthetic.** `now_ts = kept_idx / target_fps`,
-  so motion-dwell calculations are deterministic and reproducible
-  but won't match wall-clock cadence.
+so motion-dwell calculations are deterministic and reproducible
+but won't match wall-clock cadence.
 - **No fan-out to WS subscribers / no Phase-11B ingest.** Pure
-  classifier — no networking, no broadcasts.
+classifier — no networking, no broadcasts.
 
 ---
 
@@ -392,29 +403,33 @@ It differs from prod in:
 Cross-reference this list with the eval's `suppression_reasons` field
 when something "should be detected but isn't":
 
-| symptom | first place to look |
-|---|---|
-| nothing detected | `CONF_THRESHOLD` too high, or `MODEL_PATH` missing → `model.track` returns 0 boxes |
-| boxes flicker on/off | `MIN_TRACK_FRAMES` too low, OR vote majority not reached (raw labels swapping) |
-| stuff labeled as "couch" / "umbrella" | `ALLOWED_CLASSES` includes the wrong noise class, or `PER_CLASS_CONF[bad_label]` floor too low |
+
+| symptom                                           | first place to look                                                                                      |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| nothing detected                                  | `CONF_THRESHOLD` too high, or `MODEL_PATH` missing → `model.track` returns 0 boxes                       |
+| boxes flicker on/off                              | `MIN_TRACK_FRAMES` too low, OR vote majority not reached (raw labels swapping)                           |
+| stuff labeled as "couch" / "umbrella"             | `ALLOWED_CLASSES` includes the wrong noise class, or `PER_CLASS_CONF[bad_label]` floor too low           |
 | moving objects shown but parked car never appears | VLM rejected it (`vlm_rejected:<label>` in suppression), OR VLM never called (cooldown / in-flight loop) |
-| labels strobe between two classes | `VOTE_WINDOW` too short — increase to 12-16 |
-| brand-new track delayed by ~1s | working as designed: `MIN_TRACK_FRAMES * (1/TARGET_FPS)` = 3 * 200 ms |
-| static person at door never appears | `STATIC_REQUIRE_VERIFY=true` AND VLM is unreachable (check `_VLMVerifier.cooled_down`) |
-| persistence missing in `/admin/tracks` | `TRACKER_INGEST_SECRET` mismatch between tracker env and Node env, or POST timing out |
-| live overlay drifts behind video | `image_w/h` in WS payload ≠ MSE video pixel dims — see `VideoTile.tsx` scale calc |
-| eval result != prod behavior | check eval.py's "**no VLM HTTP call**" caveat above, OR config overrides hash differs |
+| labels strobe between two classes                 | `VOTE_WINDOW` too short — increase to 12-16                                                              |
+| brand-new track delayed by ~1s                    | working as designed: `MIN_TRACK_FRAMES * (1/TARGET_FPS)` = 3 * 200 ms                                    |
+| static person at door never appears               | `STATIC_REQUIRE_VERIFY=true` AND VLM is unreachable (check `_VLMVerifier.cooled_down`)                   |
+| persistence missing in `/admin/tracks`            | `TRACKER_INGEST_SECRET` mismatch between tracker env and Node env, or POST timing out                    |
+| live overlay drifts behind video                  | `image_w/h` in WS payload ≠ MSE video pixel dims — see `VideoTile.tsx` scale calc                        |
+| eval result != prod behavior                      | check eval.py's "**no VLM HTTP call**" caveat above, OR config overrides hash differs                    |
+
 
 ### Specific functions worth re-reading when debugging
 
-| concern | function | file |
-|---|---|---|
-| "why is this box being dropped" | `_infer_and_classify` | services/tracker/app.py:861 |
-| "why is motion classified wrong" | `_BBoxHistory.update` + `is_static` | services/tracker/app.py:337 |
-| "why is the label flickering" | `_TrackVoter.update` | services/tracker/app.py:535 |
-| "why isn't the VLM answering" | `_call_ollama_yes_no` + `_verify_track` | services/tracker/app.py:466 / 704 |
-| "why isn't the static dot showing up after VLM verify" | `VLM_VERDICT_TTL_S` expiry, or cache miss after restart |
-| "why aren't sessions persisting" | `_flush_to_ingest` + `agent-tracks.mjs ingest handler` | services/tracker/app.py:759 |
+
+| concern                                                | function                                                | file                              |
+| ------------------------------------------------------ | ------------------------------------------------------- | --------------------------------- |
+| "why is this box being dropped"                        | `_infer_and_classify`                                   | services/tracker/app.py:861       |
+| "why is motion classified wrong"                       | `_BBoxHistory.update` + `is_static`                     | services/tracker/app.py:337       |
+| "why is the label flickering"                          | `_TrackVoter.update`                                    | services/tracker/app.py:535       |
+| "why isn't the VLM answering"                          | `_call_ollama_yes_no` + `_verify_track`                 | services/tracker/app.py:466 / 704 |
+| "why isn't the static dot showing up after VLM verify" | `VLM_VERDICT_TTL_S` expiry, or cache miss after restart |                                   |
+| "why aren't sessions persisting"                       | `_flush_to_ingest` + `agent-tracks.mjs ingest handler`  | services/tracker/app.py:759       |
+
 
 ---
 
@@ -458,8 +473,8 @@ when something "should be detected but isn't":
 ### Where each env var is read
 
 - Tracker (Python): `os.environ.get(...)` at module top of
-  `services/tracker/app.py` (lines 53-228) — values from
-  `/etc/odyn-aware/api.env` via systemd `EnvironmentFile`.
+`services/tracker/app.py` (lines 53-228) — values from
+`/etc/odyn-aware/api.env` via systemd `EnvironmentFile`.
 - Node: `process.env.X` in `server/api.mjs` and the route modules.
 - Frontend: nothing read at runtime; only Vite build-time `import.meta.env`.
 

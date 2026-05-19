@@ -178,6 +178,41 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "find_person_sightings",
+      description:
+        "Search when a known enrolled person appeared on camera. Returns timestamps, cameras, and optional Frigate clip ids. Use for 'did Kamal show up yesterday' or 'when was this person last seen'.",
+      parameters: {
+        type: "object",
+        properties: {
+          person_id: { type: "integer", description: "people.id from list_known_people" },
+          camera: { type: "string" },
+          since: { type: "string", description: "ISO8601 start time" },
+          until: { type: "string", description: "ISO8601 end time" },
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+        },
+        required: ["person_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_recurring_strangers",
+      description:
+        "List clustered unknown faces (recurring visitors not in the people DB). Shows how many times each stranger cluster was seen and on which cameras.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: { type: "string", enum: ["unreviewed", "ignored", "promoted"], default: "unreviewed" },
+          limit: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "get_daily_summary",
       description:
         "Return today's (or a specified day's) summary of camera activity. " +
@@ -439,6 +474,56 @@ async function runTool(name, args, ctx) {
           quality: r.quality,
           model: r.model,
           event_id: r.event_id,
+          track_session_id: r.track_session_id ?? null,
+          frigate_event_id: r.frigate_event_id ?? null,
+          cluster_id: r.cluster_id ?? null,
+        })),
+      };
+    }
+    if (name === "find_person_sightings") {
+      const person_id = Number(args?.person_id);
+      if (!Number.isInteger(person_id) || person_id <= 0) {
+        return { ok: false, error: "person_id_required" };
+      }
+      const since_ms = args?.since ? Date.parse(args.since) : Date.now() - 7 * 86400000;
+      const until_ms = args?.until ? Date.parse(args.until) : null;
+      const rows = ctx.harness?.findPersonSightingsFromDb?.({
+        person_id,
+        camera: args?.camera || null,
+        since_ms: Number.isFinite(since_ms) ? since_ms : null,
+        until_ms: until_ms && Number.isFinite(until_ms) ? until_ms : null,
+        limit: Math.min(Math.max(Number(args?.limit ?? 50), 1), 100),
+      }) ?? [];
+      return {
+        ok: true,
+        count: rows.length,
+        sightings: rows.map((r) => ({
+          at: r.created_at,
+          camera: r.camera,
+          similarity: r.similarity,
+          frigate_event_id: r.frigate_event_id,
+          track_session_id: r.track_session_id,
+        })),
+      };
+    }
+    if (name === "list_recurring_strangers") {
+      const status = args?.status === "ignored" || args?.status === "promoted"
+        ? args.status
+        : "unreviewed";
+      const rows = ctx.harness?.listFaceClustersFromDb?.({
+        status,
+        limit: Math.min(Math.max(Number(args?.limit ?? 20), 1), 50),
+      }) ?? [];
+      return {
+        ok: true,
+        count: rows.length,
+        clusters: rows.map((r) => ({
+          id: r.id,
+          member_count: r.member_count,
+          cameras: (() => { try { return JSON.parse(r.cameras_json); } catch { return []; } })(),
+          first_seen_at: r.first_seen_at,
+          last_seen_at: r.last_seen_at,
+          status: r.status,
         })),
       };
     }

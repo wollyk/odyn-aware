@@ -20,7 +20,12 @@
 
 import { request } from "node:http";
 import { URL } from "node:url";
-import { loadEmbeddingsForRecognition, recordFaceMatch } from "../db.mjs";
+import { loadEmbeddingsForRecognition } from "../db.mjs";
+import { insertFaceMatchExtended, updateFaceMatchThumb } from "../db/face-identity.mjs";
+import { saveFaceThumb } from "../util/face-thumb.mjs";
+import { getSettings, findTrackForFace } from "./face_identity.mjs";
+import { clusterUnknownMatch } from "./face_cluster.mjs";
+import { updateTrackIdentity } from "../db/face-identity.mjs";
 
 const FACE_EMBEDDER_URL = process.env.FACE_EMBEDDER_URL ?? "http://127.0.0.1:8765";
 const FACE_MODEL = process.env.FACE_EMBEDDER_MODEL ?? "buffalo_l";
@@ -212,10 +217,20 @@ export function cosine(a, b) {
  */
 export async function recognize(
   image,
-  { camera = "", event_id = null, recordMatch = true } = {},
+  {
+    camera = "",
+    event_id = null,
+    recordMatch = true,
+    track_session_id = null,
+    frigate_event_id = null,
+    imgW = 0,
+    imgH = 0,
+    tenant_id = "default",
+  } = {},
 ) {
   const out = await embed(image);
   const { rows, vecs } = await ensureLoaded();
+  const settings = recordMatch ? getSettings() : null;
   const results = [];
 
   for (const f of out.faces ?? []) {
@@ -248,11 +263,19 @@ export async function recognize(
       similarity: matched ? bestSim : (bestIdx >= 0 ? bestSim : 0),
       decision: matched ? "match" : "unknown",
     };
-    results.push(result);
+    let match_id = null;
+    let cluster_id = null;
 
     if (recordMatch && cachedDb && camera) {
       try {
-        recordFaceMatch(cachedDb, {
+        const storeVec = settings?.store_match_vectors !== false;
+        const probe = Float32Array.from(f.embedding ?? []);
+        const linkedTrack =
+          settings?.link_tracks !== false && imgW && imgH
+            ? findTrackForFace(camera, f.bbox, imgW, imgH) ?? track_session_id
+            : track_session_id;
+        const ins = insertFaceMatchExtended(cachedDb, {
+          tenant_id,
           camera,
           event_id,
           person_id: result.person_id,
@@ -260,11 +283,65 @@ export async function recognize(
           bbox: result.bbox,
           quality: result.quality,
           model: STORED_MODEL_TAG,
+          vec: storeVec && probe.length ? probe : null,
+          vec_dim: storeVec ? VEC_DIM : null,
+          track_session_id: settings?.link_tracks !== false ? linkedTrack : null,
+          frigate_event_id:
+            settings?.link_frigate_clips ? frigate_event_id : null,
         });
+        match_id = ins.id;
+
+        if (
+          result.decision === "unknown" &&
+          settings?.cluster_unknown_faces &&
+          storeVec &&
+          probe.length
+        ) {
+          const cl = await clusterUnknownMatch({
+            match_id,
+            vec: probe,
+            model: STORED_MODEL_TAG,
+            camera,
+            quality: result.quality,
+            settings,
+            tenant_id,
+          });
+          cluster_id = cl.cluster_id;
+        }
+
+        if (linkedTrack && settings?.link_tracks !== false) {
+          updateTrackIdentity(cachedDb, linkedTrack, {
+            person_id: result.person_id,
+            cluster_id,
+            frigate_event_id: settings?.link_frigate_clips ? frigate_event_id : null,
+          });
+        }
+
+        if (
+          settings?.store_match_thumbnails !== false &&
+          match_id &&
+          Array.isArray(f.bbox) &&
+          f.bbox.length === 4 &&
+          image?.length
+        ) {
+          try {
+            const maxPx = Number(settings.thumbnail_max_px ?? 256) || 256;
+            const rel = await saveFaceThumb(image, f.bbox, {
+              kind: "match",
+              id: match_id,
+              maxPx,
+            });
+            updateFaceMatchThumb(cachedDb, match_id, rel);
+          } catch (thumbErr) {
+            console.warn("[face] thumb save failed:", thumbErr?.message);
+          }
+        }
       } catch (err) {
-        console.warn("[face] recordFaceMatch failed:", err?.message);
+        console.warn("[face] insertFaceMatchExtended failed:", err?.message);
       }
     }
+
+    results.push({ ...result, match_id, cluster_id });
   }
   return {
     ok: true,

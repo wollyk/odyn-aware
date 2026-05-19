@@ -49,7 +49,10 @@ import time
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 
@@ -164,6 +167,50 @@ async def embed(image: UploadFile = File(...)) -> JSONResponse:
             "faces": out,
         }
     )
+
+
+@api.post("/crop")
+async def crop_face(
+    image: UploadFile = File(...),
+    bbox: str = Form(...),
+    max_px: int = Form(256),
+    padding: float = Form(0.12),
+) -> Response:
+    """Crop a face region from a JPEG/PNG and return a small JPEG thumbnail."""
+    if image.content_type and not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"bad_content_type: {image.content_type}")
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_body")
+    try:
+        box = json.loads(bbox)
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            raise ValueError("bbox must be [x1,y1,x2,y2]")
+        x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bad_bbox: {exc}") from exc
+
+    try:
+        im = Image.open(io.BytesIO(raw))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bad_image: {exc}") from exc
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    w, h = im.size
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    pad = max(0.0, min(float(padding), 0.5))
+    px = bw * pad
+    py = bh * pad
+    left = int(max(0, min(w - 1, x1 - px)))
+    top = int(max(0, min(h - 1, y1 - py)))
+    right = int(max(left + 1, min(w, x2 + px)))
+    bottom = int(max(top + 1, min(h, y2 + py)))
+    cropped = im.crop((left, top, right, bottom))
+    max_px = max(32, min(int(max_px), 512))
+    cropped.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    cropped.save(out, format="JPEG", quality=85, optimize=True)
+    return Response(content=out.getvalue(), media_type="image/jpeg")
 
 
 @api.post("/similarity")

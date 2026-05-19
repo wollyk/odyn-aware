@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { applyAlertsSchema } from "./db/alerts.mjs";
 import { applyTracksSchema } from "./db/tracks.mjs";
 import { applyEvalsSchema } from "./db/evals.mjs";
+import { applyFaceIdentitySchema } from "./db/face-identity.mjs";
 
 const DEFAULT_PATH = path.resolve(process.cwd(), "data/odyn.db");
 
@@ -222,6 +223,7 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
   applyAlertsSchema(db);
   applyTracksSchema(db);
   applyEvalsSchema(db);
+  applyFaceIdentitySchema(db);
   return db;
 }
 
@@ -676,6 +678,15 @@ export function deleteFaceEmbedding(db, id) {
   return db.prepare(`DELETE FROM face_embeddings WHERE id = ?`).run(id);
 }
 
+export function updateFaceEmbeddingPhotoPath(db, id, photo_path) {
+  return db.prepare(`UPDATE face_embeddings SET photo_path = ? WHERE id = ?`).run(photo_path, id);
+}
+
+export function getFaceEmbeddingPhotoPath(db, id) {
+  const row = db.prepare(`SELECT photo_path FROM face_embeddings WHERE id = ?`).get(id);
+  return row?.photo_path ?? null;
+}
+
 /**
  * Load every embedding for the given tenant + model into memory. The
  * recognizer expects to do an in-memory cosine-similarity scan because we
@@ -764,6 +775,7 @@ export function listRecentFaceMatches(
     .prepare(
       `SELECT fm.id, fm.created_at, fm.camera, fm.event_id, fm.person_id,
               fm.similarity, fm.quality, fm.bbox_json, fm.model,
+              fm.track_session_id, fm.frigate_event_id, fm.cluster_id, fm.thumb_path,
               p.name AS person_name
          FROM face_matches fm
     LEFT JOIN people p ON p.id = fm.person_id

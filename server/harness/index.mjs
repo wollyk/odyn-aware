@@ -32,6 +32,14 @@ import * as tier1 from "./tier1.mjs";
 import * as tier2 from "./tier2.mjs";
 import * as tier3 from "./tier3.mjs";
 import * as face from "./face.mjs";
+import * as faceIdentity from "./face_identity.mjs";
+import * as faceCluster from "./face_cluster.mjs";
+import {
+  setFaceIdentitySettings as persistFaceIdentitySettings,
+  findPersonSightings,
+  listFaceClusters,
+  setClusterStatus,
+} from "../db/face-identity.mjs";
 import * as weapon from "./weapon.mjs";
 import * as summary from "./summary.mjs";
 import * as alerts from "./alerts.mjs";
@@ -80,6 +88,8 @@ export function start(deps) {
   // matrix. Sidecar reachability is opportunistic; it fails open until
   // the InsightFace service is installed (services/face-embedder).
   face.init({ db: deps.db });
+  faceIdentity.init({ db: deps.db });
+  faceCluster.init({ db: deps.db });
 
   // Phase 6: weapon / suspicious-object detector. Stateless on the Node
   // side (no DB lookups), so init() is a no-op marker. Sidecar
@@ -180,7 +190,40 @@ export async function embedFace({ imageBuffer } = {}) {
 /** Drop the in-memory face cache. Call after enroll/delete from the API layer. */
 export function invalidateFaceCache() {
   face.invalidate();
+  faceCluster.invalidateClusterCache();
 }
+
+export function getFaceIdentitySettings() {
+  return faceIdentity.getSettings();
+}
+
+export function saveFaceIdentitySettings(settings, opts) {
+  if (!_deps?.db) throw new Error("harness not started");
+  const merged = persistFaceIdentitySettings(_deps.db, settings, opts);
+  faceCluster.invalidateClusterCache();
+  return merged;
+}
+
+export function searchFacesByProbe(probe, opts) {
+  return faceIdentity.searchByVector(probe, opts);
+}
+
+export function findPersonSightingsFromDb(opts) {
+  if (!_deps?.db) return [];
+  return findPersonSightings(_deps.db, opts);
+}
+
+export function listFaceClustersFromDb(opts) {
+  if (!_deps?.db) return [];
+  return listFaceClusters(_deps.db, opts);
+}
+
+export function setFaceClusterStatus(id, status, opts) {
+  if (!_deps?.db) throw new Error("harness not started");
+  setClusterStatus(_deps.db, id, status, opts);
+  faceCluster.invalidateClusterCache();
+}
+
 
 export const FACE_CONFIG = face.FACE_CONFIG;
 
@@ -293,6 +336,24 @@ export async function analyzeImageRouted({
     tier3.analyzeImage({ imageBuffer: ib, camera: c })
   );
 
+  const frameDims = getJpegDims(imageBuffer);
+  const frameW = frameDims?.width ?? 0;
+  const frameH = frameDims?.height ?? 0;
+  const identitySettings = faceIdentity.getSettings();
+  let frameFrigateEventId = null;
+  if (identitySettings?.link_frigate_clips && _deps?.frigate && camera) {
+    frameFrigateEventId = await faceIdentity.findFrigateEventId(_deps.frigate, camera);
+  }
+  const harnessEventId = `routed_${crypto.randomUUID()}`;
+  const faceOpts = {
+    camera,
+    event_id: harnessEventId,
+    recordMatch: true,
+    imgW: frameW,
+    imgH: frameH,
+    frigate_event_id: frameFrigateEventId,
+  };
+
   // Step 1: T2 + face + weapon in parallel. T2 is the slow path (~1-2s
   // local VLM); face recognition is ~166ms; weapon is ~100-250ms (yolov8n
   // CPU). All three work on the same already-fetched frame buffer so we
@@ -305,7 +366,7 @@ export async function analyzeImageRouted({
   if (mode !== "off" && mode !== "always-t3") {
     const [t2Settled, faceSettled, weaponSettled] = await Promise.allSettled([
       t2Caller({ imageBuffer, camera }),
-      face.recognize(imageBuffer, { camera, recordMatch: true }).catch((err) => ({
+      face.recognize(imageBuffer, faceOpts).catch((err) => ({
         ok: false, error: err?.message ?? "recognize_failed", faces: [],
       })),
       weapon.scoreSafe(imageBuffer),
@@ -318,7 +379,7 @@ export async function analyzeImageRouted({
     t2Result = { ok: false, severity: "normal", scene: "", alert_type: null, confidence: 0, hits: {} };
     // Still run faces + weapons so the badges surface.
     [faceResult, weaponResult] = await Promise.all([
-      face.recognize(imageBuffer, { camera, recordMatch: true })
+      face.recognize(imageBuffer, faceOpts)
         .catch((err) => ({ ok: false, error: err?.message ?? "recognize_failed", faces: [] })),
       weapon.scoreSafe(imageBuffer),
     ]);
@@ -520,7 +581,7 @@ export async function analyzeImageRouted({
   // Publish is fire-and-forget: subscribers run synchronously on the
   // event bus but their dispatch work is async + non-blocking.
   if (shouldPublishAlert(result)) {
-    const event_id = result?.detections?.event_id ?? `routed_${crypto.randomUUID()}`;
+    const event_id = result?.detections?.event_id ?? harnessEventId;
     try {
       publish(TOPIC.ALERT, alerts.buildAlertPayload({
         event_id,
