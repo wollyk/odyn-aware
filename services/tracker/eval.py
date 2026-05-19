@@ -40,13 +40,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import os
 import sys
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 # Production imports. Importing here pulls torch + ultralytics + cv2,
 # so the CLI takes ~3s to start cold. Acceptable — runs are minutes long.
@@ -85,9 +89,13 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "allowed_classes": sorted(ALLOWED_CLASSES) if ALLOWED_CLASSES else [],
     "static_require_verify": STATIC_REQUIRE_VERIFY,
     "vlm_enabled": False,  # off by default; flip with --vlm
+    "faces_enabled": True,  # InsightFace sidecar; emits per-frame face bboxes
+    "face_min_quality": 0.55,
     "max_frames": None,  # None = entire video
     "fps_cap": None,  # None = use video's native fps
 }
+
+FACE_EMBEDDER_URL = os.environ.get("FACE_EMBEDDER_URL", "http://127.0.0.1:8765").rstrip("/")
 
 
 def merge_config(overrides: dict[str, Any] | None) -> dict[str, Any]:
@@ -98,6 +106,58 @@ def merge_config(overrides: dict[str, Any] | None) -> dict[str, Any]:
             if k in cfg:
                 cfg[k] = v
     return cfg
+
+
+def detect_faces_on_frame(
+    pil,
+    ow: int,
+    oh: int,
+    *,
+    enabled: bool,
+    min_quality: float,
+) -> list[dict[str, Any]]:
+    """Call the face-embedder sidecar; return normalized xywh face boxes."""
+    if not enabled or ow <= 0 or oh <= 0:
+        return []
+    buf = io.BytesIO()
+    pil.convert("RGB").save(buf, format="JPEG", quality=85)
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            res = client.post(
+                f"{FACE_EMBEDDER_URL}/embed",
+                files={"image": ("frame.jpg", buf.getvalue(), "image/jpeg")},
+            )
+        res.raise_for_status()
+        data = res.json()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[eval] face embedder warn: {exc}", flush=True)
+        return []
+
+    faces_out: list[dict[str, Any]] = []
+    for f in data.get("faces") or []:
+        q = float(f.get("quality") or 0.0)
+        if q < min_quality:
+            continue
+        bbox = f.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        w = max(0.0, x2 - x1)
+        h = max(0.0, y2 - y1)
+        if w <= 0 or h <= 0:
+            continue
+        faces_out.append(
+            {
+                "bbox": [
+                    round(x1 / ow, 5),
+                    round(y1 / oh, 5),
+                    round(w / ow, 5),
+                    round(h / oh, 5),
+                ],
+                "quality": round(q, 4),
+            }
+        )
+    return faces_out
 
 
 def hash_config(cfg: dict[str, Any]) -> str:
@@ -252,6 +312,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             overrides = json.load(f)
     if args.vlm:
         overrides["vlm_enabled"] = True
+    if getattr(args, "no_faces", False):
+        overrides["faces_enabled"] = False
     if args.max_frames is not None:
         overrides["max_frames"] = args.max_frames
     if args.fps is not None:
@@ -447,6 +509,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                         if vlm is not None:
                             vlm.gc(now_ts)
 
+                faces_emitted = detect_faces_on_frame(
+                    pil,
+                    ow,
+                    oh,
+                    enabled=bool(cfg.get("faces_enabled", True)),
+                    min_quality=float(cfg.get("face_min_quality", 0.55)),
+                )
+
                 fout.write(
                     json.dumps(
                         {
@@ -457,6 +527,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                             "image_h": oh,
                             "infer_ms": t_infer_ms,
                             "tracks": tracks_emitted,
+                            "faces": faces_emitted,
                         }
                     )
                     + "\n"
@@ -465,7 +536,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     fout.flush()
                     print(
                         f"[eval:{run_id}] frame={kept_idx} infer={t_infer_ms}ms "
-                        f"emitted={len(tracks_emitted)}",
+                        f"emitted={len(tracks_emitted)} faces={len(faces_emitted)}",
                         flush=True,
                     )
 
@@ -655,6 +726,11 @@ def main() -> int:
     p_run.add_argument("--out", required=True, help="JSONL output path")
     p_run.add_argument("--config", help="JSON config overrides")
     p_run.add_argument("--vlm", action="store_true", help="enable VLM verification path")
+    p_run.add_argument(
+        "--no-faces",
+        action="store_true",
+        help="skip InsightFace face boxes (default: faces on)",
+    )
     p_run.add_argument("--max-frames", type=int, dest="max_frames")
     p_run.add_argument("--fps", type=float, help="override target fps (default = video fps)")
     p_run.add_argument("--run-id", dest="run_id", help="optional explicit run UUID")

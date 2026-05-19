@@ -41,6 +41,13 @@ type TrackEmit = {
   verified: boolean | null;
 };
 
+type FaceEmit = {
+  bbox: [number, number, number, number];
+  quality: number;
+  person_name?: string | null;
+  decision?: "match" | "unknown" | "low_quality";
+};
+
 type Frame = {
   type: "frame";
   frame: number;
@@ -49,6 +56,7 @@ type Frame = {
   image_h: number;
   infer_ms: number;
   tracks: TrackEmit[];
+  faces?: FaceEmit[];
 };
 
 type Header = {
@@ -83,6 +91,7 @@ export function EvalPlayer({
   const [videoTime, setVideoTime] = useState(0);
   const [showLabels, setShowLabels] = useState(true);
   const [showStatic, setShowStatic] = useState(true);
+  const [showFaces, setShowFaces] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   // Sequence-mode playback state. Ignored when source_kind === "video".
   const [seqIdx, setSeqIdx] = useState(0);
@@ -169,6 +178,13 @@ export function EvalPlayer({
   showLabelsRef.current = showLabels;
   const showStaticRef = useRef(showStatic);
   showStaticRef.current = showStatic;
+  const showFacesRef = useRef(showFaces);
+  showFacesRef.current = showFaces;
+
+  const hasFaceData = useMemo(
+    () => frames.some((f) => (f.faces?.length ?? 0) > 0),
+    [frames],
+  );
 
   // -- video-mode overlay loop --------------------------------------------
   useEffect(() => {
@@ -195,6 +211,7 @@ export function EvalPlayer({
       drawOverlay(c, v, framesRef.current[lastFrameIdx] ?? null, {
         showLabels: showLabelsRef.current,
         showStatic: showStaticRef.current,
+        showFaces: showFacesRef.current,
       });
       raf = requestAnimationFrame(tick);
     };
@@ -333,6 +350,12 @@ export function EvalPlayer({
           · {frames.length} frames
         </span>
       </div>
+      {!hasFaceData && frames.length > 0 && (
+        <p className="font-mono text-[11px] text-amber-400/90 border border-amber-400/30 bg-amber-400/5 px-3 py-2">
+          This run has no face boxes in its JSONL (recorded before face-in-eval shipped). Re-run the eval
+          to bake head boxes — green = person track, dashed cyan = face.
+        </p>
+      )}
 
       <div
         ref={wrapRef}
@@ -482,6 +505,14 @@ export function EvalPlayer({
             />
             static tracks
           </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={showFaces}
+              onChange={(e) => setShowFaces(e.target.checked)}
+            />
+            face boxes
+          </label>
         </div>
         <div className="text-foreground/55">
           t ={" "}
@@ -498,7 +529,10 @@ export function EvalPlayer({
               infer {currentFrame.infer_ms}ms
               {" · "}
               <span className="text-foreground/85">
-                {currentFrame.tracks.length} emit
+                {currentFrame.tracks.length} tracks
+                {(currentFrame.faces?.length ?? 0) > 0
+                  ? ` · ${currentFrame.faces!.length} faces`
+                  : ""}
               </span>
             </>
           ) : (
@@ -619,7 +653,7 @@ function drawOverlay(
   canvas: HTMLCanvasElement,
   source: HTMLVideoElement | HTMLImageElement,
   frame: Frame | null,
-  opts: { showLabels: boolean; showStatic: boolean },
+  opts: { showLabels: boolean; showStatic: boolean; showFaces: boolean },
 ) {
   // The canvas covers the wrap container's full client box (so it
   // works whether the video is at intrinsic size with no letterboxing
@@ -733,6 +767,39 @@ function drawOverlay(
       ctx.fillRect(x, labelY, metrics.width + padX * 2, textH);
       ctx.fillStyle = "#0a0a0a";
       ctx.fillText(lbl, x + padX, labelY + textH - 3);
+    }
+  }
+
+  if (opts.showFaces && frame.faces?.length) {
+    const faceLineW = Math.max(1, lineW - 1);
+    const faceFontPx = Math.max(10, labelFontPx - 1);
+    ctx.font = `${faceFontPx}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    for (const f of frame.faces) {
+      const [bx, by, bw, bh] = f.bbox;
+      const x = offsetX + bx * renderedW;
+      const y = offsetY + by * renderedH;
+      const ww = bw * renderedW;
+      const hh = bh * renderedH;
+      const known = f.decision === "match";
+      const color = known ? "#38bdf8" : "#fbbf24";
+      ctx.lineWidth = faceLineW;
+      ctx.strokeStyle = color;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x, y, ww, hh);
+      ctx.setLineDash([]);
+      if (opts.showLabels) {
+        const lbl =
+          f.person_name ??
+          (f.quality > 0 ? `face ${(f.quality * 100).toFixed(0)}%` : "face");
+        const metrics = ctx.measureText(lbl);
+        const textH = faceFontPx + 2;
+        const padX = 4;
+        const labelY = y > textH ? y - textH : y + hh;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, labelY, metrics.width + padX * 2, textH);
+        ctx.fillStyle = "#0a0a0a";
+        ctx.fillText(lbl, x + padX, labelY + textH - 3);
+      }
     }
   }
 }
