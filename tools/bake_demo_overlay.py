@@ -104,14 +104,26 @@ def _draw_track(img, t: dict, w: int, h: int, show_labels: bool) -> None:
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
     if show_labels:
-        lbl = f"{t.get('label', '?')}"
-        # Compact label; the live player shows more but homepage demo
-        # benefits from a clean look.
+        # Match EvalPlayer.tsx::drawOverlay label format:
+        #   "{label} #{id} {conf*100}%"
+        # The #id part is the whole reason this demo exists — it's the
+        # visual proof that ByteTrack keeps the same number on the same
+        # person across frames. Without it the boxes look like simple
+        # detection.
+        tid = t.get("id")
+        conf = t.get("conf")
+        parts = [str(t.get("label", "?"))]
+        if tid is not None:
+            parts.append(f"#{int(tid)}")
+        if isinstance(conf, (int, float)):
+            parts.append(f"{int(round(conf * 100))}%")
+        lbl = " ".join(parts)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.45
+        scale = 0.5
         thick = 1
         (tw, th), _ = cv2.getTextSize(lbl, font, scale, thick)
         pad = 3
+        # If we can't fit the label above the box, put it inside the top.
         ly1 = max(0, y1 - th - 2 * pad)
         ly2 = ly1 + th + 2 * pad
         lx1 = x1
