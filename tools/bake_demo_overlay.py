@@ -52,6 +52,7 @@ _PERSON_BGR = (153, 211, 52)        # #34d399
 _PET_BGR = (252, 211, 125)          # #7dd3fc
 _VEHICLE_BGR = (36, 191, 251)       # #fbbf24
 _OTHER_BGR = (225, 213, 203)        # #cbd5e1
+_FACE_BGR = (248, 189, 56)          # #38bdf8 — EvalPlayer face_unknown/known
 
 
 def _color_for_label(label: str) -> tuple[int, int, int]:
@@ -141,6 +142,39 @@ def _draw_track(img, t: dict, w: int, h: int, show_labels: bool) -> None:
         )
 
 
+def _draw_face(img, f: dict, w: int, h: int) -> None:
+    """Tight head box — dashed cyan, drawn inside the person track."""
+    bx, by, bw, bh = f["bbox"]
+    x1 = max(0, int(bx * w))
+    y1 = max(0, int(by * h))
+    x2 = min(w - 1, int((bx + bw) * w))
+    y2 = min(h - 1, int((by + bh) * h))
+    _dashed_rect(img, (x1, y1), (x2, y2), _FACE_BGR, 1, dash=4, gap=3)
+    q = f.get("quality")
+    if isinstance(q, (int, float)) and q > 0:
+        lbl = f"face {int(round(q * 100))}%"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.4
+        thick = 1
+        (tw, th), _ = cv2.getTextSize(lbl, font, scale, thick)
+        pad = 2
+        ly1 = max(0, y1 - th - 2 * pad)
+        ly2 = ly1 + th + 2 * pad
+        lx1 = x1
+        lx2 = min(w - 1, x1 + tw + 2 * pad)
+        cv2.rectangle(img, (lx1, ly1), (lx2, ly2), _FACE_BGR, -1)
+        cv2.putText(
+            img,
+            lbl,
+            (lx1 + pad, ly2 - pad),
+            font,
+            scale,
+            (10, 10, 10),
+            thick,
+            cv2.LINE_AA,
+        )
+
+
 def _dashed_rect(img, p1, p2, color, thick, dash=6, gap=4) -> None:
     x1, y1 = p1
     x2, y2 = p2
@@ -211,6 +245,9 @@ def bake(video_path: Path, jsonl_path: Path, out_path: Path) -> dict:
                 if ev is not None:
                     for trk in ev.get("tracks", []):
                         _draw_track(img, trk, w, h, show_labels=True)
+                        n_boxes += 1
+                    for face in ev.get("faces", []):
+                        _draw_face(img, face, w, h)
                         n_boxes += 1
                     n_drawn += 1
                 kept_idx += 1

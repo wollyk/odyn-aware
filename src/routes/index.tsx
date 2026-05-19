@@ -130,19 +130,43 @@ function Index() {
         </div>
       </section>
 
-      {/* TRACKING — the autoplay demo carries this section. */}
-      <section id="tracking" className="border-t border-border">
+      {/* IDENTITY — baked eval 15.mp4 with person + face overlays. */}
+      <section id="identity" className="border-t border-border">
         <div className="mx-auto max-w-7xl px-6 py-24 sm:py-32">
           <div className="grid gap-12 lg:grid-cols-12 lg:items-center">
             <div className="lg:col-span-5">
               <h2 className="text-4xl font-light leading-tight tracking-tight sm:text-5xl">
-                Follow every<br />
-                moving thing.
+                Know who belongs<br />
+                — and who <span className="italic font-serif">doesn&apos;t.</span>
               </h2>
               <p className="mt-6 text-base leading-relaxed text-muted-foreground">
-                One person, one number — kept the same as they move between
-                cameras. So you can actually answer "where did they go".
+                Green boxes follow each person. Cyan boxes lock onto every face.
+                Upload a photo and search your footage. Get alerted when someone
+                unrecognized shows up where they shouldn&apos;t.
               </p>
+              <ul className="mt-8 space-y-4 border-y border-border py-6 font-mono text-xs text-foreground/85">
+                <li className="flex gap-3">
+                  <span className="shrink-0 text-emerald-400">01</span>
+                  <span>
+                    <strong className="text-foreground">Search</strong> — find
+                    this person across cameras and shifts
+                  </span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="shrink-0 text-sky-400">02</span>
+                  <span>
+                    <strong className="text-foreground">Authorize</strong> — enroll
+                    staff and contractors who are allowed on site
+                  </span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="shrink-0 text-alert">03</span>
+                  <span>
+                    <strong className="text-foreground">Alert</strong> — flag
+                    unrecognized faces in a restricted area
+                  </span>
+                </li>
+              </ul>
             </div>
             <figure className="lg:col-span-7">
               <div className="overflow-hidden border border-border bg-card/30 shadow-2xl">
@@ -150,14 +174,14 @@ function Index() {
                     eval run. Lives at /demo/* (nginx alias outside dist/)
                     so it survives rebuilds. */}
                 <video
-                  src="/demo/aurora-tracking.mp4"
+                  src="/demo/aurora-identity.mp4"
                   poster={liveCroatia}
                   autoPlay
                   loop
                   muted
                   playsInline
                   preload="metadata"
-                  aria-label="People walking through a scene, each given a persistent number"
+                  aria-label="Crowd scene with each person numbered and a box around every face"
                   className="block h-auto w-full"
                 />
               </div>
