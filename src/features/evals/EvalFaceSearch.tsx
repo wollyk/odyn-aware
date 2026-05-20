@@ -3,6 +3,7 @@
 // gallery is every face vector stored in that run's JSONL (vec_b64 per face).
 
 import { useState } from "react";
+import { compressProbeImage } from "@/lib/probe-image";
 
 export type EvalSearchHit = {
   frame: number;
@@ -34,7 +35,8 @@ export function EvalFaceSearch({
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
-    const dataUrl = await readAsDataUrl(f);
+    const raw = await readAsDataUrl(f);
+    const dataUrl = await compressProbeImage(raw);
     setPreview(dataUrl);
     setImageBase64(dataUrl);
     setHits([]);
@@ -54,7 +56,16 @@ export function EvalFaceSearch({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_base64: imageBase64, threshold, limit: 40 }),
       });
-      const data = await res.json();
+      const ct = res.headers.get("content-type") ?? "";
+      const text = await res.text();
+      if (!ct.includes("application/json")) {
+        throw new Error(
+          res.status === 413
+            ? "Probe image too large for the server proxy (try a smaller crop)."
+            : `Server returned non-JSON (${res.status}). ${text.slice(0, 120)}`,
+        );
+      }
+      const data = JSON.parse(text) as Record<string, unknown>;
       if (!res.ok) {
         const hint = data?.detail?.hint ?? data?.hint ?? data?.detail ?? data?.error;
         throw new Error(typeof hint === "string" ? hint : JSON.stringify(hint ?? data));
