@@ -205,9 +205,12 @@ function AdminEvals() {
     setSeekTarget({
       ts_s: hit.ts_s,
       frame: hit.frame,
+      face_index: hit.face_index,
+      similarity: hit.similarity,
+      bbox: hit.bbox,
       token: Date.now(),
     });
-    playerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    playerRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, []);
 
   const fetchAll = useCallback(async () => {

@@ -73,6 +73,9 @@ type Header = {
 export type EvalSeekTarget = {
   ts_s: number;
   frame: number;
+  face_index?: number;
+  similarity?: number;
+  bbox?: [number, number, number, number];
   /** Bumped on each seek so repeated clicks on the same frame still run. */
   token: number;
 };
@@ -110,21 +113,32 @@ export function EvalPlayer({
   // Jump to a search hit (video time or sequence frame index).
   useEffect(() => {
     if (!seekTarget || !header || frames.length === 0) return;
+    highlightFaceRef.current =
+      seekTarget.face_index != null
+        ? {
+            face_index: seekTarget.face_index,
+            similarity: seekTarget.similarity,
+          }
+        : null;
     setSeqPlaying(false);
+    const fi = findFrameIndexByNumber(frames, seekTarget.frame);
+    const frameIdx = fi >= 0 ? fi : findClosestFrame(frames, seekTarget.ts_s);
     if (isSequence) {
-      const idx = Math.max(
-        0,
-        Math.min(frames.length - 1, seekTarget.frame),
-      );
+      const idx =
+        frameIdx >= 0
+          ? frameIdx
+          : Math.max(0, Math.min(frames.length - 1, seekTarget.frame));
       setSeqIdx(idx);
       setCurrentFrame(frames[idx] ?? null);
     } else {
       const v = videoRef.current;
+      if (frameIdx >= 0) setCurrentFrame(frames[frameIdx]);
       if (v) {
-        v.currentTime = Math.max(0, seekTarget.ts_s);
-        setVideoTime(seekTarget.ts_s);
-        const fi = findClosestFrame(frames, seekTarget.ts_s);
-        if (fi >= 0) setCurrentFrame(frames[fi]);
+        seekVideoTo(v, seekTarget.ts_s, () => {
+          setVideoTime(v.currentTime);
+          const synced = findClosestFrame(frames, v.currentTime);
+          if (synced >= 0) setCurrentFrame(frames[synced]);
+        });
       }
     }
   }, [seekTarget, isSequence, frames, header]);
@@ -211,6 +225,10 @@ export function EvalPlayer({
   showStaticRef.current = showStatic;
   const showFacesRef = useRef(showFaces);
   showFacesRef.current = showFaces;
+  const highlightFaceRef = useRef<{
+    face_index: number;
+    similarity?: number;
+  } | null>(null);
 
   const hasFaceData = useMemo(
     () => frames.some((f) => (f.faces?.length ?? 0) > 0),
@@ -243,6 +261,7 @@ export function EvalPlayer({
         showLabels: showLabelsRef.current,
         showStatic: showStaticRef.current,
         showFaces: showFacesRef.current,
+        highlightFace: highlightFaceRef.current,
       });
       raf = requestAnimationFrame(tick);
     };
@@ -294,6 +313,8 @@ export function EvalPlayer({
       drawOverlay(c, img, frame, {
         showLabels: showLabelsRef.current,
         showStatic: showStaticRef.current,
+        showFaces: showFacesRef.current,
+        highlightFace: highlightFaceRef.current,
       });
       raf = requestAnimationFrame(tick);
     };
@@ -650,6 +671,35 @@ export function EvalPlayer({
 
 // ---- helpers ------------------------------------------------------------
 
+function findFrameIndexByNumber(frames: Frame[], frameNum: number): number {
+  let lo = 0;
+  let hi = frames.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const f = frames[mid].frame;
+    if (f === frameNum) return mid;
+    if (f < frameNum) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+function seekVideoTo(
+  v: HTMLVideoElement,
+  ts_s: number,
+  onDone?: () => void,
+) {
+  const t = Math.max(0, ts_s);
+  const run = () => {
+    v.pause();
+    const bump = Math.abs(v.currentTime - t) < 0.02 ? 0.001 : 0;
+    if (onDone) v.addEventListener("seeked", () => onDone(), { once: true });
+    v.currentTime = t + bump;
+  };
+  if (v.readyState >= 2) run();
+  else v.addEventListener("loadeddata", run, { once: true });
+}
+
 function findClosestFrame(frames: Frame[], t: number): number {
   // Binary search by ts_s. Returns index of the frame whose ts_s is
   // closest to (and not significantly after) `t`. -1 if none.
@@ -684,7 +734,12 @@ function drawOverlay(
   canvas: HTMLCanvasElement,
   source: HTMLVideoElement | HTMLImageElement,
   frame: Frame | null,
-  opts: { showLabels: boolean; showStatic: boolean; showFaces: boolean },
+  opts: {
+    showLabels: boolean;
+    showStatic: boolean;
+    showFaces: boolean;
+    highlightFace?: { face_index: number; similarity?: number } | null;
+  },
 ) {
   // The canvas covers the wrap container's full client box (so it
   // works whether the video is at intrinsic size with no letterboxing
@@ -805,23 +860,30 @@ function drawOverlay(
     const faceLineW = Math.max(1, lineW - 1);
     const faceFontPx = Math.max(10, labelFontPx - 1);
     ctx.font = `${faceFontPx}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-    for (const f of frame.faces) {
+    const hi = opts.highlightFace?.face_index ?? -1;
+    frame.faces.forEach((f, faceIdx) => {
       const [bx, by, bw, bh] = f.bbox;
       const x = offsetX + bx * renderedW;
       const y = offsetY + by * renderedH;
       const ww = bw * renderedW;
       const hh = bh * renderedH;
+      const isHit = faceIdx === hi;
       const known = f.decision === "match";
-      const color = known ? "#38bdf8" : "#fbbf24";
-      ctx.lineWidth = faceLineW;
+      const color = isHit ? "#f472b6" : known ? "#38bdf8" : "#fbbf24";
+      ctx.lineWidth = isHit ? Math.max(3, lineW + 1) : faceLineW;
       ctx.strokeStyle = color;
-      ctx.setLineDash([4, 3]);
+      ctx.setLineDash(isHit ? [] : [4, 3]);
       ctx.strokeRect(x, y, ww, hh);
       ctx.setLineDash([]);
       if (opts.showLabels) {
-        const lbl =
-          f.person_name ??
-          (f.quality > 0 ? `face ${(f.quality * 100).toFixed(0)}%` : "face");
+        const sim =
+          isHit && opts.highlightFace?.similarity != null
+            ? ` ${(opts.highlightFace.similarity * 100).toFixed(0)}%`
+            : "";
+        const lbl = isHit
+          ? `probe match${sim}`
+          : (f.person_name ??
+            (f.quality > 0 ? `face ${(f.quality * 100).toFixed(0)}%` : "face"));
         const metrics = ctx.measureText(lbl);
         const textH = faceFontPx + 2;
         const padX = 4;
@@ -831,7 +893,7 @@ function drawOverlay(
         ctx.fillStyle = "#0a0a0a";
         ctx.fillText(lbl, x + padX, labelY + textH - 3);
       }
-    }
+    });
   }
 }
 

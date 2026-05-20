@@ -92,7 +92,10 @@ export function EvalFaceSearch({
       <p className="mt-2 text-xs text-muted-foreground max-w-2xl">
         Upload the passport or face screenshot (your probe). We embed it with the same
         InsightFace model used during the eval, then cosine-match against every face
-        vector stored in this run. Click a hit to jump the player to that moment.
+        vector stored in this run. Hits are scored against <strong>your probe</strong> —
+        not enrolled names (use <span className="font-mono">/admin/faces</span> for that).
+        Click <span className="font-mono">Jump →</span> to seek the player and highlight
+        the matching face box in pink.
       </p>
       <p className="mt-1 font-mono text-[10px] text-foreground/50">
         Runs completed before vector indexing was enabled must be re-run once.
@@ -144,6 +147,7 @@ export function EvalFaceSearch({
               <tr className="border-b border-border bg-card/40 text-left text-foreground/55 uppercase tracking-widest">
                 <th className="px-2 py-2">Time</th>
                 <th className="px-2 py-2">Frame</th>
+                <th className="px-2 py-2">Face</th>
                 <th className="px-2 py-2">Sim</th>
                 <th className="px-2 py-2">Quality</th>
                 <th className="px-2 py-2" />
@@ -157,6 +161,7 @@ export function EvalFaceSearch({
                 >
                   <td className="px-2 py-2 text-foreground/85">{h.ts_s.toFixed(2)}s</td>
                   <td className="px-2 py-2 text-foreground/85">{h.frame}</td>
+                  <td className="px-2 py-2 text-foreground/70">#{h.face_index + 1}</td>
                   <td className="px-2 py-2 text-sky-300">
                     {(h.similarity * 100).toFixed(0)}%
                   </td>
