@@ -23,7 +23,8 @@ import {
   AuthLoadingScreen,
   useAdminAuth,
 } from "@/components/admin-shell";
-import { EvalPlayer } from "@/features/evals/EvalPlayer";
+import { EvalFaceSearch, type EvalSearchHit } from "@/features/evals/EvalFaceSearch";
+import { EvalPlayer, type EvalSeekTarget } from "@/features/evals/EvalPlayer";
 import { UploadDropzone } from "@/features/evals/UploadDropzone";
 
 export const Route = createFileRoute("/admin/evals")({
@@ -197,7 +198,17 @@ function AdminEvals() {
 
   // -- player state: which run to play, scrolled-into-view container
   const [viewingRunId, setViewingRunId] = useState<string | null>(null);
+  const [seekTarget, setSeekTarget] = useState<EvalSeekTarget | null>(null);
   const playerRef = useRef<HTMLDivElement | null>(null);
+
+  const handleSearchSeek = useCallback((hit: EvalSearchHit) => {
+    setSeekTarget({
+      ts_s: hit.ts_s,
+      frame: hit.frame,
+      token: Date.now(),
+    });
+    playerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -657,6 +668,7 @@ function AdminEvals() {
                             type="button"
                             onClick={() => {
                               setViewingRunId(r.run_id);
+                              setSeekTarget(null);
                               setTimeout(
                                 () =>
                                   playerRef.current?.scrollIntoView({
@@ -705,7 +717,10 @@ function AdminEvals() {
                   </h2>
                   <button
                     type="button"
-                    onClick={() => setViewingRunId(null)}
+                    onClick={() => {
+                      setViewingRunId(null);
+                      setSeekTarget(null);
+                    }}
                     className="font-mono text-[10px] uppercase tracking-widest text-foreground/55 hover:text-foreground"
                   >
                     × close
@@ -715,6 +730,12 @@ function AdminEvals() {
                   key={viewingRunId}
                   runId={viewingRunId}
                   clipName={r.clip}
+                  seekTarget={seekTarget}
+                />
+                <EvalFaceSearch
+                  runId={viewingRunId}
+                  runLabel={r.name || r.clip}
+                  onSeek={handleSearchSeek}
                 />
               </section>
             );

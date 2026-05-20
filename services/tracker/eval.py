@@ -39,6 +39,7 @@ asyncio.create_subprocess_exec to avoid blocking uvicorn.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -51,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 
 # Production imports. Importing here pulls torch + ultralytics + cv2,
 # so the CLI takes ~3s to start cold. Acceptable — runs are minutes long.
@@ -146,6 +148,14 @@ def detect_faces_on_frame(
         h = max(0.0, y2 - y1)
         if w <= 0 or h <= 0:
             continue
+        emb = f.get("embedding")
+        vec_b64 = None
+        if isinstance(emb, (list, tuple)) and len(emb) >= 64:
+            arr = np.asarray(emb, dtype=np.float32)
+            n = float(np.linalg.norm(arr))
+            if n > 0:
+                arr = arr / n
+            vec_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
         faces_out.append(
             {
                 "bbox": [
@@ -155,6 +165,7 @@ def detect_faces_on_frame(
                     round(h / oh, 5),
                 ],
                 "quality": round(q, 4),
+                "vec_b64": vec_b64,
             }
         )
     return faces_out

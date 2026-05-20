@@ -184,6 +184,12 @@ const diffSchema = z.object({
   b: z.string().min(8).max(64),
 });
 
+const evalSearchSchema = z.object({
+  image_base64: z.string().min(64),
+  threshold: z.number().min(0.3).max(0.95).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
 function trackerHeaders() {
   return {
     "content-type": "application/json",
@@ -667,6 +673,45 @@ export async function register(req, res, url, ctx) {
       rows = listEvalRuns(db, { limit });
     }
     send(res, 200, { rows, count: rows.length });
+    return true;
+  }
+
+  // -- face search within a completed eval (probe vs stored run vectors) ---
+  const mSearch = url.pathname.match(/^\/api\/agent\/evals\/([0-9a-f]{8,64})\/search$/i);
+  if (req.method === "POST" && mSearch) {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    let body;
+    try {
+      body = await readJson(req, 10 * 1024 * 1024);
+    } catch (err) {
+      send(res, 400, { error: "bad_body", detail: err.message });
+      return true;
+    }
+    const parsed = evalSearchSchema.safeParse(body);
+    if (!parsed.success) {
+      send(res, 400, { error: "invalid_input", detail: parsed.error.issues });
+      return true;
+    }
+    const runId = mSearch[1];
+    const row = getEvalRun(db, runId);
+    if (!row) {
+      send(res, 404, { error: "not_found" });
+      return true;
+    }
+    if (row.status !== "ok") {
+      send(res, 409, { error: "run_not_complete", status: row.status });
+      return true;
+    }
+    try {
+      const upstream = await trackerFetch(`/eval/search/${runId}`, {
+        method: "POST",
+        body: JSON.stringify(parsed.data),
+      });
+      send(res, upstream.status, upstream.body ?? { error: "tracker_error" });
+    } catch (err) {
+      send(res, 502, { error: "tracker_unreachable", detail: err.message });
+    }
     return true;
   }
 

@@ -70,12 +70,21 @@ type Header = {
   config: Record<string, unknown>;
 };
 
+export type EvalSeekTarget = {
+  ts_s: number;
+  frame: number;
+  /** Bumped on each seek so repeated clicks on the same frame still run. */
+  token: number;
+};
+
 export function EvalPlayer({
   runId,
   clipName,
+  seekTarget = null,
 }: {
   runId: string;
   clipName: string;
+  seekTarget?: EvalSeekTarget | null;
 }) {
   const [header, setHeader] = useState<Header | null>(null);
   const [frames, setFrames] = useState<Frame[]>([]);
@@ -97,6 +106,28 @@ export function EvalPlayer({
   const [seqIdx, setSeqIdx] = useState(0);
   const [seqPlaying, setSeqPlaying] = useState(false);
   const isSequence = header?.source_kind === "sequence";
+
+  // Jump to a search hit (video time or sequence frame index).
+  useEffect(() => {
+    if (!seekTarget || !header || frames.length === 0) return;
+    setSeqPlaying(false);
+    if (isSequence) {
+      const idx = Math.max(
+        0,
+        Math.min(frames.length - 1, seekTarget.frame),
+      );
+      setSeqIdx(idx);
+      setCurrentFrame(frames[idx] ?? null);
+    } else {
+      const v = videoRef.current;
+      if (v) {
+        v.currentTime = Math.max(0, seekTarget.ts_s);
+        setVideoTime(seekTarget.ts_s);
+        const fi = findClosestFrame(frames, seekTarget.ts_s);
+        if (fi >= 0) setCurrentFrame(frames[fi]);
+      }
+    }
+  }, [seekTarget, isSequence, frames, header]);
 
   // Track document fullscreen so we can swap the player's layout
   // class. The native <video> fullscreen button would take JUST the

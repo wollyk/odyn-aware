@@ -24,6 +24,7 @@ but their output JSONL on disk is intact.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -36,6 +37,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import httpx
+import numpy as np
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -51,6 +54,7 @@ RUNS_DIR = Path(
 )
 EVAL_SECRET = os.environ.get("TRACKER_EVAL_SECRET", "").strip()
 EVAL_PY = Path(__file__).resolve().parent / "eval.py"
+FACE_EMBEDDER_URL = os.environ.get("FACE_EMBEDDER_URL", "http://127.0.0.1:8765").rstrip("/")
 
 # Hard cap on a single uploaded clip. Defaults to 500 MB so the admin UI
 # can upload typical 1080p test footage without surprises. Configurable
@@ -858,6 +862,152 @@ async def run_result_raw(
     if not out_path.exists():
         raise HTTPException(404, "no_output")
     return FileResponse(str(out_path), media_type="application/x-ndjson")
+
+
+# ---- face search within a completed eval run -----------------------------
+class EvalSearchBody(BaseModel):
+    """Probe image (base64) searched against all face vectors in the run JSONL."""
+
+    image_base64: str = Field(min_length=64)
+    threshold: float = Field(default=0.45, ge=0.3, le=0.95)
+    limit: int = Field(default=30, ge=1, le=100)
+
+
+def _vec_from_b64(b64: str | None) -> np.ndarray | None:
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64)
+        if len(raw) < 64 or len(raw) % 4 != 0:
+            return None
+        return np.frombuffer(raw, dtype=np.float32).copy()
+    except Exception:
+        return None
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(a.size, b.size)
+    if n == 0:
+        return 0.0
+    return float(np.dot(a[:n], b[:n]))
+
+
+async def _embed_probe(image_bytes: bytes) -> np.ndarray:
+    """POST probe JPEG to the face-embedder; return L2-normalized 512-d vector."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            f"{FACE_EMBEDDER_URL}/embed",
+            files={"image": ("probe.jpg", image_bytes, "image/jpeg")},
+        )
+    res.raise_for_status()
+    data = res.json()
+    faces = data.get("faces") or []
+    if not faces:
+        raise HTTPException(422, "no_face_detected")
+    best = max(faces, key=lambda f: float(f.get("quality") or 0))
+    emb = best.get("embedding")
+    if not isinstance(emb, (list, tuple)) or len(emb) < 64:
+        raise HTTPException(422, "no_face_detected")
+    arr = np.asarray(emb, dtype=np.float32)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 0:
+        raise HTTPException(422, "bad_probe_vector")
+    return arr / norm
+
+
+def _iter_run_face_sightings(out_path: Path) -> list[dict[str, Any]]:
+    """Load every face sighting with vec_b64 from a run JSONL."""
+    sightings: list[dict[str, Any]] = []
+    with out_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "frame":
+                continue
+            frame = int(obj.get("frame", 0))
+            ts_s = float(obj.get("ts_s", 0))
+            for fi, face in enumerate(obj.get("faces") or []):
+                vec = _vec_from_b64(face.get("vec_b64"))
+                if vec is None:
+                    continue
+                sightings.append(
+                    {
+                        "frame": frame,
+                        "ts_s": ts_s,
+                        "face_index": fi,
+                        "bbox": face.get("bbox"),
+                        "quality": face.get("quality"),
+                        "vec": vec,
+                    }
+                )
+    return sightings
+
+
+@router.post("/search/{run_id}")
+async def eval_search_run(
+    run_id: str,
+    body: EvalSearchBody,
+    x_eval_secret: str | None = Header(default=None),
+) -> JSONResponse:
+    """Cosine-search a probe face photo against all faces indexed in this eval."""
+    _require_secret(x_eval_secret)
+    out_path = RUNS_DIR / f"{run_id}.jsonl"
+    if not out_path.exists():
+        raise HTTPException(404, "no_output")
+
+    b64 = body.image_base64.strip()
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[-1]
+    try:
+        image_bytes = base64.b64decode(b64)
+    except Exception as exc:
+        raise HTTPException(400, f"bad_image: {exc}") from exc
+    if len(image_bytes) < 200:
+        raise HTTPException(400, "image_too_small")
+
+    probe = await _embed_probe(image_bytes)
+    sightings = _iter_run_face_sightings(out_path)
+    if not sightings:
+        raise HTTPException(
+            422,
+            detail={
+                "error": "no_face_vectors",
+                "hint": "Re-run this eval after deploying face-vector indexing (faces need vec_b64 in JSONL).",
+            },
+        )
+
+    hits: list[dict[str, Any]] = []
+    for s in sightings:
+        sim = _cosine(probe, s["vec"])
+        if sim >= body.threshold:
+            hits.append(
+                {
+                    "frame": s["frame"],
+                    "ts_s": s["ts_s"],
+                    "face_index": s["face_index"],
+                    "similarity": round(sim, 4),
+                    "quality": s.get("quality"),
+                    "bbox": s.get("bbox"),
+                }
+            )
+    hits.sort(key=lambda h: (-h["similarity"], h["frame"]))
+    hits = hits[: body.limit]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "threshold": body.threshold,
+            "gallery_faces": len(sightings),
+            "count": len(hits),
+            "hits": hits,
+        }
+    )
 
 
 # ---- clip streaming (with HTTP Range support) ----------------------------
