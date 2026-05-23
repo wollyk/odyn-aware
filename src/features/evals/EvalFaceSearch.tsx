@@ -108,7 +108,7 @@ export function EvalFaceSearch({
         vector stored in this run. Hits are scored against <strong>your probe</strong> —
         not enrolled names (use <span className="font-mono">/admin/faces</span> for that).
         Click <span className="font-mono">Jump →</span> to seek the player and highlight
-        the matching face box in pink. Your probe appears inset on the video for comparison.
+        the matching face box in pink. Your probe appears inset top-left on the video.
       </p>
       <p className="mt-1 font-mono text-[10px] text-foreground/50">
         Runs completed before vector indexing was enabled must be re-run once.
@@ -140,7 +140,7 @@ export function EvalFaceSearch({
 
       {preview && (
         <p className="mt-3 font-mono text-[10px] text-foreground/55">
-          Probe loaded — shown bottom-left on the player above.
+          Probe loaded — shown top-left on the player above.
         </p>
       )}
       {galleryFaces != null && (

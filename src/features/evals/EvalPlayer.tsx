@@ -101,6 +101,11 @@ export function EvalPlayer({
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const framesRef = useRef<Frame[]>([]);
+  const showLabelsRef = useRef(true);
+  const showStaticRef = useRef(true);
+  const showFacesRef = useRef(true);
+  const seekTargetRef = useRef(seekTarget);
 
   const [currentFrame, setCurrentFrame] = useState<Frame | null>(null);
   const [videoTime, setVideoTime] = useState(0);
@@ -113,16 +118,15 @@ export function EvalPlayer({
   const [seqPlaying, setSeqPlaying] = useState(false);
   const isSequence = header?.source_kind === "sequence";
 
+  framesRef.current = frames;
+  showLabelsRef.current = showLabels;
+  showStaticRef.current = showStatic;
+  showFacesRef.current = showFaces;
+  seekTargetRef.current = seekTarget;
+
   // Jump to a search hit (video time or sequence frame index).
   useEffect(() => {
     if (!seekTarget || !header || frames.length === 0) return;
-    highlightFaceRef.current =
-      seekTarget.face_index != null
-        ? {
-            face_index: seekTarget.face_index,
-            similarity: seekTarget.similarity,
-          }
-        : null;
     setSeqPlaying(false);
     const fi = findFrameIndexByNumber(frames, seekTarget.frame);
     const frameIdx = fi >= 0 ? fi : findClosestFrame(frames, seekTarget.ts_s);
@@ -220,18 +224,6 @@ export function EvalPlayer({
   // updates on the compositor's cadence, but `timeupdate` fires at
   // ~250ms which produces visible lag. rAF keeps the overlay glued to
   // the video.
-  const framesRef = useRef<Frame[]>([]);
-  framesRef.current = frames;
-  const showLabelsRef = useRef(showLabels);
-  showLabelsRef.current = showLabels;
-  const showStaticRef = useRef(showStatic);
-  showStaticRef.current = showStatic;
-  const showFacesRef = useRef(showFaces);
-  showFacesRef.current = showFaces;
-  const highlightFaceRef = useRef<{
-    face_index: number;
-    similarity?: number;
-  } | null>(null);
 
   const hasFaceData = useMemo(
     () => frames.some((f) => (f.faces?.length ?? 0) > 0),
@@ -264,7 +256,7 @@ export function EvalPlayer({
         showLabels: showLabelsRef.current,
         showStatic: showStaticRef.current,
         showFaces: showFacesRef.current,
-        highlightFace: highlightFaceRef.current,
+        highlightSeek: seekTargetRef.current,
       });
       raf = requestAnimationFrame(tick);
     };
@@ -317,7 +309,7 @@ export function EvalPlayer({
         showLabels: showLabelsRef.current,
         showStatic: showStaticRef.current,
         showFaces: showFacesRef.current,
-        highlightFace: highlightFaceRef.current,
+        highlightSeek: seekTargetRef.current,
       });
       raf = requestAnimationFrame(tick);
     };
@@ -480,19 +472,19 @@ export function EvalPlayer({
         </button>
         {probeImage && (
           <div
-            className="absolute bottom-3 left-3 z-10 max-w-[28%] border border-pink-400/70 bg-black/75 p-1.5 shadow-lg backdrop-blur-sm"
+            className="pointer-events-none absolute left-3 top-3 z-10 max-w-[22%] border border-pink-400/70 bg-black/75 p-1 shadow-lg backdrop-blur-sm"
             title="Probe photo used for identity search"
           >
-            <p className="mb-1 font-mono text-[9px] uppercase tracking-widest text-pink-200/90">
+            <p className="mb-0.5 font-mono text-[9px] uppercase tracking-widest text-pink-200/90">
               probe
               {seekTarget?.similarity != null
-                ? ` · ${(seekTarget.similarity * 100).toFixed(0)}% at hit`
+                ? ` · ${(seekTarget.similarity * 100).toFixed(0)}%`
                 : ""}
             </p>
             <img
               src={probeImage}
               alt="Search probe"
-              className="block max-h-24 w-auto max-w-full object-contain sm:max-h-32"
+              className="block max-h-16 w-auto max-w-full object-contain sm:max-h-20"
             />
           </div>
         )}
@@ -759,7 +751,7 @@ function drawOverlay(
     showLabels: boolean;
     showStatic: boolean;
     showFaces: boolean;
-    highlightFace?: { face_index: number; similarity?: number } | null;
+    highlightSeek?: EvalSeekTarget | null;
   },
 ) {
   // The canvas covers the wrap container's full client box (so it
@@ -881,14 +873,18 @@ function drawOverlay(
     const faceLineW = Math.max(1, lineW - 1);
     const faceFontPx = Math.max(10, labelFontPx - 1);
     ctx.font = `${faceFontPx}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-    const hi = opts.highlightFace?.face_index ?? -1;
+    const hi = opts.highlightSeek;
     frame.faces.forEach((f, faceIdx) => {
       const [bx, by, bw, bh] = f.bbox;
       const x = offsetX + bx * renderedW;
       const y = offsetY + by * renderedH;
       const ww = bw * renderedW;
       const hh = bh * renderedH;
-      const isHit = faceIdx === hi;
+      const isHit =
+        hi != null &&
+        hi.face_index != null &&
+        frame.frame === hi.frame &&
+        faceIdx === hi.face_index;
       const known = f.decision === "match";
       const color = isHit ? "#f472b6" : known ? "#38bdf8" : "#fbbf24";
       ctx.lineWidth = isHit ? Math.max(3, lineW + 1) : faceLineW;
@@ -898,8 +894,8 @@ function drawOverlay(
       ctx.setLineDash([]);
       if (opts.showLabels) {
         const sim =
-          isHit && opts.highlightFace?.similarity != null
-            ? ` ${(opts.highlightFace.similarity * 100).toFixed(0)}%`
+          isHit && hi?.similarity != null
+            ? ` ${(hi.similarity * 100).toFixed(0)}%`
             : "";
         const lbl = isHit
           ? `probe match${sim}`
