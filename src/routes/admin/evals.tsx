@@ -199,6 +199,7 @@ function AdminEvals() {
   // -- player state: which run to play, scrolled-into-view container
   const [viewingRunId, setViewingRunId] = useState<string | null>(null);
   const [seekTarget, setSeekTarget] = useState<EvalSeekTarget | null>(null);
+  const [probePreview, setProbePreview] = useState<string | null>(null);
   const playerRef = useRef<HTMLDivElement | null>(null);
 
   const handleSearchSeek = useCallback((hit: EvalSearchHit) => {
@@ -723,6 +724,7 @@ function AdminEvals() {
                     onClick={() => {
                       setViewingRunId(null);
                       setSeekTarget(null);
+                      setProbePreview(null);
                     }}
                     className="font-mono text-[10px] uppercase tracking-widest text-foreground/55 hover:text-foreground"
                   >
@@ -734,11 +736,13 @@ function AdminEvals() {
                   runId={viewingRunId}
                   clipName={r.clip}
                   seekTarget={seekTarget}
+                  probeImage={probePreview}
                 />
                 <EvalFaceSearch
                   runId={viewingRunId}
                   runLabel={r.name || r.clip}
                   onSeek={handleSearchSeek}
+                  onProbeChange={setProbePreview}
                 />
               </section>
             );

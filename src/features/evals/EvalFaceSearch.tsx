@@ -2,7 +2,7 @@
 // Uses the same InsightFace embedder + cosine path as /admin/faces search, but the
 // gallery is every face vector stored in that run's JSONL (vec_b64 per face).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { compressProbeImage } from "@/lib/probe-image";
 
 export type EvalSearchHit = {
@@ -18,10 +18,12 @@ export function EvalFaceSearch({
   runId,
   runLabel,
   onSeek,
+  onProbeChange,
 }: {
   runId: string;
   runLabel: string;
   onSeek: (hit: EvalSearchHit) => void;
+  onProbeChange?: (dataUrl: string | null) => void;
 }) {
   const [preview, setPreview] = useState<string | null>(null);
   const [imageBase64, setImageBase64] = useState<string | null>(null);
@@ -32,6 +34,16 @@ export function EvalFaceSearch({
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    setPreview(null);
+    setImageBase64(null);
+    setHits([]);
+    setGalleryFaces(null);
+    setErr(null);
+    setMsg(null);
+    onProbeChange?.(null);
+  }, [runId, onProbeChange]);
+
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -39,6 +51,7 @@ export function EvalFaceSearch({
     const dataUrl = await compressProbeImage(raw);
     setPreview(dataUrl);
     setImageBase64(dataUrl);
+    onProbeChange?.(dataUrl);
     setHits([]);
     setErr(null);
     setMsg(null);
@@ -95,7 +108,7 @@ export function EvalFaceSearch({
         vector stored in this run. Hits are scored against <strong>your probe</strong> —
         not enrolled names (use <span className="font-mono">/admin/faces</span> for that).
         Click <span className="font-mono">Jump →</span> to seek the player and highlight
-        the matching face box in pink.
+        the matching face box in pink. Your probe appears inset on the video for comparison.
       </p>
       <p className="mt-1 font-mono text-[10px] text-foreground/50">
         Runs completed before vector indexing was enabled must be re-run once.
@@ -126,11 +139,9 @@ export function EvalFaceSearch({
       </div>
 
       {preview && (
-        <img
-          src={preview}
-          alt="Probe face"
-          className="mt-4 max-h-32 border border-border object-contain"
-        />
+        <p className="mt-3 font-mono text-[10px] text-foreground/55">
+          Probe loaded — shown bottom-left on the player above.
+        </p>
       )}
       {galleryFaces != null && (
         <p className="mt-2 font-mono text-[10px] text-foreground/55">

@@ -84,10 +84,13 @@ export function EvalPlayer({
   runId,
   clipName,
   seekTarget = null,
+  probeImage = null,
 }: {
   runId: string;
   clipName: string;
   seekTarget?: EvalSeekTarget | null;
+  /** Passport / probe photo shown inset on the player for comparison. */
+  probeImage?: string | null;
 }) {
   const [header, setHeader] = useState<Header | null>(null);
   const [frames, setFrames] = useState<Frame[]>([]);
@@ -475,6 +478,24 @@ export function EvalPlayer({
         >
           {isFullscreen ? "⤓ exit" : "⛶ fullscreen"}
         </button>
+        {probeImage && (
+          <div
+            className="absolute bottom-3 left-3 z-10 max-w-[28%] border border-pink-400/70 bg-black/75 p-1.5 shadow-lg backdrop-blur-sm"
+            title="Probe photo used for identity search"
+          >
+            <p className="mb-1 font-mono text-[9px] uppercase tracking-widest text-pink-200/90">
+              probe
+              {seekTarget?.similarity != null
+                ? ` · ${(seekTarget.similarity * 100).toFixed(0)}% at hit`
+                : ""}
+            </p>
+            <img
+              src={probeImage}
+              alt="Search probe"
+              className="block max-h-24 w-auto max-w-full object-contain sm:max-h-32"
+            />
+          </div>
+        )}
       </div>
 
       {isSequence && (
