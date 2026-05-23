@@ -31,11 +31,25 @@ tsconfig.tsbuildinfo
 api.out.log
 api.err.log
 
-# Local test datasets (UCSD, etc) — do NOT commit; they're 100s of MB
-# and we upload smaller selected subsets to the server via /admin/evals.
+# Local test datasets (UCSD, Avenue, etc) — do NOT commit; they're 100s
+# of MB and we upload smaller selected subsets to the server via
+# /admin/evals.
 UCSD_Anomaly_Dataset*/
+Dataset/
+Avenue_Dataset*/
 *.tar
 *.tar.gz
+*.avi
+*.mat
+*.mp4
+
+# Stray training/probe images (handled as user uploads, never assets)
+src/assets/website_images/face_test.PNG
+src/assets/website_images/home_pahe_upgrade_2.PNG
+
+# Debug artifacts from local deploy attempts
+push-debug.log
+.git-commit-msg.txt
 
 # Editor directories and files
 .vscode/*

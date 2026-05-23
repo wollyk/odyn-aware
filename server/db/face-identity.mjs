@@ -156,10 +156,12 @@ export function insertFaceMatchExtended(
     .prepare(
       `INSERT INTO face_matches
         (tenant_id, camera, event_id, person_id, similarity, bbox_json, quality, model,
-         vec_dim, vec_blob, track_session_id, frigate_event_id, cluster_id, thumb_path)
+         vec_dim, vec_blob, track_session_id, frigate_event_id, cluster_id, thumb_path,
+         created_ms)
        VALUES
         (@tenant_id, @camera, @event_id, @person_id, @similarity, @bbox_json, @quality, @model,
-         @vec_dim, @vec_blob, @track_session_id, @frigate_event_id, @cluster_id, @thumb_path)`,
+         @vec_dim, @vec_blob, @track_session_id, @frigate_event_id, @cluster_id, @thumb_path,
+         @created_ms)`,
     )
     .run({
       tenant_id,
@@ -176,6 +178,7 @@ export function insertFaceMatchExtended(
       frigate_event_id,
       cluster_id,
       thumb_path,
+      created_ms: Date.now(),
     });
   return { id: Number(info.lastInsertRowid) };
 }

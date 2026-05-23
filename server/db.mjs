@@ -5,6 +5,7 @@ import { applyAlertsSchema } from "./db/alerts.mjs";
 import { applyTracksSchema } from "./db/tracks.mjs";
 import { applyEvalsSchema } from "./db/evals.mjs";
 import { applyFaceIdentitySchema } from "./db/face-identity.mjs";
+import { applyFaceTimelineSchema } from "./db/face-timeline.mjs";
 
 const DEFAULT_PATH = path.resolve(process.cwd(), "data/odyn.db");
 
@@ -224,6 +225,7 @@ export function openDb(file = process.env.DB_PATH ?? DEFAULT_PATH) {
   applyTracksSchema(db);
   applyEvalsSchema(db);
   applyFaceIdentitySchema(db);
+  applyFaceTimelineSchema(db);
   return db;
 }
 

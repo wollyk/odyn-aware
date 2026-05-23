@@ -45,6 +45,7 @@ import * as agentAlerts from "./routes/agent-alerts.mjs";
 import * as agentTracks from "./routes/agent-tracks.mjs";
 import * as agentEvals from "./routes/agent-evals.mjs";
 import * as agentChat from "./routes/agent-chat.mjs";
+import * as agentTimeline from "./routes/agent-timeline.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -84,6 +85,7 @@ const ROUTES = [
   agentTracks,
   agentEvals,
   agentChat,
+  agentTimeline,
 ];
 
 const server = http.createServer(async (req, res) => {

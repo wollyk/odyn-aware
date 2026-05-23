@@ -5,6 +5,7 @@ import { useCameras } from "@/features/live/useCameras";
 import { VideoTile } from "@/features/live/VideoTile";
 import { ChatPanel } from "@/features/live/ChatPanel";
 import { DailySummaryPanel } from "@/features/live/DailySummaryPanel";
+import { TimelinePanel } from "@/features/live/TimelinePanel";
 import {
   AdminHeader,
   AuthDeniedScreen,
@@ -109,6 +110,8 @@ function AdminLive() {
           <VideoTile cam={cam} mode={mode} agentStatus={agentStatus} />
           <ChatPanel cam={cam} agentStatus={agentStatus} />
         </div>
+
+        <TimelinePanel camera={cam?.name ?? null} />
 
         <p className="mt-6 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           {mode === "snapshot"
