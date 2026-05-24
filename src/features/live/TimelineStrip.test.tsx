@@ -52,22 +52,55 @@ describe("TimelineStrip", () => {
     expect(screen.getByTestId("match-dot").getAttribute("data-selected")).toBe("true");
   });
 
-  it("clicking the strip calls onSeek with the mapped ms", () => {
+  it("pointerdown on the strip calls onSeek with the mapped ms", () => {
     const onSeek = vi.fn();
     const { container } = render(
       <TimelineStrip {...baseProps} onSeek={onSeek} />,
     );
     const strip = container.querySelector("[data-testid='timeline-strip']") as HTMLElement;
     setWidth(strip, 1000);
-    // Trigger an internal resize observer flush via a manual rerender:
-    fireEvent.click(strip, { clientX: 500 });
+    fireEvent.pointerDown(strip, { clientX: 500, button: 0, pointerId: 1 });
     expect(onSeek).toHaveBeenCalled();
     const callArg = onSeek.mock.calls[0][0];
     expect(callArg).toBeGreaterThanOrEqual(0);
     expect(callArg).toBeLessThanOrEqual(1000);
   });
 
-  it("clicking a match dot calls onMatchClick and stops propagation", () => {
+  it("dragging across the strip emits onSeek for every move", () => {
+    const onSeek = vi.fn();
+    const { container } = render(
+      <TimelineStrip {...baseProps} onSeek={onSeek} />,
+    );
+    const strip = container.querySelector("[data-testid='timeline-strip']") as HTMLElement;
+    setWidth(strip, 1000);
+
+    fireEvent.pointerDown(strip, { clientX: 100, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(strip, { clientX: 250, pointerId: 1 });
+    fireEvent.pointerMove(strip, { clientX: 600, pointerId: 1 });
+    fireEvent.pointerMove(strip, { clientX: 900, pointerId: 1 });
+    fireEvent.pointerUp(strip, { clientX: 900, pointerId: 1 });
+
+    // 1 down + 3 moves = 4 seeks, last one near the right edge.
+    expect(onSeek.mock.calls.length).toBeGreaterThanOrEqual(4);
+    const lastMs = onSeek.mock.calls.at(-1)![0];
+    expect(lastMs).toBeGreaterThan(800);
+    expect(strip.getAttribute("data-dragging")).toBe("false");
+  });
+
+  it("pointermove without a prior pointerdown does NOT seek (hover only)", () => {
+    const onSeek = vi.fn();
+    const { container } = render(
+      <TimelineStrip {...baseProps} onSeek={onSeek} />,
+    );
+    const strip = container.querySelector("[data-testid='timeline-strip']") as HTMLElement;
+    setWidth(strip, 1000);
+    fireEvent.pointerMove(strip, { clientX: 400, pointerId: 1 });
+    expect(onSeek).not.toHaveBeenCalled();
+    // Hover tooltip should be visible though.
+    expect(screen.getByTestId("timeline-tooltip")).toBeInTheDocument();
+  });
+
+  it("clicking a match dot calls onMatchClick and does not seek", () => {
     const onMatchClick = vi.fn();
     const onSeek = vi.fn();
     const matches: TimelineMatch[] = [
@@ -81,7 +114,9 @@ describe("TimelineStrip", () => {
         onSeek={onSeek}
       />,
     );
-    fireEvent.click(screen.getByTestId("match-dot"));
+    const dot = screen.getByTestId("match-dot");
+    fireEvent.pointerDown(dot, { button: 0, pointerId: 1 });
+    fireEvent.click(dot);
     expect(onMatchClick).toHaveBeenCalledWith(matches[0]);
     expect(onSeek).not.toHaveBeenCalled();
   });

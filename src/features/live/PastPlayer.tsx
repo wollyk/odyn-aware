@@ -37,12 +37,28 @@ export function PastPlayer({
     useHlsPlayer({ src, windowStartMs: startMs, hlsModule });
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Seek when the consumer changes cursorMs.
+  // Seek when the consumer changes cursorMs. During an active drag the
+  // parent updates cursorMs many times per second; if we seek the HLS
+  // pipeline on every change it thrashes segment loads. Debounce the
+  // actual `seekToMs` call by ~120ms so it settles on the latest value.
   const cursorRef = useRef(cursorMs);
+  const seekTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (Math.abs(cursorRef.current - cursorMs) < 50) return;
     cursorRef.current = cursorMs;
-    seekToMs(cursorMs);
+    if (seekTimerRef.current != null) {
+      window.clearTimeout(seekTimerRef.current);
+    }
+    seekTimerRef.current = window.setTimeout(() => {
+      seekTimerRef.current = null;
+      seekToMs(cursorMs);
+    }, 120);
+    return () => {
+      if (seekTimerRef.current != null) {
+        window.clearTimeout(seekTimerRef.current);
+        seekTimerRef.current = null;
+      }
+    };
   }, [cursorMs, seekToMs]);
 
   // Notify the parent when playback advances naturally (not on every seek).

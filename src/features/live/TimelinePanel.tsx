@@ -139,7 +139,10 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
         </div>
       )}
 
-      {activeMatch && (
+      {/* Past-playback panel: open whenever the user has scrubbed off
+          "now" (pinnedWindow is set) OR clicked a match dot. Selected
+          match is optional — without one we just play the recording. */}
+      {(pinnedWindow || activeMatch) && (
         <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_360px]">
           <PastPlayer
             camera={camera}
@@ -152,7 +155,7 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
           />
           <MatchList
             matches={matches}
-            selectedMatchId={activeMatch.id}
+            selectedMatchId={activeMatch?.id ?? null}
             onPick={(m) => {
               setActiveMatch(m);
               setCursorMs(m.ts_ms);

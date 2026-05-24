@@ -72,6 +72,34 @@ describe("TimelinePanel", () => {
     expect(screen.getByTestId("past-player")).toBeInTheDocument();
   });
 
+  it("dragging the strip opens the PastPlayer even without a selected match", async () => {
+    render(
+      <TimelinePanel
+        camera="Driveway"
+        hlsModule={fakeHlsModule as unknown as typeof import("hls.js")}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("timeline-strip")).toBeInTheDocument(),
+    );
+    const strip = screen.getByTestId("timeline-strip") as HTMLElement;
+    Object.defineProperty(strip, "clientWidth", { configurable: true, value: 800 });
+    Object.defineProperty(strip, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        left: 0, top: 0, right: 800, bottom: 100,
+        width: 800, height: 100, x: 0, y: 0, toJSON() {},
+      }),
+    });
+
+    expect(screen.queryByTestId("past-player")).not.toBeInTheDocument();
+    fireEvent.pointerDown(strip, { clientX: 200, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(strip, { clientX: 400, pointerId: 1 });
+    fireEvent.pointerUp(strip, { clientX: 400, pointerId: 1 });
+
+    expect(screen.getByTestId("past-player")).toBeInTheDocument();
+  });
+
   it("clicking [Now] resets pinned window", async () => {
     render(<TimelinePanel camera="Driveway" hlsModule={fakeHlsModule as unknown as typeof import("hls.js")} />);
     await waitFor(() =>

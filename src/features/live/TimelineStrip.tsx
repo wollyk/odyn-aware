@@ -63,21 +63,68 @@ export function TimelineStrip(props: TimelineStripProps) {
     [segments],
   );
 
-  const handleClick: React.MouseEventHandler<HTMLDivElement> = (e) => {
-    if (!wrapRef.current) return;
+  // Drag scrubbing via pointer events:
+  //   - pointerdown: capture, seek, enter "dragging"
+  //   - pointermove: continuous seek while captured
+  //   - pointerup/cancel: release capture, exit "dragging"
+  //
+  // The hover state separately tracks the mouse position so we can render
+  // a wall-clock tooltip ahead of any commit. Touch users skip the
+  // tooltip and just scrub.
+  const [dragging, setDragging] = useState(false);
+  const [hoverMs, setHoverMs] = useState<number | null>(null);
+
+  const msFromEvent = (clientX: number): number | null => {
+    if (!wrapRef.current) return null;
     const rect = wrapRef.current.getBoundingClientRect();
-    // Prefer the live bounding rect width — handles cases where the
-    // ResizeObserver hasn't fired yet (e.g. first paint, tests).
     const w = rect.width || widthPx;
-    if (w === 0) return;
-    const x = e.clientX - rect.left;
-    onSeek(pxToMs(x, startMs, endMs, w));
+    if (w === 0) return null;
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    return pxToMs(x, startMs, endMs, w);
+  };
+
+  const onPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    // Ignore secondary buttons. Note: jsdom often leaves `button`
+    // undefined on synthetic pointer events, so we only bail on
+    // explicit right/middle clicks (>0) rather than `!== 0`.
+    if ((e.button ?? 0) > 0) return;
+    if ((e.target as HTMLElement).closest("[data-match-dot]")) return;
+    const ms = msFromEvent(e.clientX);
+    if (ms == null) return;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    setDragging(true);
+    onSeek(ms);
+  };
+
+  const onPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    const ms = msFromEvent(e.clientX);
+    if (ms == null) return;
+    setHoverMs(ms);
+    if (dragging) onSeek(ms);
+  };
+
+  const endDrag: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    if (!dragging) return;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    setDragging(false);
+  };
+
+  const onPointerLeave: React.PointerEventHandler<HTMLDivElement> = () => {
+    if (!dragging) setHoverMs(null);
   };
 
   return (
     <div
       ref={wrapRef}
-      onClick={handleClick}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onPointerLeave={onPointerLeave}
       role="slider"
       aria-label="Timeline"
       aria-valuemin={startMs}
@@ -85,7 +132,10 @@ export function TimelineStrip(props: TimelineStripProps) {
       aria-valuenow={cursorMs}
       data-testid="timeline-strip"
       data-width={widthPx}
-      className="relative w-full cursor-pointer select-none border border-foreground/15 bg-foreground/[0.04]"
+      data-dragging={dragging ? "true" : "false"}
+      className={`relative w-full touch-none select-none border border-foreground/15 bg-foreground/[0.04] ${
+        dragging ? "cursor-grabbing" : "cursor-ew-resize"
+      }`}
       style={{ height: heightPx }}
     >
       {/* Density bars */}
@@ -119,6 +169,29 @@ export function TimelineStrip(props: TimelineStripProps) {
         style={{ left: msToPx(cursorMs, startMs, endMs, widthPx) }}
       />
 
+      {/* Cursor knob — bigger hit target hint */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute z-20 -translate-x-1/2 rounded-full border border-white/80 bg-white/20"
+        style={{
+          left: msToPx(cursorMs, startMs, endMs, widthPx),
+          top: 4,
+          width: 8,
+          height: 8,
+        }}
+      />
+
+      {/* Hover tooltip with wall-clock time at the pointer */}
+      {hoverMs != null && (
+        <div
+          data-testid="timeline-tooltip"
+          className="pointer-events-none absolute z-30 -translate-x-1/2 whitespace-nowrap border border-white/30 bg-black/80 px-1.5 py-0.5 font-mono text-[10px] text-white/90"
+          style={{ left: msToPx(hoverMs, startMs, endMs, widthPx), top: -22 }}
+        >
+          {new Date(hoverMs).toLocaleTimeString()}
+        </div>
+      )}
+
       {/* Match dots */}
       <div className="absolute inset-x-0 bottom-6 top-6">
         {matches.map((m) => {
@@ -134,11 +207,13 @@ export function TimelineStrip(props: TimelineStripProps) {
             <button
               key={m.id}
               type="button"
+              onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
                 onMatchClick(m);
               }}
               data-testid="match-dot"
+              data-match-dot="true"
               data-kind={known ? "known" : "unknown"}
               data-selected={selected ? "true" : "false"}
               title={`${m.person_name ?? "unknown"} · ${(m.similarity * 100).toFixed(0)}% · ${new Date(m.ts_ms).toLocaleTimeString()}`}
