@@ -22,6 +22,7 @@ import {
   openRangeFetch,
   listRecordingsWindow,
   probeRecordings,
+  probeHlsMaster,
 } from "../frigate-vod.mjs";
 
 const CAM_RE = /^\/api\/agent\/timeline\/([A-Za-z0-9_\-]+)\/(.*)$/;
@@ -105,9 +106,20 @@ export async function handle(req, res, url, ctx) {
       return true;
     }
     try {
-      const probeFn = vod?.probeRecordings ?? probeRecordings;
-      const result = await probeFn(camera, start_ms, end_ms);
-      send(res, 200, { camera, start_ms, end_ms, frigate_configured: true, ...result });
+      const recProbe = vod?.probeRecordings ?? probeRecordings;
+      const hlsProbe = vod?.probeHlsMaster ?? probeHlsMaster;
+      const [recordings, hls] = await Promise.all([
+        recProbe(camera, start_ms, end_ms),
+        hlsProbe(camera, start_ms, end_ms),
+      ]);
+      send(res, 200, {
+        camera,
+        start_ms,
+        end_ms,
+        frigate_configured: true,
+        recordings,
+        hls,
+      });
     } catch (err) {
       send(res, 500, { error: "diagnose_failed", detail: err.message });
     }

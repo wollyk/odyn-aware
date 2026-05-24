@@ -211,17 +211,12 @@ export async function listRecordingsWindow(camera, startMs, endMs) {
 }
 
 /**
- * Diagnostic probe: returns raw status, content-type, and the first
- * `maxBytes` bytes of the body. Lets an admin see EXACTLY why Frigate
- * is rejecting a recordings request without me having to read logs.
+ * Diagnostic probe of an arbitrary upstream URL — returns raw status,
+ * content-type, and a small body preview. Lower-level helper.
  */
-export async function probeRecordings(camera, startMs, endMs, { maxBytes = 200 } = {}) {
-  assertWindow(startMs, endMs);
-  const url = frigateUrl(
-    `/api/${encodeCam(camera)}/recordings?after=${(startMs / 1000).toFixed(3)}&before=${(endMs / 1000).toFixed(3)}`,
-  );
+export async function probeUrl(url, { maxBytes = 400, rangeHeader = null } = {}) {
   try {
-    const upstream = await openRangeFetch(url, null);
+    const upstream = await openRangeFetch(url, rangeHeader);
     const buf = await collect(upstream.stream);
     return {
       upstream_url: url.toString(),
@@ -237,6 +232,31 @@ export async function probeRecordings(camera, startMs, endMs, { maxBytes = 200 }
       error: err?.message ?? String(err),
     };
   }
+}
+
+/**
+ * Diagnostic probe: returns raw status, content-type, and the first
+ * `maxBytes` bytes of the body. Lets an admin see EXACTLY why Frigate
+ * is rejecting a recordings request without me having to read logs.
+ */
+export async function probeRecordings(camera, startMs, endMs, opts = {}) {
+  assertWindow(startMs, endMs);
+  const url = frigateUrl(
+    `/api/${encodeCam(camera)}/recordings?after=${(startMs / 1000).toFixed(3)}&before=${(endMs / 1000).toFixed(3)}`,
+  );
+  return probeUrl(url, opts);
+}
+
+/**
+ * Diagnostic probe of the HLS master playlist URL. Returns the raw
+ * upstream status + body preview so we can tell whether Frigate's
+ * /vod/<cam>/start/.../master.m3u8 endpoint is serving anything for
+ * the requested window.
+ */
+export async function probeHlsMaster(camera, startMs, endMs, opts = {}) {
+  assertWindow(startMs, endMs);
+  const url = buildHlsMasterUrl(camera, startMs, endMs);
+  return probeUrl(new URL(url), opts);
 }
 
 function collect(stream) {

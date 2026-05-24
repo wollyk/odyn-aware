@@ -100,6 +100,45 @@ test("probeRecordings returns raw upstream status + body preview", async () => {
   assert.ok(probe.body_preview.startsWith("[{"));
 });
 
+test("probeHlsMaster hits the /vod/<cam>/start/<...>/master.m3u8 path", async () => {
+  requestsSeen.length = 0;
+  // Stage a master.m3u8 response on the fake server.
+  const origRequestListener = fakeServer.listeners("request")[0];
+  fakeServer.removeAllListeners("request");
+  fakeServer.on("request", (req, res) => {
+    requestsSeen.push({ url: req.url, cookie: req.headers.cookie ?? null });
+    if (req.url === "/api/login" && req.method === "POST") {
+      res.setHeader("Set-Cookie", `frigate_token=${fakeJwt}; Path=/`);
+      res.writeHead(200);
+      res.end("{}");
+      return;
+    }
+    if (!req.headers.cookie?.includes("frigate_token=")) {
+      res.writeHead(401);
+      res.end("unauthorized");
+      return;
+    }
+    if (req.url.startsWith("/vod/Driveway/start/")) {
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.writeHead(200);
+      res.end("#EXTM3U\n#EXT-X-VERSION:3\nrendition0/index.m3u8\n");
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+
+  const probe = await vod.probeHlsMaster("Driveway", 1000, 60_000);
+  assert.equal(probe.status, 200);
+  assert.match(probe.upstream_url, /\/vod\/Driveway\/start\//);
+  assert.match(probe.upstream_url, /\/master\.m3u8$/);
+  assert.match(probe.body_preview, /^#EXTM3U/);
+
+  // Restore the original handler for other tests in this file.
+  fakeServer.removeAllListeners("request");
+  if (origRequestListener) fakeServer.on("request", origRequestListener);
+});
+
 test.after(() => {
   fakeServer.close();
 });

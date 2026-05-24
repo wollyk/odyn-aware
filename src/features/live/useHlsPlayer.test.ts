@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
-import { renderHook, act } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, act, waitFor } from "@testing-library/react";
 import { useHlsPlayer } from "./useHlsPlayer";
+import { installFetchMock, type FetchMock } from "../../test/fetch-mock";
 
 // Minimal fake mirroring the hls.js API surface we actually touch.
 class FakeHls {
@@ -17,12 +18,23 @@ function fakeHlsModule() {
 }
 
 function attachVideo(result: ReturnType<typeof renderHook>["result"]) {
-  // jsdom doesn't render the <video>, so we attach an element after the hook
-  // mounts and trigger a re-render.
   const v = document.createElement("video");
   (result.current as { videoRef: { current: HTMLVideoElement | null } }).videoRef.current = v;
   return v;
 }
+
+const VALID_M3U8 =
+  "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=1280x720\nrendition0/index.m3u8\n";
+
+let mock: FetchMock;
+
+beforeEach(() => {
+  mock = installFetchMock();
+});
+
+afterEach(() => {
+  mock.restore();
+});
 
 describe("useHlsPlayer", () => {
   it("idle when src is null", () => {
@@ -32,11 +44,14 @@ describe("useHlsPlayer", () => {
     expect(result.current.status).toBe("idle");
   });
 
-  it("uses native HLS when canPlayType is truthy", () => {
+  it("uses native HLS when canPlayType is truthy and manifest probe succeeds", async () => {
     Object.defineProperty(window.HTMLMediaElement.prototype, "canPlayType", {
       configurable: true,
       value: () => "probably",
     });
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response(VALID_M3U8, { status: 200, headers: { "Content-Type": "application/vnd.apple.mpegurl" } }),
+    );
     const { result, rerender } = renderHook(
       ({ src }: { src: string | null }) =>
         useHlsPlayer({ src, windowStartMs: 0 }),
@@ -44,14 +59,19 @@ describe("useHlsPlayer", () => {
     );
     attachVideo(result);
     rerender({ src: "/api/agent/timeline/X/hls/master.m3u8?start_ms=0&end_ms=1" });
-    expect(result.current.videoRef.current?.src).toMatch(/master\.m3u8/);
+    await waitFor(() => {
+      expect(result.current.videoRef.current?.src).toMatch(/master\.m3u8/);
+    });
   });
 
-  it("constructs hls.js when native HLS is unsupported", async () => {
+  it("constructs hls.js when native HLS is unsupported and manifest is valid", async () => {
     Object.defineProperty(window.HTMLMediaElement.prototype, "canPlayType", {
       configurable: true,
       value: () => "",
     });
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response(VALID_M3U8, { status: 200 }),
+    );
     const mod = fakeHlsModule();
     const { result, rerender } = renderHook(
       ({ src }: { src: string | null }) =>
@@ -64,10 +84,47 @@ describe("useHlsPlayer", () => {
     );
     attachVideo(result);
     rerender({ src: "/x/master.m3u8" });
-    await act(async () => {
-      await Promise.resolve();
+    await waitFor(() => {
+      expect((mod.default as unknown as typeof FakeHls).isSupported).toHaveBeenCalled();
     });
-    expect((mod.default as unknown as typeof FakeHls).isSupported).toHaveBeenCalled();
+  });
+
+  it("transitions to error with detail when the manifest probe returns 502", async () => {
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response(
+        JSON.stringify({ error: "frigate_unreachable", detail: "frigate recordings 404" }),
+        { status: 502, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const { result, rerender } = renderHook(
+      ({ src }: { src: string | null }) =>
+        useHlsPlayer({ src, windowStartMs: 0 }),
+      { initialProps: { src: null as string | null } },
+    );
+    attachVideo(result);
+    rerender({ src: "/x/master.m3u8" });
+    await waitFor(() => {
+      expect(result.current.status).toBe("error");
+      expect(result.current.error).toMatch(/frigate_unreachable/);
+      expect(result.current.error).toMatch(/404/);
+    });
+  });
+
+  it("transitions to error when the manifest body is not HLS", async () => {
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response("<html>not a playlist</html>", { status: 200 }),
+    );
+    const { result, rerender } = renderHook(
+      ({ src }: { src: string | null }) =>
+        useHlsPlayer({ src, windowStartMs: 0 }),
+      { initialProps: { src: null as string | null } },
+    );
+    attachVideo(result);
+    rerender({ src: "/x/master.m3u8" });
+    await waitFor(() => {
+      expect(result.current.status).toBe("error");
+      expect(result.current.error).toMatch(/bad_manifest/);
+    });
   });
 
   it("seekToMs converts wall-clock ms to video.currentTime seconds", () => {
