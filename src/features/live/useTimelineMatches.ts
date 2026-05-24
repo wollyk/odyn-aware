@@ -64,8 +64,15 @@ export function useTimelineMatches(
           if (!ct.includes("application/json")) {
             throw new Error(`non_json_response (${r.status})`);
           }
-          const body = (await r.json()) as { matches?: TimelineMatch[]; error?: string };
-          if (!r.ok) throw new Error(body.error ?? `http_${r.status}`);
+          const body = (await r.json()) as {
+            matches?: TimelineMatch[];
+            error?: string;
+            detail?: string;
+          };
+          if (!r.ok) {
+            const base = body.error ?? `http_${r.status}`;
+            throw new Error(body.detail ? `${base}: ${body.detail}` : base);
+          }
           setMatches(body.matches ?? []);
           setError(null);
         })

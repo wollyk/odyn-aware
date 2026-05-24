@@ -107,6 +107,17 @@ async function loginIfNeeded(force = false) {
   return cachedToken;
 }
 
+/**
+ * Returns the currently-cached `frigate_token` cookie value, refreshing it
+ * via login when expired. Exposed for sibling modules (frigate-vod.mjs)
+ * that need to make authenticated requests against Frigate but want to
+ * own their own response handling.
+ */
+export async function getAuthCookie({ refresh = false } = {}) {
+  const token = await loginIfNeeded(refresh);
+  return `frigate_token=${token}`;
+}
+
 async function frigateFetch(path, opts = {}) {
   const token = await loginIfNeeded();
   const url = frigateUrl(path);

@@ -57,8 +57,14 @@ export function useTimelineSegments(
             segments?: TimelineSegment[];
             bin_ms?: number;
             error?: string;
+            detail?: string;
           };
-          if (!r.ok) throw new Error(body.error ?? `http_${r.status}`);
+          if (!r.ok) {
+            // Include detail so the UI can show the real upstream reason
+            // (e.g. "frigate recordings 401") instead of just "frigate_unreachable".
+            const base = body.error ?? `http_${r.status}`;
+            throw new Error(body.detail ? `${base}: ${body.detail}` : base);
+          }
           setSegments(body.segments ?? []);
           setBinMs(body.bin_ms ?? 60_000);
           setError(null);

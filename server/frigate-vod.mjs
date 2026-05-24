@@ -24,6 +24,7 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
+import { getAuthCookie } from "./frigate.mjs";
 
 const FRIGATE_BASE = process.env.FRIGATE_BASE ?? "https://127.0.0.1:3000";
 
@@ -111,13 +112,36 @@ export function buildClipUrl(camera, startMs, endMs) {
 // Returns the raw node:http(s) IncomingMessage so the caller can pipe
 // bytes back to its own response (preserves Content-Range / Content-Type).
 //
+// Authenticated by default: attaches the Frigate JWT cookie. Without this
+// every VOD/recordings endpoint returns 401 on Frigate >= 0.14. On 401 we
+// retry exactly once with a forced re-login, mirroring frigate.mjs's
+// frigateFetch behavior.
+//
 // Resolves on the response headers; the body is the IncomingMessage stream.
 export function openRangeFetch(upstreamUrl, rangeHeader = null, extraHeaders = {}) {
-  return new Promise((resolve, reject) => {
+  return _doRangeFetch(upstreamUrl, rangeHeader, extraHeaders, /*allowRetry*/ true);
+}
+
+async function _doRangeFetch(upstreamUrl, rangeHeader, extraHeaders, allowRetry) {
+  // Caller can pre-supply a Cookie via extraHeaders; otherwise we attach
+  // the cached Frigate JWT. Auth-disabled environments end up with no
+  // cookie and that's fine (loginIfNeeded throws frigate_not_configured
+  // long before we get here).
+  let headers = { ...extraHeaders };
+  if (!headers.Cookie && !headers.cookie) {
+    try {
+      headers.Cookie = await getAuthCookie();
+    } catch (err) {
+      // Surface the auth failure as the immediate error; the route layer
+      // turns it into a 502 with the message intact.
+      throw new Error(`frigate_auth_failed: ${err?.message ?? err}`);
+    }
+  }
+  if (rangeHeader) headers.range = rangeHeader;
+
+  const res = await new Promise((resolve, reject) => {
     const u = upstreamUrl instanceof URL ? upstreamUrl : new URL(upstreamUrl);
     const isHttps = u.protocol === "https:";
-    const headers = { ...extraHeaders };
-    if (rangeHeader) headers.range = rangeHeader;
     const opts = {
       hostname: u.hostname,
       port: u.port || (isHttps ? 443 : 80),
@@ -128,12 +152,8 @@ export function openRangeFetch(upstreamUrl, rangeHeader = null, extraHeaders = {
       // as frigate.mjs::rawRequest.
       rejectUnauthorized: false,
     };
-    const req = (isHttps ? httpsRequest : httpRequest)(opts, (res) => {
-      resolve({
-        status: res.statusCode ?? 0,
-        headers: res.headers,
-        stream: res,
-      });
+    const req = (isHttps ? httpsRequest : httpRequest)(opts, (r) => {
+      resolve({ status: r.statusCode ?? 0, headers: r.headers, stream: r });
     });
     req.on("error", reject);
     req.setTimeout(30_000, () => {
@@ -141,6 +161,20 @@ export function openRangeFetch(upstreamUrl, rangeHeader = null, extraHeaders = {
     });
     req.end();
   });
+
+  if (res.status === 401 && allowRetry) {
+    // Drain the body so the socket can be reused.
+    res.stream.resume();
+    try {
+      const fresh = await getAuthCookie({ refresh: true });
+      const newHeaders = { ...extraHeaders, Cookie: fresh };
+      return _doRangeFetch(upstreamUrl, rangeHeader, newHeaders, /*allowRetry*/ false);
+    } catch (err) {
+      throw new Error(`frigate_auth_failed: ${err?.message ?? err}`);
+    }
+  }
+
+  return res;
 }
 
 // -- Recordings density ----------------------------------------------------
@@ -153,14 +187,12 @@ export function openRangeFetch(upstreamUrl, rangeHeader = null, extraHeaders = {
  * for ≤24h. Each bin's `bytes` is summed `segment_size` across the
  * segments that intersect the bin.
  */
-export async function listRecordingsWindow(camera, startMs, endMs, { auth } = {}) {
+export async function listRecordingsWindow(camera, startMs, endMs) {
   assertWindow(startMs, endMs);
   const url = frigateUrl(
     `/api/${encodeCam(camera)}/recordings?after=${(startMs / 1000).toFixed(3)}&before=${(endMs / 1000).toFixed(3)}`,
   );
-  const headers = {};
-  if (auth) headers.Cookie = `frigate_token=${auth}`;
-  const upstream = await openRangeFetch(url, null, headers);
+  const upstream = await openRangeFetch(url, null);
   if (upstream.status !== 200) {
     const err = new Error(`frigate recordings ${upstream.status}`);
     err.code = "upstream_status";
@@ -176,6 +208,35 @@ export async function listRecordingsWindow(camera, startMs, endMs, { auth } = {}
   }
   const segments = Array.isArray(raw) ? raw : [];
   return aggregateSegments(segments, startMs, endMs);
+}
+
+/**
+ * Diagnostic probe: returns raw status, content-type, and the first
+ * `maxBytes` bytes of the body. Lets an admin see EXACTLY why Frigate
+ * is rejecting a recordings request without me having to read logs.
+ */
+export async function probeRecordings(camera, startMs, endMs, { maxBytes = 200 } = {}) {
+  assertWindow(startMs, endMs);
+  const url = frigateUrl(
+    `/api/${encodeCam(camera)}/recordings?after=${(startMs / 1000).toFixed(3)}&before=${(endMs / 1000).toFixed(3)}`,
+  );
+  try {
+    const upstream = await openRangeFetch(url, null);
+    const buf = await collect(upstream.stream);
+    return {
+      upstream_url: url.toString(),
+      status: upstream.status,
+      content_type: upstream.headers["content-type"] ?? null,
+      body_preview: buf.subarray(0, maxBytes).toString("utf8"),
+      body_bytes: buf.length,
+    };
+  } catch (err) {
+    return {
+      upstream_url: url.toString(),
+      status: 0,
+      error: err?.message ?? String(err),
+    };
+  }
 }
 
 function collect(stream) {

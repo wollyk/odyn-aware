@@ -45,4 +45,19 @@ describe("useTimelineSegments", () => {
     );
     await waitFor(() => expect(result.current.error).toBe("frigate_unreachable"));
   });
+
+  it("includes detail field in the error message when present", async () => {
+    mock.on("GET", /\/segments/, () =>
+      jsonResponse(
+        { error: "frigate_unreachable", detail: "frigate recordings 401" },
+        { status: 502 },
+      ),
+    );
+    const { result } = renderHook(() =>
+      useTimelineSegments("Driveway", { start_ms: 0, end_ms: 60_000 }, { debounceMs: 0 }),
+    );
+    await waitFor(() =>
+      expect(result.current.error).toBe("frigate_unreachable: frigate recordings 401"),
+    );
+  });
 });

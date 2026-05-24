@@ -21,6 +21,7 @@ import {
   buildClipUrl,
   openRangeFetch,
   listRecordingsWindow,
+  probeRecordings,
 } from "../frigate-vod.mjs";
 
 const CAM_RE = /^\/api\/agent\/timeline\/([A-Za-z0-9_\-]+)\/(.*)$/;
@@ -91,6 +92,28 @@ export async function handle(req, res, url, ctx) {
     return true;
   }
 
+  // ---- /diagnose --------------------------------------------------------
+  // Returns the raw upstream response so an admin can see EXACTLY what
+  // Frigate is sending back (status, content-type, body preview). Useful
+  // when /segments returns "frigate_unreachable" and you need to know why.
+  if (req.method === "GET" && rest === "diagnose") {
+    if (!frigate.isConfigured()) {
+      send(res, 200, {
+        frigate_configured: false,
+        detail: "FRIGATE_USER/FRIGATE_PASS not set on this server",
+      });
+      return true;
+    }
+    try {
+      const probeFn = vod?.probeRecordings ?? probeRecordings;
+      const result = await probeFn(camera, start_ms, end_ms);
+      send(res, 200, { camera, start_ms, end_ms, frigate_configured: true, ...result });
+    } catch (err) {
+      send(res, 500, { error: "diagnose_failed", detail: err.message });
+    }
+    return true;
+  }
+
   // ---- /segments --------------------------------------------------------
   if (req.method === "GET" && rest === "segments") {
     if (!frigate.isConfigured()) {
@@ -102,11 +125,15 @@ export async function handle(req, res, url, ctx) {
         camera,
         start_ms,
         end_ms,
-        {},
       );
       send(res, 200, { camera, ...out });
     } catch (err) {
-      send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      // Always include the detail so the UI can show the real reason.
+      send(res, 502, {
+        error: "frigate_unreachable",
+        detail: err?.message ?? String(err),
+        hint: "GET /api/agent/timeline/<cam>/diagnose?start_ms=...&end_ms=... for raw upstream info",
+      });
     }
     return true;
   }
