@@ -27,9 +27,30 @@ import {
 
 const CAM_RE = /^\/api\/agent\/timeline\/([A-Za-z0-9_\-]+)\/(.*)$/;
 
+// Tiny ring buffer of recent VOD proxy attempts. Exposed via
+// /api/agent/timeline/_recent so an admin can see exactly what was
+// requested upstream and what came back, without needing server logs.
+const RECENT_MAX = 50;
+const recent = [];
+function recordProxy(entry) {
+  recent.push({ at: new Date().toISOString(), ...entry });
+  while (recent.length > RECENT_MAX) recent.shift();
+}
+
 // Exported so tests can call without bringing up a full HTTP server.
 export async function handle(req, res, url, ctx) {
   const { db, frigate, vod = null } = ctx;
+
+  // Lightweight admin-only diagnostic — last 50 VOD proxy attempts
+  // with their upstream status codes and timings. No camera-name in
+  // path so it falls outside CAM_RE.
+  if (url.pathname === "/api/agent/timeline/_recent") {
+    const me = requireAdmin(db, req, res);
+    if (!me) return true;
+    send(res, 200, { count: recent.length, entries: [...recent].reverse() });
+    return true;
+  }
+
   const m = url.pathname.match(CAM_RE);
   if (!m) return false;
   const camera = m[1];
@@ -156,15 +177,31 @@ export async function handle(req, res, url, ctx) {
       send(res, 503, { error: "frigate_not_configured" });
       return true;
     }
+    const t0 = Date.now();
+    let upstreamUrl = null;
     try {
-      const upstreamUrl = (vod?.buildHlsMasterUrl ?? buildHlsMasterUrl)(
+      upstreamUrl = (vod?.buildHlsMasterUrl ?? buildHlsMasterUrl)(
         camera,
         start_ms,
         end_ms,
       );
       const up = await (vod?.openRangeFetch ?? openRangeFetch)(upstreamUrl, null);
       if (up.status !== 200) {
-        send(res, up.status, { error: "upstream", status: up.status });
+        const bodyPreview = (await collect(up.stream)).subarray(0, 200).toString("utf8");
+        recordProxy({
+          kind: "master.m3u8",
+          camera,
+          upstream_url: upstreamUrl.toString(),
+          upstream_status: up.status,
+          ms: Date.now() - t0,
+          body_preview: bodyPreview,
+        });
+        send(res, up.status, {
+          error: "upstream",
+          status: up.status,
+          upstream_url: upstreamUrl.toString(),
+          body_preview: bodyPreview,
+        });
         return true;
       }
       const buf = await collect(up.stream);
@@ -174,13 +211,33 @@ export async function handle(req, res, url, ctx) {
         start_ms,
         end_ms,
       );
+      recordProxy({
+        kind: "master.m3u8",
+        camera,
+        upstream_url: upstreamUrl.toString(),
+        upstream_status: 200,
+        ms: Date.now() - t0,
+        rewritten_bytes: rewritten.length,
+      });
       res.writeHead(200, {
         "Content-Type": "application/vnd.apple.mpegurl",
         "Cache-Control": "private, max-age=10",
       });
       res.end(rewritten);
     } catch (err) {
-      send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      recordProxy({
+        kind: "master.m3u8",
+        camera,
+        upstream_url: upstreamUrl?.toString() ?? null,
+        upstream_status: 0,
+        ms: Date.now() - t0,
+        error: err?.message ?? String(err),
+      });
+      send(res, 502, {
+        error: "frigate_unreachable",
+        detail: err.message,
+        upstream_url: upstreamUrl?.toString() ?? null,
+      });
     }
     return true;
   }

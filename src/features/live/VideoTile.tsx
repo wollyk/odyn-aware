@@ -382,6 +382,14 @@ export function VideoTile({
       ? `Stream error${live.error ? `: ${live.error}` : ""}`
       : "Connecting…";
 
+  // When the past-playback tile errors out, build a quick admin link
+  // back to the diagnose endpoint for THIS exact window. The user can
+  // click it to see the raw upstream response.
+  const diagnoseHref =
+    isPast && cam && playback.kind === "past"
+      ? `/api/agent/timeline/${encodeURIComponent(cam.name)}/diagnose?start_ms=${playback.startMs}&end_ms=${playback.endMs}`
+      : null;
+
   return (
     <div className="relative" ref={wrapRef}>
       <div className="relative aspect-video overflow-hidden border border-border bg-black">
@@ -422,9 +430,27 @@ export function VideoTile({
         />
 
         {showCenterOverlay && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-            <div className="bg-black/70 px-4 py-2 font-mono text-xs uppercase tracking-widest text-foreground/85">
-              {overlayText}
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div
+              className={`max-w-[80%] px-4 py-3 font-mono text-xs tracking-widest ${
+                (isPast && past.status === "error") ||
+                (!isPast && live.status === "error")
+                  ? "bg-red-950/85 text-red-200 border border-red-500/60"
+                  : "bg-black/70 text-foreground/85"
+              }`}
+            >
+              <div className="text-center uppercase">{overlayText}</div>
+              {isPast && past.status === "error" && diagnoseHref && (
+                <a
+                  href={diagnoseHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-2 block text-center text-[10px] underline-offset-2 hover:underline text-red-100"
+                  data-testid="diagnose-link"
+                >
+                  open /diagnose for raw upstream info ↗
+                </a>
+              )}
             </div>
           </div>
         )}

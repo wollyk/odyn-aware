@@ -68,18 +68,24 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
     setStatus("loading");
     setError(null);
 
-    // 20s safety net — if we never transition to playing/paused/error,
-    // surface a timeout so the operator can act. The handle lives on
-    // a ref so the media-event listener effect can defuse it.
+    // 6s safety net — if we never transition to playing/paused/error
+    // we surface a clear error. The previous 20s was just frustrating
+    // to wait through during diagnosis.
     watchdogRef.current = window.setTimeout(() => {
       if (cancelled) return;
       setStatus("error");
-      setError("manifest_timeout (no manifest after 20s)");
-    }, 20_000);
+      setError("manifest_timeout (no media event in 6s)");
+    }, 6_000);
+
+    // AbortController so the manifest fetch itself can't outrun the
+    // watchdog — without this the fetch could sit waiting for a slow
+    // upstream while the UI shows "loading".
+    const ac = new AbortController();
+    const fetchTimer = window.setTimeout(() => ac.abort(), 6_000);
 
     // Pre-probe the manifest. If it's not a valid playlist body we
     // bail BEFORE letting hls.js spin indefinitely.
-    const probe = fetch(src, { credentials: "include" })
+    const probe = fetch(src, { credentials: "include", signal: ac.signal })
       .then(async (r) => {
         if (cancelled) return { ok: false as const, reason: "cancelled" };
         if (!r.ok) {
@@ -107,12 +113,18 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
         }
         return { ok: true as const };
       })
-      .catch((err) => ({
-        ok: false as const,
-        reason: err instanceof Error ? err.message : "fetch_failed",
-      }));
+      .catch((err) => {
+        const reason =
+          err?.name === "AbortError"
+            ? "fetch_timeout (manifest request did not complete in 6s)"
+            : err instanceof Error
+              ? err.message
+              : "fetch_failed";
+        return { ok: false as const, reason };
+      });
 
     probe.then((result) => {
+      window.clearTimeout(fetchTimer);
       if (cancelled) return;
       if (!result.ok) {
         defuseWatchdog();
@@ -161,6 +173,8 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
 
     return () => {
       cancelled = true;
+      window.clearTimeout(fetchTimer);
+      ac.abort();
       defuseWatchdog();
       hlsRef.current?.destroy();
       hlsRef.current = null;

@@ -307,6 +307,62 @@ test("/clip.mp4 forwards Range and pipes upstream stream", async () => {
   assert.equal(res.body.toString("utf8"), "PARTIAL_BYTES");
 });
 
+test("/hls/master.m3u8 includes body_preview when upstream is non-200", async () => {
+  const db = makeDb();
+  const vod = {
+    buildHlsMasterUrl: () => "https://frigate.local:3000/vod/.../master.m3u8",
+    openRangeFetch: async () => ({
+      status: 404,
+      headers: { "content-type": "text/html" },
+      stream: Readable.from([Buffer.from("<html>not found</html>")]),
+    }),
+  };
+  const { req, url } = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/master.m3u8",
+    query: { start_ms: 1000, end_ms: 2000 },
+  });
+  const res = new FakeRes();
+  await handle(req, res, url, { db, frigate: fakeFrigate(), vod });
+  assert.equal(res.statusCode, 404);
+  const body = res.json();
+  assert.equal(body.error, "upstream");
+  assert.equal(body.status, 404);
+  assert.match(body.upstream_url, /frigate\.local/);
+  assert.match(body.body_preview, /not found/);
+});
+
+test("/_recent returns the last few proxy attempts (ring buffer)", async () => {
+  const db = makeDb();
+  const vod = {
+    buildHlsMasterUrl: () => "https://frigate.local:3000/vod/cam/master.m3u8",
+    openRangeFetch: async () => ({
+      status: 404,
+      headers: { "content-type": "text/html" },
+      stream: Readable.from([Buffer.from("<html>nope</html>")]),
+    }),
+  };
+  // Stage one failing request through the master endpoint so it lands in
+  // the ring buffer.
+  const ctx = { db, frigate: fakeFrigate(), vod };
+  const r1 = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/master.m3u8",
+    query: { start_ms: 1000, end_ms: 2000 },
+  });
+  await handle(r1.req, new FakeRes(), r1.url, ctx);
+
+  // Now read the ring buffer.
+  const r2 = makeReq({ path: "/api/agent/timeline/_recent", query: {} });
+  const res = new FakeRes();
+  await handle(r2.req, res, r2.url, ctx);
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.ok(body.count >= 1);
+  const entry = body.entries[0];
+  assert.equal(entry.kind, "master.m3u8");
+  assert.equal(entry.upstream_status, 404);
+  assert.match(entry.body_preview, /nope/);
+});
+
 test("/clip.mp4 returns 502 when upstream throws", async () => {
   const db = makeDb();
   const vod = {
