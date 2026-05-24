@@ -4,6 +4,8 @@
 // just calls these helpers with the current mode and the user's
 // intent, gets a new mode back, and renders.
 
+import type { TimelineMatch } from "./useTimelineMatches";
+
 export type PlaybackMode =
   | { kind: "live" }
   | {
@@ -11,7 +13,12 @@ export type PlaybackMode =
       startMs: number;
       endMs: number;
       cursorMs: number;
+      /** Optional — populated when the user clicked a face dot.
+       *  Used by VideoTile to draw the pink probe bbox. */
+      activeMatch?: TimelineMatch | null;
     };
+
+export const LIVE: PlaybackMode = { kind: "live" };
 
 /** Default window for the past timeline strip: most recent N ms. */
 export function windowFor(now: number, spanMs: number): {

@@ -1,23 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { TimelinePanel } from "./TimelinePanel";
+import { LIVE_MODE, type PlaybackMode } from "./playbackMode";
 import {
   installFetchMock,
   jsonResponse,
   type FetchMock,
 } from "../../test/fetch-mock";
-
-class FakeHls {
-  static Events = { ERROR: "hlsError" };
-  static isSupported = vi.fn(() => true);
-  destroy = vi.fn();
-  loadSource = vi.fn();
-  attachMedia = vi.fn();
-  on = vi.fn();
-}
-const fakeHlsModule = {
-  default: FakeHls as unknown as typeof import("hls.js").default,
-};
 
 let mock: FetchMock;
 
@@ -49,36 +39,65 @@ beforeEach(() => {
 
 afterEach(() => mock.restore());
 
-describe("TimelinePanel", () => {
+/**
+ * Test helper: render TimelinePanel inside a state container so we can
+ * verify it correctly emits onPlaybackChange and reacts to controlled
+ * playback updates the same way the parent would.
+ */
+function Harness({ camera = "Driveway" as string | null }: { camera?: string | null }) {
+  const [playback, setPlayback] = useState<PlaybackMode>(LIVE_MODE);
+  return (
+    <div>
+      <div data-testid="hmode">{playback.kind}</div>
+      <div data-testid="hcursor">
+        {playback.kind === "past" ? String(playback.cursorMs) : "—"}
+      </div>
+      <div data-testid="hactive-id">
+        {playback.kind === "past" && playback.activeMatch
+          ? String(playback.activeMatch.id)
+          : "—"}
+      </div>
+      <TimelinePanel
+        camera={camera}
+        playback={playback}
+        onPlaybackChange={setPlayback}
+      />
+    </div>
+  );
+}
+
+describe("TimelinePanel (controlled)", () => {
   it("renders disabled state when camera is null", () => {
-    render(<TimelinePanel camera={null} />);
+    render(
+      <TimelinePanel
+        camera={null}
+        playback={LIVE_MODE}
+        onPlaybackChange={() => {}}
+      />,
+    );
     expect(screen.getByText(/Timeline disabled/i)).toBeInTheDocument();
   });
 
   it("fetches matches and segments when a camera is provided", async () => {
-    render(<TimelinePanel camera="Driveway" hlsModule={fakeHlsModule as unknown as typeof import("hls.js")} />);
+    render(<Harness />);
     await waitFor(() => {
       expect(mock.calls.some((c) => c.url.includes("/matches"))).toBe(true);
       expect(mock.calls.some((c) => c.url.includes("/segments"))).toBe(true);
     });
   });
 
-  it("clicking a match dot opens the PastPlayer", async () => {
-    render(<TimelinePanel camera="Driveway" hlsModule={fakeHlsModule as unknown as typeof import("hls.js")} />);
+  it("clicking a match dot emits past playback with that match active", async () => {
+    render(<Harness />);
     await waitFor(() =>
       expect(screen.queryByTestId("match-dot")).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByTestId("match-dot"));
-    expect(screen.getByTestId("past-player")).toBeInTheDocument();
+    expect(screen.getByTestId("hmode").textContent).toBe("past");
+    expect(screen.getByTestId("hactive-id").textContent).toBe("17");
   });
 
-  it("dragging the strip opens the PastPlayer even without a selected match", async () => {
-    render(
-      <TimelinePanel
-        camera="Driveway"
-        hlsModule={fakeHlsModule as unknown as typeof import("hls.js")}
-      />,
-    );
+  it("dragging the strip emits past playback with the dragged cursor", async () => {
+    render(<Harness />);
     await waitFor(() =>
       expect(screen.queryByTestId("timeline-strip")).toBeInTheDocument(),
     );
@@ -91,28 +110,60 @@ describe("TimelinePanel", () => {
         width: 800, height: 100, x: 0, y: 0, toJSON() {},
       }),
     });
-
-    expect(screen.queryByTestId("past-player")).not.toBeInTheDocument();
     fireEvent.pointerDown(strip, { clientX: 200, button: 0, pointerId: 1 });
     fireEvent.pointerMove(strip, { clientX: 400, pointerId: 1 });
     fireEvent.pointerUp(strip, { clientX: 400, pointerId: 1 });
 
-    expect(screen.getByTestId("past-player")).toBeInTheDocument();
+    expect(screen.getByTestId("hmode").textContent).toBe("past");
+    expect(screen.getByTestId("hactive-id").textContent).toBe("—");
+    expect(Number(screen.getByTestId("hcursor").textContent)).toBeGreaterThan(0);
   });
 
-  it("clicking [Now] resets pinned window", async () => {
-    render(<TimelinePanel camera="Driveway" hlsModule={fakeHlsModule as unknown as typeof import("hls.js")} />);
+  it("clicking [Now] returns to live mode", async () => {
+    render(<Harness />);
     await waitFor(() =>
       expect(screen.queryByTestId("match-dot")).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByTestId("match-dot"));
-    expect(screen.getByTestId("past-player")).toBeInTheDocument();
+    expect(screen.getByTestId("hmode").textContent).toBe("past");
     fireEvent.click(screen.getByRole("button", { name: /\[ Now \]/i }));
-    expect(screen.queryByTestId("past-player")).not.toBeInTheDocument();
+    expect(screen.getByTestId("hmode").textContent).toBe("live");
+  });
+
+  it("camera change forces back to live mode (does not strand a past window)", async () => {
+    function CameraSwitcher() {
+      const [cam, setCam] = useState("Driveway" as string);
+      const [playback, setPlayback] = useState<PlaybackMode>({
+        kind: "past",
+        startMs: Date.now() - 60_000,
+        endMs: Date.now(),
+        cursorMs: Date.now() - 30_000,
+        activeMatch: null,
+      });
+      return (
+        <div>
+          <div data-testid="hmode">{playback.kind}</div>
+          <button type="button" onClick={() => setCam("Backyard")}>
+            switch
+          </button>
+          <TimelinePanel
+            camera={cam}
+            playback={playback}
+            onPlaybackChange={setPlayback}
+          />
+        </div>
+      );
+    }
+    render(<CameraSwitcher />);
+    expect(screen.getByTestId("hmode").textContent).toBe("past");
+    fireEvent.click(screen.getByRole("button", { name: "switch" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("hmode").textContent).toBe("live"),
+    );
   });
 
   it("span toggle re-issues fetches", async () => {
-    render(<TimelinePanel camera="Driveway" />);
+    render(<Harness />);
     await waitFor(() =>
       expect(mock.calls.some((c) => c.url.includes("/matches"))).toBe(true),
     );

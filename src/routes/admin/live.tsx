@@ -6,6 +6,8 @@ import { VideoTile } from "@/features/live/VideoTile";
 import { ChatPanel } from "@/features/live/ChatPanel";
 import { DailySummaryPanel } from "@/features/live/DailySummaryPanel";
 import { TimelinePanel } from "@/features/live/TimelinePanel";
+import type { PlaybackMode } from "@/features/live/playbackMode";
+import { LIVE_MODE } from "@/features/live/playbackMode";
 import {
   AdminHeader,
   AuthDeniedScreen,
@@ -28,6 +30,11 @@ function AdminLive() {
   // Default to Live MSE (snapshot mode hits Frigate's `latest.jpg` placeholder
   // when detect.enabled=false). MSE taps go2rtc directly.
   const [mode, setMode] = useState<StreamMode>("live");
+
+  // Single source of truth for live-vs-past. VideoTile renders it
+  // (live MSE or HLS), TimelinePanel reads it (cursor position) and
+  // emits new values via setPlayback.
+  const [playback, setPlayback] = useState<PlaybackMode>(LIVE_MODE);
 
   const cam = useMemo(
     () => camList.cameras.find((c) => c.name === camera) ?? null,
@@ -107,11 +114,25 @@ function AdminLive() {
         </div>
 
         <div className="grid gap-4 lg:grid-cols-[1fr_420px]">
-          <VideoTile cam={cam} mode={mode} agentStatus={agentStatus} />
+          <VideoTile
+            cam={cam}
+            mode={mode}
+            agentStatus={agentStatus}
+            playback={playback}
+            onPastCursorAdvance={(ms) => {
+              setPlayback((prev) =>
+                prev.kind === "past" ? { ...prev, cursorMs: ms } : prev,
+              );
+            }}
+          />
           <ChatPanel cam={cam} agentStatus={agentStatus} />
         </div>
 
-        <TimelinePanel camera={cam?.name ?? null} />
+        <TimelinePanel
+          camera={cam?.name ?? null}
+          playback={playback}
+          onPlaybackChange={setPlayback}
+        />
 
         <p className="mt-6 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           {mode === "snapshot"

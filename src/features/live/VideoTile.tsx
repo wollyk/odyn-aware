@@ -17,16 +17,32 @@ import type {
 import { useMseStream } from "./useMseStream";
 import { useDetections } from "./useDetections";
 import { useTracker, type TrackedBox } from "./useTracker";
+import { useHlsPlayer } from "./useHlsPlayer";
+import type { PlaybackMode } from "./playbackMode";
+import { LIVE_MODE } from "./playbackMode";
+
+export type VideoTileProps = {
+  cam: Camera | null;
+  mode: StreamMode;
+  agentStatus: AgentStatus | null;
+  /** Live vs past-playback intent. Defaults to live. */
+  playback?: PlaybackMode;
+  /** Called when HLS playback advances naturally so the parent can
+   *  scroll the timeline cursor in sync. */
+  onPastCursorAdvance?: (ms: number) => void;
+  /** Test seam: inject hls.js to avoid network imports. */
+  hlsModule?: typeof import("hls.js");
+};
 
 export function VideoTile({
   cam,
   mode,
   agentStatus,
-}: {
-  cam: Camera | null;
-  mode: StreamMode;
-  agentStatus: AgentStatus | null;
-}) {
+  playback = LIVE_MODE,
+  onPastCursorAdvance,
+  hlsModule,
+}: VideoTileProps) {
+  const isPast = playback.kind === "past";
   const [imgUrl, setImgUrl] = useState<string>("");
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -36,16 +52,62 @@ export function VideoTile({
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const live = useMseStream(cam?.name ?? null, mode === "live");
-  const det = useDetections(cam);
-  // Phase-10: real-time tracker WS subscription. Drives the canvas
-  // overlay; det's boxes (face/weapon from the polling path) become a
-  // fallback for when the tracker is offline.
-  const trk = useTracker(cam);
+  // Live data sources — disabled when scrubbing the past. Disabling
+  // them tears down the WebSocket / polling timers cleanly.
+  const live = useMseStream(cam?.name ?? null, mode === "live" && !isPast);
+  const det = useDetections(isPast ? null : cam);
+  const trk = useTracker(isPast ? null : cam);
 
-  // Snapshot polling: 1Hz, cache-busted via ?t= (only in snapshot mode)
+  // Past playback (HLS). Source URL is null in live mode so the hook
+  // sits idle and doesn't poke at the <video>.
+  const pastSrc =
+    isPast && cam
+      ? `/api/agent/timeline/${encodeURIComponent(cam.name)}/hls/master.m3u8?start_ms=${playback.startMs}&end_ms=${playback.endMs}`
+      : null;
+  const past = useHlsPlayer({
+    src: pastSrc,
+    windowStartMs: isPast ? playback.startMs : 0,
+    hlsModule,
+  });
+
+  // Seek the HLS player when the parent's cursorMs changes. Debounced
+  // so a fast drag doesn't thrash segment loads (same trick the old
+  // PastPlayer used).
+  const cursorRef = useRef<number>(0);
+  const seekTimerRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!cam || mode !== "snapshot") return;
+    if (!isPast) return;
+    const target = playback.cursorMs;
+    if (Math.abs(cursorRef.current - target) < 50) return;
+    cursorRef.current = target;
+    if (seekTimerRef.current != null) {
+      window.clearTimeout(seekTimerRef.current);
+    }
+    seekTimerRef.current = window.setTimeout(() => {
+      seekTimerRef.current = null;
+      past.seekToMs(target);
+    }, 120);
+    return () => {
+      if (seekTimerRef.current != null) {
+        window.clearTimeout(seekTimerRef.current);
+        seekTimerRef.current = null;
+      }
+    };
+  }, [isPast, playback, past.seekToMs]);
+
+  // Emit cursor advance during natural playback so the timeline
+  // strip can follow along. We ignore the value while we're inside
+  // a debounced seek (the user just initiated movement).
+  useEffect(() => {
+    if (!isPast || !onPastCursorAdvance) return;
+    if (Math.abs(past.currentMs - cursorRef.current) < 250) return;
+    cursorRef.current = past.currentMs;
+    onPastCursorAdvance(past.currentMs);
+  }, [isPast, past.currentMs, onPastCursorAdvance]);
+
+  // Snapshot polling: 1Hz, cache-busted via ?t= (only in live snapshot mode)
+  useEffect(() => {
+    if (!cam || mode !== "snapshot" || isPast) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const tick = () => {
@@ -71,7 +133,7 @@ export function VideoTile({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [cam, mode]);
+  }, [cam, mode, isPast]);
 
   // HUD clock
   useEffect(() => {
@@ -97,7 +159,11 @@ export function VideoTile({
   // gracefully decay over 1.5s instead of sticking around looking real.
   useEffect(() => {
     const canvas = canvasRef.current;
-    const target: HTMLElement | null = mode === "live" ? live.videoRef.current : imgRef.current;
+    const target: HTMLElement | null = isPast
+      ? past.videoRef.current
+      : mode === "live"
+      ? live.videoRef.current
+      : imgRef.current;
     if (!canvas || !target) return;
 
     // COCO-class palette. Picked to be distinct against typical security
@@ -140,7 +206,7 @@ export function VideoTile({
       if (!w || !h) return null;
       let srcW = 0;
       let srcH = 0;
-      if (mode === "live" && target instanceof HTMLVideoElement) {
+      if (target instanceof HTMLVideoElement) {
         srcW = target.videoWidth || 0;
         srcH = target.videoHeight || 0;
       } else if (target instanceof HTMLImageElement) {
@@ -181,34 +247,53 @@ export function VideoTile({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
-      const useTracker = trk.status === "open" && trk.tickAt != null;
-      const trackerBoxes: DrawBox[] = useTracker
-        ? trk.tracks.map((t: TrackedBox) => ({
-            rgb: colorForClass(t.label),
-            bbox: t.bbox,
-            label: `${t.label} #${t.id} ${t.conf.toFixed(2)}`,
-            ts: trk.tickAt ?? Date.now(),
+      // In past playback, the only overlay we draw is the active
+      // match's pink probe bbox (when the cursor is within ±500ms of
+      // its ts_ms). Tracker/detection feeds are paused.
+      let drawBoxes: DrawBox[] = [];
+      if (isPast) {
+        const am = playback.kind === "past" ? playback.activeMatch : null;
+        if (am?.bbox && Math.abs(past.currentMs - am.ts_ms) < 500) {
+          drawBoxes = [{
+            rgb: "244, 114, 182",
+            bbox: am.bbox,
+            label: am.person_name
+              ? `${am.person_name} ${(am.similarity * 100).toFixed(0)}%`
+              : `match ${(am.similarity * 100).toFixed(0)}%`,
+            ts: Date.now(),
             lineWidth: 2,
-          }))
-        : [];
-      const faceBoxes: DrawBox[] = det.boxes
-        .filter((b) => FACE_SOURCES.has(b.source))
-        .map((b) => ({
-          rgb: b.source === "face_known" ? "56, 189, 248" : "251, 191, 36",
-          bbox: b.bbox,
-          label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
-          ts: b.ts,
-          lineWidth: 1,
-          dashed: true,
-        }));
-      const drawBoxes: DrawBox[] = useTracker
-        ? [...trackerBoxes, ...faceBoxes]
-        : det.boxes.map((b) => ({
-            rgb: FALLBACK_STYLE[b.source] ?? "148, 163, 184",
+          }];
+        }
+      } else {
+        const useTracker = trk.status === "open" && trk.tickAt != null;
+        const trackerBoxes: DrawBox[] = useTracker
+          ? trk.tracks.map((t: TrackedBox) => ({
+              rgb: colorForClass(t.label),
+              bbox: t.bbox,
+              label: `${t.label} #${t.id} ${t.conf.toFixed(2)}`,
+              ts: trk.tickAt ?? Date.now(),
+              lineWidth: 2,
+            }))
+          : [];
+        const faceBoxes: DrawBox[] = det.boxes
+          .filter((b) => FACE_SOURCES.has(b.source))
+          .map((b) => ({
+            rgb: b.source === "face_known" ? "56, 189, 248" : "251, 191, 36",
             bbox: b.bbox,
             label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
             ts: b.ts,
+            lineWidth: 1,
+            dashed: true,
           }));
+        drawBoxes = useTracker
+          ? [...trackerBoxes, ...faceBoxes]
+          : det.boxes.map((b) => ({
+              rgb: FALLBACK_STYLE[b.source] ?? "148, 163, 184",
+              bbox: b.bbox,
+              label: b.confidence > 0 ? `${b.label} ${b.confidence.toFixed(2)}` : b.label,
+              ts: b.ts,
+            }));
+      }
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.textBaseline = "top";
 
@@ -262,32 +347,55 @@ export function VideoTile({
       ro.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trk.tracks, trk.tickAt, trk.status, det.boxes, det.tickAt, imgUrl, mode, live.status]);
+  }, [
+    trk.tracks, trk.tickAt, trk.status,
+    det.boxes, det.tickAt,
+    imgUrl, mode, live.status,
+    isPast, past.currentMs, playback,
+  ]);
 
   const camLabel = cam ? cam.label : "—";
   const wireName = cam ? cam.name : "";
   const ts = new Date(now).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
 
   // ---- HUD label rules ----
-  // mode=live + playing: show bitrate; otherwise show "Connecting…"
-  // mode=snapshot:       show latency; otherwise "…"
-  const hudRight =
-    mode === "live"
+  const pastClock = isPast
+    ? new Date(past.currentMs || (playback.kind === "past" ? playback.cursorMs : Date.now()))
+        .toLocaleTimeString()
+    : "";
+  const hudRight = isPast
+    ? `past · ${pastClock} · ${past.status === "playing" ? "▶" : past.status === "paused" ? "⏸" : past.status}`
+    : mode === "live"
       ? `${ts} · ${live.status === "playing" ? `${live.bitrateKbps}kbps` : "connecting…"}`
       : `${ts} · ${latencyMs != null ? `${latencyMs}ms` : "…"}`;
 
   // ---- Center overlay rules ----
   // Only show explicit "error" copy. Everything else is a single calm "Connecting…".
-  const showCenterOverlay = mode === "live" && live.status !== "playing";
-  const overlayText =
-    live.status === "error"
+  const showCenterOverlay = isPast
+    ? past.status === "loading" || past.status === "error"
+    : mode === "live" && live.status !== "playing";
+  const overlayText = isPast
+    ? past.status === "error"
+      ? `Playback error${past.error ? `: ${past.error}` : ""}`
+      : "Loading recording…"
+    : live.status === "error"
       ? `Stream error${live.error ? `: ${live.error}` : ""}`
       : "Connecting…";
 
   return (
     <div className="relative" ref={wrapRef}>
       <div className="relative aspect-video overflow-hidden border border-border bg-black">
-        {mode === "live" ? (
+        {isPast ? (
+          <video
+            ref={past.videoRef}
+            controls
+            playsInline
+            preload="metadata"
+            controlsList="nodownload"
+            className="h-full w-full object-contain select-none"
+            data-testid="past-video"
+          />
+        ) : mode === "live" ? (
           <video
             ref={live.videoRef}
             autoPlay
@@ -326,12 +434,14 @@ export function VideoTile({
           <div className="flex items-center gap-2 bg-black/65 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-foreground">
             <span
               className={`inline-block h-1.5 w-1.5 rounded-full ${
-                mode === "live" && live.status !== "playing"
-                  ? "bg-amber-400"
-                  : "bg-red-500 animate-pulse"
+                isPast
+                  ? "bg-fuchsia-400"
+                  : mode === "live" && live.status !== "playing"
+                    ? "bg-amber-400"
+                    : "bg-red-500 animate-pulse"
               }`}
             />
-            {mode === "live" ? "LIVE-MSE · AURORAVIEW" : "LIVE · AURORAVIEW"}
+            {isPast ? "PAST · AURORAVIEW" : mode === "live" ? "LIVE-MSE · AURORAVIEW" : "LIVE · AURORAVIEW"}
           </div>
           <div className="flex items-center gap-2">
             {/* Tracker WS status pill — green dot+count when streaming,

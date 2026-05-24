@@ -1,21 +1,23 @@
-// Live timeline panel — the composite "Option C" feature.
+// Controlled timeline panel.
 //
 // Layout:
-//   row 1: span selector  ·  loaded counts  ·  refresh
+//   row 1: span selector  ·  loaded counts  ·  [ Now ]
 //   row 2: TimelineStrip (full width)
-//   row 3: PastPlayer (left) + MatchList (right)
+//   row 3: MatchList (right column when in past mode)
 //
-// State machine: `mode` here is just for the strip — past playback only
-// becomes active when the user clicks a match (or scrubs to a non-now
-// cursor and presses play). Until then the panel sits dormant so its
-// data fetches don't block the live view above it.
+// Ownership note: this component is **controlled by the parent**. The
+// parent owns `playback` (live vs past) and the cursorMs. We only own
+// transient UI state — the span selector and the "now" clock that drives
+// live-mode windowing. Every user gesture (click/drag/match-pick/Now)
+// translates into an `onPlaybackChange(next)` call. This lets the live
+// VideoTile and the timeline stay in sync via a single source of truth.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTimelineMatches, type TimelineMatch } from "./useTimelineMatches";
 import { useTimelineSegments } from "./useTimelineSegments";
 import { TimelineStrip } from "./TimelineStrip";
-import { PastPlayer } from "./PastPlayer";
 import { MatchList } from "./MatchList";
+import type { PlaybackMode } from "./playbackMode";
 
 type SpanKey = "15m" | "1h" | "6h" | "24h";
 
@@ -28,32 +30,43 @@ const SPAN_MS: Record<SpanKey, number> = {
 
 export type TimelinePanelProps = {
   camera: string | null;
-  /** Optional injection point for tests so we can skip dynamic-imports. */
-  hlsModule?: typeof import("hls.js");
+  /** Current playback intent — sourced from the parent. */
+  playback: PlaybackMode;
+  /** Called whenever the user changes the playback intent. */
+  onPlaybackChange: (next: PlaybackMode) => void;
 };
 
-export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
+export function TimelinePanel({
+  camera,
+  playback,
+  onPlaybackChange,
+}: TimelinePanelProps) {
   const [span, setSpan] = useState<SpanKey>("1h");
   const [now, setNow] = useState(Date.now());
-  const [activeMatch, setActiveMatch] = useState<TimelineMatch | null>(null);
-  const [pinnedWindow, setPinnedWindow] = useState<
-    { start_ms: number; end_ms: number } | null
-  >(null);
-  const [cursorMs, setCursorMs] = useState<number>(Date.now());
 
-  // Refresh "now" once per minute when nothing is pinned. We deliberately
-  // don't refetch on a second-by-second cadence — matches/segments are
-  // cheap but not free, and the human is fine with ±60s freshness.
+  const isPast = playback.kind === "past";
+
+  // Refresh "now" once per minute while in live mode. We don't refresh
+  // every second — segments/matches are cheap but not free and ±60s is
+  // fine for human review.
   useEffect(() => {
-    if (pinnedWindow) return;
+    if (isPast) return;
     const t = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(t);
-  }, [pinnedWindow]);
+  }, [isPast]);
 
+  // Derive the visible time window:
+  //   live mode  → [now - span, now]
+  //   past mode  → frozen at the window from when the user first scrubbed
   const window_ = useMemo(() => {
-    if (pinnedWindow) return pinnedWindow;
+    if (isPast) {
+      return { start_ms: playback.startMs, end_ms: playback.endMs };
+    }
     return { start_ms: now - SPAN_MS[span], end_ms: now };
-  }, [pinnedWindow, span, now]);
+  }, [isPast, playback, span, now]);
+
+  const cursorMs = isPast ? playback.cursorMs : window_.end_ms;
+  const activeMatch = isPast ? playback.activeMatch ?? null : null;
 
   const { matches, loading: mLoading, error: mError } = useTimelineMatches(
     camera,
@@ -64,13 +77,23 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
     window_,
   );
 
-  // When the user changes camera or span, drop any active match/cursor.
+  // Camera change → back to live so we don't try to load HLS for a
+  // window that referred to a different camera's recording set. We use
+  // a ref to skip the initial mount: a parent that hands us
+  // `playback={past}` on first render meant it; only later switches
+  // should reset.
+  const prevCameraRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
-    setActiveMatch(null);
-    setPinnedWindow(null);
-    setCursorMs(window_.end_ms);
+    if (prevCameraRef.current === undefined) {
+      prevCameraRef.current = camera;
+      return;
+    }
+    if (prevCameraRef.current !== camera) {
+      prevCameraRef.current = camera;
+      if (playback.kind === "past") onPlaybackChange({ kind: "live" });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera, span]);
+  }, [camera]);
 
   if (!camera) {
     return (
@@ -80,6 +103,36 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
     );
   }
 
+  const seekTo = (ms: number) => {
+    // Snap the timeline window the first time we scrub. Subsequent
+    // scrubs reuse the frozen window so the strip doesn't slide.
+    if (playback.kind === "past") {
+      onPlaybackChange({ ...playback, cursorMs: ms });
+    } else {
+      onPlaybackChange({
+        kind: "past",
+        startMs: window_.start_ms,
+        endMs: window_.end_ms,
+        cursorMs: ms,
+        activeMatch: null,
+      });
+    }
+  };
+
+  const pickMatch = (m: TimelineMatch) => {
+    if (playback.kind === "past") {
+      onPlaybackChange({ ...playback, cursorMs: m.ts_ms, activeMatch: m });
+    } else {
+      onPlaybackChange({
+        kind: "past",
+        startMs: window_.start_ms,
+        endMs: window_.end_ms,
+        cursorMs: m.ts_ms,
+        activeMatch: m,
+      });
+    }
+  };
+
   return (
     <section className="mt-6" data-testid="timeline-panel">
       <div className="mb-3 flex items-center gap-3">
@@ -88,13 +141,15 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
           Timeline · {camera}
         </span>
         <span className="h-px flex-1 bg-border" />
+        <span className="font-mono text-[10px] uppercase tracking-widest text-foreground/55">
+          {isPast ? "past playback" : "live"}
+        </span>
         <SpanToggle value={span} onChange={setSpan} />
         <button
           type="button"
           onClick={() => {
-            setActiveMatch(null);
-            setPinnedWindow(null);
             setNow(Date.now());
+            onPlaybackChange({ kind: "live" });
           }}
           className="border border-border bg-background px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground hover:border-foreground hover:text-foreground"
         >
@@ -109,15 +164,8 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
         segments={segments}
         matches={matches}
         selectedMatchId={activeMatch?.id ?? null}
-        onSeek={(ms) => {
-          setCursorMs(ms);
-          if (!pinnedWindow) setPinnedWindow(window_);
-        }}
-        onMatchClick={(m) => {
-          setActiveMatch(m);
-          setCursorMs(m.ts_ms);
-          if (!pinnedWindow) setPinnedWindow(window_);
-        }}
+        onSeek={seekTo}
+        onMatchClick={pickMatch}
       />
 
       <div className="mt-1 flex justify-between font-mono text-[10px] text-foreground/55">
@@ -139,27 +187,17 @@ export function TimelinePanel({ camera, hlsModule }: TimelinePanelProps) {
         </div>
       )}
 
-      {/* Past-playback panel: open whenever the user has scrubbed off
-          "now" (pinnedWindow is set) OR clicked a match dot. Selected
-          match is optional — without one we just play the recording. */}
-      {(pinnedWindow || activeMatch) && (
+      {isPast && (
         <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_360px]">
-          <PastPlayer
-            camera={camera}
-            startMs={window_.start_ms}
-            endMs={window_.end_ms}
-            cursorMs={cursorMs}
-            selectedMatch={activeMatch}
-            onCursorChange={(ms) => setCursorMs(ms)}
-            hlsModule={hlsModule}
-          />
+          <div className="border border-foreground/15 bg-foreground/[0.02] p-3 font-mono text-[10px] text-foreground/55">
+            Playback rendered in the Live View tile above. Drag the
+            timeline or pick a match to scrub. Press [ Now ] to return
+            to live.
+          </div>
           <MatchList
             matches={matches}
             selectedMatchId={activeMatch?.id ?? null}
-            onPick={(m) => {
-              setActiveMatch(m);
-              setCursorMs(m.ts_ms);
-            }}
+            onPick={pickMatch}
           />
         </div>
       )}
