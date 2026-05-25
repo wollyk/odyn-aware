@@ -22,6 +22,7 @@ export type UseHlsPlayerResult = {
   durationMs: number;
   seekToMs: (ms: number) => void;
   setPlaying: (playing: boolean) => void;
+  togglePlay: () => void;
 };
 
 type Args = {
@@ -38,6 +39,10 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const watchdogRef = useRef<number | null>(null);
+  // Remember whether the user explicitly paused. If they did we
+  // honor that and stop retrying autoplay every time a buffer fill
+  // fires `canplay`. Cleared on the next user-initiated play().
+  const userPausedRef = useRef<boolean>(false);
   const [status, setStatus] = useState<HlsPlayerStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [currentMs, setCurrentMs] = useState(windowStartMs);
@@ -78,6 +83,15 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
     // transition loading → paused when metadata or playable data
     // arrives so the UI never sticks on "loading" after a successful
     // load.
+    //
+    // Autoplay is best-effort and gets retried on every "we have
+    // enough data to play" signal we receive, unless the user
+    // explicitly paused — that way a buffer underrun during a seek
+    // doesn't leave the tile sitting on the last frame forever.
+    const tryPlay = () => {
+      if (!autoPlay || userPausedRef.current) return;
+      void video.play().catch(() => {});
+    };
     const onTime = () => {
       defuseWatchdog();
       setCurrentMs(windowStartMs + video.currentTime * 1000);
@@ -86,17 +100,41 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
     const onReady = () => {
       defuseWatchdog();
       setStatus((s) => (s === "loading" ? "paused" : s));
+      tryPlay();
     };
-    const onPlay = () => { defuseWatchdog(); setStatus("playing"); };
-    const onPause = () => { defuseWatchdog(); setStatus("paused"); };
+    const onCanPlay = () => {
+      defuseWatchdog();
+      tryPlay();
+    };
+    const onPlay = () => {
+      defuseWatchdog();
+      userPausedRef.current = false;
+      setStatus("playing");
+    };
+    const onPause = () => {
+      defuseWatchdog();
+      setStatus("paused");
+      // Only count it as a user pause if we're at a steady frame
+      // (i.e. not at the tail of a seek where the browser briefly
+      // pauses to rebuffer). HTMLVideoElement exposes `seeking` for
+      // exactly that distinction.
+      if (!video.seeking) userPausedRef.current = true;
+    };
     const onEnded = () => setStatus("ended");
+    const onSeeked = () => {
+      // After a programmatic seek the video often needs a nudge to
+      // resume even though it has buffered data — re-attempt play
+      // and clear the soft-paused flag so canplay retries work too.
+      tryPlay();
+    };
     video.addEventListener("timeupdate", onTime);
     video.addEventListener("durationchange", onDur);
     video.addEventListener("loadedmetadata", onReady);
-    video.addEventListener("canplay", onReady);
+    video.addEventListener("canplay", onCanPlay);
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("ended", onEnded);
+    video.addEventListener("seeked", onSeeked);
 
     // 6s safety net — if we never transition to playing/paused/error
     // we surface a clear error. The previous 20s was just frustrating
@@ -181,7 +219,25 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
             setError("hls_not_supported");
             return;
           }
-          const hls = new HlsCtor();
+          // VOD-tuned buffer config. Defaults are conservative
+          // (maxBufferLength=30s, maxBufferSize=60MB) which makes
+          // seeks within the window feel like cold loads. We bump
+          // them so the playhead has 2min of ahead-buffer and
+          // ~200MB to work with — that comfortably covers a few
+          // forward-skips within a 15m/1h timeline window without
+          // re-fetching the same segments.
+          const hls = new HlsCtor({
+            maxBufferLength: 120,
+            maxMaxBufferLength: 1800,
+            maxBufferSize: 200 * 1024 * 1024,
+            backBufferLength: 60,
+            // Prefer faster initial startup over picking the highest
+            // bitrate variant — we usually only have one anyway.
+            startLevel: -1,
+            // Don't auto-resync forward on stalls: if we're paused,
+            // we want to stay where the user put us, not skip.
+            lowLatencyMode: false,
+          });
           hlsRef.current = hls;
           hls.on(HlsCtor.Events.ERROR, (_evt, data) => {
             if (cancelled) return;
@@ -211,10 +267,11 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
       video.removeEventListener("timeupdate", onTime);
       video.removeEventListener("durationchange", onDur);
       video.removeEventListener("loadedmetadata", onReady);
-      video.removeEventListener("canplay", onReady);
+      video.removeEventListener("canplay", onCanPlay);
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("ended", onEnded);
+      video.removeEventListener("seeked", onSeeked);
       video.removeAttribute("src");
       try { video.load(); } catch { /* ignore */ }
     };
@@ -236,9 +293,26 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
   const setPlaying = useCallback((playing: boolean) => {
     const video = videoRef.current;
     if (!video) return;
-    if (playing) void video.play().catch(() => {});
-    else video.pause();
+    if (playing) {
+      userPausedRef.current = false;
+      void video.play().catch(() => {});
+    } else {
+      userPausedRef.current = true;
+      video.pause();
+    }
   }, []);
 
-  return { videoRef, status, error, currentMs, durationMs, seekToMs, setPlaying };
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused || video.ended) {
+      userPausedRef.current = false;
+      void video.play().catch(() => {});
+    } else {
+      userPausedRef.current = true;
+      video.pause();
+    }
+  }, []);
+
+  return { videoRef, status, error, currentMs, durationMs, seekToMs, setPlaying, togglePlay };
 }

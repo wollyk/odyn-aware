@@ -146,6 +146,57 @@ describe("VideoTile playback modes", () => {
     }
   });
 
+  it("hides the native <video controls> in past mode so the misleading 50:10/59:16 timer isn't shown", () => {
+    const playback: PlaybackMode = {
+      kind: "past",
+      startMs: 1_700_000_000_000,
+      endMs: 1_700_000_000_000 + 60 * 60 * 1000,
+      cursorMs: 1_700_000_000_000 + 15 * 60 * 1000,
+      activeMatch: null,
+    };
+    render(
+      <VideoTile
+        cam={fakeCam}
+        mode="live"
+        agentStatus={null}
+        playback={playback}
+        hlsModule={fakeHlsModule as unknown as typeof import("hls.js")}
+      />,
+    );
+    const video = screen.getByTestId("past-video") as HTMLVideoElement;
+    // Native chrome MUST be off — that's what surfaced the
+    // playlist-relative timer. Operator reads our own wall-clock
+    // overlay instead.
+    expect(video.hasAttribute("controls")).toBe(false);
+  });
+
+  it("renders the REC wall-clock overlay with the playhead's clock time in past mode", () => {
+    // Pick a deterministic instant: 2026-05-24T15:30:00Z (15:30 UTC =
+    // a known time of day no matter what tz the test runs in we only
+    // assert a HH:MM:SS shape).
+    const cursorMs = Date.UTC(2026, 4, 24, 15, 30, 0);
+    const playback: PlaybackMode = {
+      kind: "past",
+      startMs: cursorMs - 30_000,
+      endMs: cursorMs + 30_000,
+      cursorMs,
+      activeMatch: null,
+    };
+    render(
+      <VideoTile
+        cam={fakeCam}
+        mode="live"
+        agentStatus={null}
+        playback={playback}
+        hlsModule={fakeHlsModule as unknown as typeof import("hls.js")}
+      />,
+    );
+    expect(screen.getByText("REC")).toBeInTheDocument();
+    // Shape "HH:MM:SS" (24-hour clock). We don't pin the exact value
+    // because the test machine's tz is not controlled.
+    expect(screen.getByText(/^\d{2}:\d{2}:\d{2}$/)).toBeInTheDocument();
+  });
+
   it("HUD chip changes from LIVE to PAST when playback flips", () => {
     const { rerender } = render(
       <VideoTile

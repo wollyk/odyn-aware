@@ -395,12 +395,20 @@ export function VideoTile({
   const ts = new Date(now).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
 
   // ---- HUD label rules ----
-  const pastClock = isPast
-    ? new Date(past.currentMs || (playback.kind === "past" ? playback.cursorMs : Date.now()))
-        .toLocaleTimeString()
-    : "";
+  // In past mode we surface a wall-clock playhead so the operator
+  // reads timestamps the same way they would on a live cam (not
+  // 50:10/59:16 "elapsed/total").
+  const pastInstantMs =
+    past.currentMs || (playback.kind === "past" ? playback.cursorMs : Date.now());
+  const pastInstant = new Date(pastInstantMs);
+  const pastTimeStr = pastInstant.toLocaleTimeString(undefined, { hour12: false });
+  const pastDateStr = pastInstant.toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "2-digit",
+  });
   const hudRight = isPast
-    ? `past · ${pastClock} · ${past.status === "playing" ? "▶" : past.status === "paused" ? "⏸" : past.status}`
+    ? `${past.status === "playing" ? "▶" : past.status === "paused" ? "⏸" : past.status}`
     : mode === "live"
       ? `${ts} · ${live.status === "playing" ? `${live.bitrateKbps}kbps` : "connecting…"}`
       : `${ts} · ${latencyMs != null ? `${latencyMs}ms` : "…"}`;
@@ -433,15 +441,20 @@ export function VideoTile({
           // muted + autoplay so the browser actually plays without a
           // user gesture. Without `muted` Chrome blocks autoplay and
           // the tile sits paused even though loading completed.
+          //
+          // No native `controls` here on purpose: the default video
+          // chrome shows "50:10/59:16" elapsed-from-playlist-start,
+          // which is meaningless against the wall-clock timeline
+          // the operator is actually navigating. We render our own
+          // wall-clock chrome + click-to-toggle overlay below.
           <video
             ref={past.videoRef}
-            controls
             autoPlay
             muted
             playsInline
             preload="auto"
-            controlsList="nodownload"
-            className="h-full w-full object-contain select-none"
+            onClick={past.togglePlay}
+            className="h-full w-full object-contain select-none cursor-pointer"
             data-testid="past-video"
           />
         ) : mode === "live" ? (
@@ -493,6 +506,30 @@ export function VideoTile({
                 </a>
               )}
             </div>
+          </div>
+        )}
+
+        {/* Past-playback wall-clock overlay.
+            Rendered as a security-camera-style timestamp burn-in at
+            the bottom-center of the tile. This is the clock the
+            operator actually cares about — the wall time of the
+            recorded moment they're looking at. */}
+        {isPast && (
+          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 flex items-baseline gap-2.5 bg-black/70 px-3 py-1.5 font-mono tabular-nums text-foreground/95 backdrop-blur-sm border border-fuchsia-500/30">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                past.status === "playing"
+                  ? "bg-fuchsia-400 animate-pulse"
+                  : past.status === "paused"
+                    ? "bg-amber-400"
+                    : "bg-foreground/40"
+              }`}
+            />
+            <span className="text-[10px] uppercase tracking-[0.18em] text-fuchsia-300/80">REC</span>
+            <span className="text-base">{pastTimeStr}</span>
+            <span className="text-[10px] uppercase tracking-[0.18em] text-foreground/55">
+              {pastDateStr}
+            </span>
           </div>
         )}
 
