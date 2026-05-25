@@ -67,6 +67,7 @@ export function VideoTile({
   const past = useHlsPlayer({
     src: pastSrc,
     windowStartMs: isPast ? playback.startMs : 0,
+    autoPlay: true,
     hlsModule,
   });
 
@@ -394,11 +395,16 @@ export function VideoTile({
     <div className="relative" ref={wrapRef}>
       <div className="relative aspect-video overflow-hidden border border-border bg-black">
         {isPast ? (
+          // muted + autoplay so the browser actually plays without a
+          // user gesture. Without `muted` Chrome blocks autoplay and
+          // the tile sits paused even though loading completed.
           <video
             ref={past.videoRef}
             controls
+            autoPlay
+            muted
             playsInline
-            preload="metadata"
+            preload="auto"
             controlsList="nodownload"
             className="h-full w-full object-contain select-none"
             data-testid="past-video"

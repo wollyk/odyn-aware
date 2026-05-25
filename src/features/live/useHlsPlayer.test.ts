@@ -147,4 +147,63 @@ describe("useHlsPlayer", () => {
     );
     expect(result.current.currentMs).toBe(12345);
   });
+
+  it("transitions loading -> paused on loadedmetadata (no manual play required)", async () => {
+    // Regression for the prod symptom: status stuck on "loading"
+    // because the only path out was a real "play" event from a user
+    // gesture, which controls-based playback never fired without
+    // autoplay.
+    Object.defineProperty(window.HTMLMediaElement.prototype, "canPlayType", {
+      configurable: true,
+      value: () => "probably",
+    });
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response(VALID_M3U8, { status: 200 }),
+    );
+    const { result, rerender } = renderHook(
+      ({ src }: { src: string | null }) =>
+        useHlsPlayer({ src, windowStartMs: 0 }),
+      { initialProps: { src: null as string | null } },
+    );
+    const v = attachVideo(result);
+    rerender({ src: "/x/master.m3u8" });
+    await waitFor(() => {
+      expect(result.current.videoRef.current?.src).toMatch(/master\.m3u8/);
+    });
+    // Simulate the browser firing loadedmetadata after the manifest
+    // and segments are ready.
+    await act(async () => {
+      v.dispatchEvent(new Event("loadedmetadata"));
+    });
+    expect(result.current.status).toBe("paused");
+  });
+
+  it("loadedmetadata does not overwrite a 'playing' status", async () => {
+    Object.defineProperty(window.HTMLMediaElement.prototype, "canPlayType", {
+      configurable: true,
+      value: () => "probably",
+    });
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response(VALID_M3U8, { status: 200 }),
+    );
+    const { result, rerender } = renderHook(
+      ({ src }: { src: string | null }) =>
+        useHlsPlayer({ src, windowStartMs: 0 }),
+      { initialProps: { src: null as string | null } },
+    );
+    const v = attachVideo(result);
+    rerender({ src: "/x/master.m3u8" });
+    await waitFor(() => {
+      expect(result.current.videoRef.current?.src).toMatch(/master\.m3u8/);
+    });
+    await act(async () => {
+      v.dispatchEvent(new Event("play"));
+    });
+    expect(result.current.status).toBe("playing");
+    // canplay arrives later — must NOT clobber "playing".
+    await act(async () => {
+      v.dispatchEvent(new Event("canplay"));
+    });
+    expect(result.current.status).toBe("playing");
+  });
 });

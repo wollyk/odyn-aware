@@ -58,6 +58,11 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
   // fast with a meaningful error instead of relying on hls.js's
   // sometimes-silent behavior when the upstream returns an empty or
   // non-200 playlist.
+  //
+  // We also attach the media-event listeners inside THIS effect so
+  // they are always wired to the live <video> element. (A separate
+  // listener-effect tied to [windowStartMs] races with the ref
+  // assignment in tests and at first mount.)
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) {
@@ -67,6 +72,31 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
     let cancelled = false;
     setStatus("loading");
     setError(null);
+
+    // ---- media event listeners ----
+    // Defuse the watchdog the moment we see any sign of life, and
+    // transition loading → paused when metadata or playable data
+    // arrives so the UI never sticks on "loading" after a successful
+    // load.
+    const onTime = () => {
+      defuseWatchdog();
+      setCurrentMs(windowStartMs + video.currentTime * 1000);
+    };
+    const onDur = () => setDurationMs(video.duration * 1000);
+    const onReady = () => {
+      defuseWatchdog();
+      setStatus((s) => (s === "loading" ? "paused" : s));
+    };
+    const onPlay = () => { defuseWatchdog(); setStatus("playing"); };
+    const onPause = () => { defuseWatchdog(); setStatus("paused"); };
+    const onEnded = () => setStatus("ended");
+    video.addEventListener("timeupdate", onTime);
+    video.addEventListener("durationchange", onDur);
+    video.addEventListener("loadedmetadata", onReady);
+    video.addEventListener("canplay", onReady);
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("ended", onEnded);
 
     // 6s safety net — if we never transition to playing/paused/error
     // we surface a clear error. The previous 20s was just frustrating
@@ -178,40 +208,20 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
       defuseWatchdog();
       hlsRef.current?.destroy();
       hlsRef.current = null;
-      video.removeAttribute("src");
-      try { video.load(); } catch { /* ignore */ }
-    };
-  }, [src, autoPlay, hlsModule, defuseWatchdog]);
-
-  // Wall-clock cursor + status from media events. Any of these
-  // firing means the pipeline is alive; defuse the manifest watchdog.
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const onTime = () => {
-      defuseWatchdog();
-      setCurrentMs(windowStartMs + video.currentTime * 1000);
-    };
-    const onDur = () => setDurationMs(video.duration * 1000);
-    const onLoaded = () => defuseWatchdog();
-    const onPlay = () => { defuseWatchdog(); setStatus("playing"); };
-    const onPause = () => { defuseWatchdog(); setStatus("paused"); };
-    const onEnded = () => setStatus("ended");
-    video.addEventListener("timeupdate", onTime);
-    video.addEventListener("durationchange", onDur);
-    video.addEventListener("loadedmetadata", onLoaded);
-    video.addEventListener("play", onPlay);
-    video.addEventListener("pause", onPause);
-    video.addEventListener("ended", onEnded);
-    return () => {
       video.removeEventListener("timeupdate", onTime);
       video.removeEventListener("durationchange", onDur);
-      video.removeEventListener("loadedmetadata", onLoaded);
+      video.removeEventListener("loadedmetadata", onReady);
+      video.removeEventListener("canplay", onReady);
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("ended", onEnded);
+      video.removeAttribute("src");
+      try { video.load(); } catch { /* ignore */ }
     };
-  }, [windowStartMs, defuseWatchdog]);
+  }, [src, autoPlay, hlsModule, defuseWatchdog, windowStartMs]);
+
+  // (Listener attach is colocated with the src-bind effect above so
+  // that the wiring is always tied to the live <video> element.)
 
   const seekToMs = useCallback(
     (ms: number) => {
