@@ -46,15 +46,44 @@ test("window > 24h throws vod_window_too_large", () => {
   );
 });
 
-test("buildHlsSegmentUrl sanitizes filename and profile", () => {
-  const u = vod.buildHlsSegmentUrl(
+test("buildHlsSubUrl preserves a flat sibling filename", () => {
+  const u = vod.buildHlsSubUrl(
     "Driveway",
     1764093600000,
     1764093660000,
-    "../oops",
+    "index-v1.m3u8",
+  );
+  assert.equal(
+    u,
+    "https://frigate.local:3000/vod/Driveway/start/1764093600.000/end/1764093660.000/index-v1.m3u8",
+  );
+});
+
+test("buildHlsSubUrl preserves a nested rendition path", () => {
+  const u = vod.buildHlsSubUrl(
+    "Driveway",
+    1764093600000,
+    1764093660000,
+    "rendition0/index.m3u8",
+  );
+  assert.match(u, /\/rendition0\/index\.m3u8$/);
+});
+
+test("buildHlsSubUrl strips traversal payloads from each segment", () => {
+  const u = vod.buildHlsSubUrl(
+    "Driveway",
+    1764093600000,
+    1764093660000,
     "../../etc/passwd",
   );
   assert.doesNotMatch(u, /\.\./);
+});
+
+test("buildHlsSubUrl rejects an empty path", () => {
+  assert.throws(
+    () => vod.buildHlsSubUrl("X", 1, 2, "///"),
+    { code: "bad_path" },
+  );
 });
 
 test("aggregateSegments produces 1m bins for <=1h windows", () => {

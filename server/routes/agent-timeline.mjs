@@ -3,8 +3,7 @@
 //   GET /api/agent/timeline/:camera/segments
 //   GET /api/agent/timeline/:camera/matches
 //   GET /api/agent/timeline/:camera/hls/master.m3u8
-//   GET /api/agent/timeline/:camera/hls/:profile/index.m3u8
-//   GET /api/agent/timeline/:camera/hls/:profile/seg/:name
+//   GET /api/agent/timeline/:camera/hls/<rel-path>   (variant playlists + segments)
 //   GET /api/agent/timeline/:camera/clip.mp4
 //
 // The HLS playlist endpoints rewrite Frigate's absolute upstream URIs
@@ -16,8 +15,7 @@ import { listMatchesInWindow } from "../db/face-timeline.mjs";
 import {
   MAX_VOD_SPAN_MS,
   buildHlsMasterUrl,
-  buildHlsChildUrl,
-  buildHlsSegmentUrl,
+  buildHlsSubUrl,
   buildClipUrl,
   openRangeFetch,
   listRecordingsWindow,
@@ -242,70 +240,114 @@ export async function handle(req, res, url, ctx) {
     return true;
   }
 
-  // ---- /hls/:profile/index.m3u8 ----------------------------------------
-  const mChild = rest.match(/^hls\/([A-Za-z0-9_.-]+)\/index\.m3u8$/);
-  if (req.method === "GET" && mChild) {
+  // ---- /hls/<...anything> ----------------------------------------------
+  //
+  // Catch-all for any sub-resource referenced from the master/child
+  // playlists: child playlists (e.g. "index-v1.m3u8") and media
+  // segments (e.g. "seg-1-v1-a1.ts"). nginx-vod-module emits these as
+  // flat siblings of master.m3u8, so we proxy whatever relative path
+  // the playlists reference straight through to Frigate.
+  //
+  // The previous implementation assumed `<profile>/index.m3u8` and
+  // `<profile>/seg/<name>` subdirectory layouts, which produced 404s
+  // against the actual upstream.
+  const mAny = rest.match(/^hls\/(.+)$/);
+  if (req.method === "GET" && mAny) {
     if (!frigate.isConfigured()) {
       send(res, 503, { error: "frigate_not_configured" });
       return true;
     }
-    try {
-      const upstreamUrl = (vod?.buildHlsChildUrl ?? buildHlsChildUrl)(
-        camera,
-        start_ms,
-        end_ms,
-        mChild[1],
-      );
-      const up = await (vod?.openRangeFetch ?? openRangeFetch)(upstreamUrl, null);
-      if (up.status !== 200) {
-        send(res, up.status, { error: "upstream", status: up.status });
-        return true;
-      }
-      const buf = await collect(up.stream);
-      const rewritten = rewriteChildPlaylist(
-        buf.toString("utf8"),
-        camera,
-        start_ms,
-        end_ms,
-        mChild[1],
-      );
-      res.writeHead(200, {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Cache-Control": "private, max-age=10",
-      });
-      res.end(rewritten);
-    } catch (err) {
-      send(res, 502, { error: "frigate_unreachable", detail: err.message });
-    }
-    return true;
-  }
-
-  // ---- /hls/:profile/seg/:name -----------------------------------------
-  const mSeg = rest.match(/^hls\/([A-Za-z0-9_.-]+)\/seg\/([A-Za-z0-9_.-]+)$/);
-  if (req.method === "GET" && mSeg) {
-    if (!frigate.isConfigured()) {
-      send(res, 503, { error: "frigate_not_configured" });
+    const rel = mAny[1]; // e.g. "index-v1.m3u8" or "seg-1-v1-a1.ts"
+    if (rel.includes("..")) {
+      send(res, 400, { error: "bad_path" });
       return true;
     }
+    const isPlaylist = rel.endsWith(".m3u8");
+    const t0 = Date.now();
+    let upstreamUrl = null;
     try {
-      const upstreamUrl = (vod?.buildHlsSegmentUrl ?? buildHlsSegmentUrl)(
+      upstreamUrl = (vod?.buildHlsSubUrl ?? buildHlsSubUrl)(
         camera,
         start_ms,
         end_ms,
-        mSeg[1],
-        mSeg[2],
+        rel,
       );
       const up = await (vod?.openRangeFetch ?? openRangeFetch)(
         upstreamUrl,
-        req.headers.range ?? null,
+        isPlaylist ? null : req.headers.range ?? null,
       );
-      if (up.status !== 200 && up.status !== 206) {
-        send(res, up.status, { error: "upstream", status: up.status });
+      const okStatus = isPlaylist
+        ? up.status === 200
+        : up.status === 200 || up.status === 206;
+      if (!okStatus) {
+        const bodyPreview = (await collect(up.stream))
+          .subarray(0, 200)
+          .toString("utf8");
+        recordProxy({
+          kind: isPlaylist ? "child.m3u8" : "segment",
+          camera,
+          upstream_url: upstreamUrl.toString(),
+          upstream_status: up.status,
+          ms: Date.now() - t0,
+          rel,
+          body_preview: bodyPreview,
+        });
+        send(res, up.status, {
+          error: "upstream",
+          status: up.status,
+          upstream_url: upstreamUrl.toString(),
+          body_preview: bodyPreview,
+        });
         return true;
       }
-      pipeUpstream(res, up);
+      if (isPlaylist) {
+        const buf = await collect(up.stream);
+        const rewritten = rewriteChildPlaylist(
+          buf.toString("utf8"),
+          camera,
+          start_ms,
+          end_ms,
+        );
+        recordProxy({
+          kind: "child.m3u8",
+          camera,
+          upstream_url: upstreamUrl.toString(),
+          upstream_status: 200,
+          ms: Date.now() - t0,
+          rel,
+          rewritten_bytes: rewritten.length,
+        });
+        res.writeHead(200, {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "private, max-age=10",
+        });
+        res.end(rewritten);
+      } else {
+        recordProxy({
+          kind: "segment",
+          camera,
+          upstream_url: upstreamUrl.toString(),
+          upstream_status: up.status,
+          ms: Date.now() - t0,
+          rel,
+        });
+        pipeUpstream(res, up, contentTypeForRel(rel));
+      }
     } catch (err) {
-      send(res, 502, { error: "frigate_unreachable", detail: err.message });
+      recordProxy({
+        kind: isPlaylist ? "child.m3u8" : "segment",
+        camera,
+        upstream_url: upstreamUrl?.toString() ?? null,
+        upstream_status: 0,
+        ms: Date.now() - t0,
+        rel,
+        error: err?.message ?? String(err),
+      });
+      send(res, 502, {
+        error: "frigate_unreachable",
+        detail: err.message,
+        upstream_url: upstreamUrl?.toString() ?? null,
+      });
     }
     return true;
   }
@@ -354,9 +396,10 @@ function collect(stream) {
   });
 }
 
-function pipeUpstream(res, up) {
+function pipeUpstream(res, up, contentTypeOverride = null) {
   const outHeaders = {
-    "Content-Type": up.headers["content-type"] || "application/octet-stream",
+    "Content-Type":
+      contentTypeOverride ?? up.headers["content-type"] ?? "application/octet-stream",
     "Accept-Ranges": "bytes",
     "Cache-Control": "no-store",
   };
@@ -366,26 +409,62 @@ function pipeUpstream(res, up) {
   up.stream.pipe(res);
 }
 
-// Rewrites the absolute upstream URIs that Frigate emits in playlists so
-// they point back at our proxy. Exported for unit tests.
+function contentTypeForRel(rel) {
+  if (rel.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+  if (rel.endsWith(".ts")) return "video/mp2t";
+  if (rel.endsWith(".m4s") || rel.endsWith(".mp4")) return "video/mp4";
+  return null;
+}
+
+/**
+ * Rewrites a playlist body so every `*.m3u8` line points back at our
+ * own /hls/<rel> proxy with the timeline window preserved on the
+ * query string.
+ *
+ * Critical: we pass the RELATIVE path through verbatim. nginx-vod-module
+ * emits variant playlists as flat siblings of master.m3u8 (e.g.
+ * "index-v1.m3u8"), and the previous "split into profile + index.m3u8"
+ * parser produced URLs like "/hls/index-v1/index.m3u8" which 404'd
+ * upstream. The proxy route is now a catch-all that accepts whatever
+ * relative path was inside the playlist, so we have no reason to
+ * second-guess it here.
+ */
 export function rewriteMasterPlaylist(text, camera, start_ms, end_ms) {
   const qs = `start_ms=${start_ms}&end_ms=${end_ms}`;
-  return text.replace(/^(?!#)(\S+)\.m3u8\s*$/gm, (line) => {
+  const cam = encodeURIComponent(camera);
+  return text.replace(/^(?!#)(\S+\.m3u8)\s*$/gm, (line) => {
     const trimmed = line.trim();
-    // Extract a profile name from any reasonable shape. Frigate emits
-    // things like "rendition0/index.m3u8" or absolute URLs ending in
-    // "/<profile>/index.m3u8".
-    const m = trimmed.match(/([A-Za-z0-9_.-]+)\/index\.m3u8$/) || trimmed.match(/([A-Za-z0-9_.-]+)\.m3u8$/);
-    const profile = m ? m[1].replace(/\.m3u8$/, "") : "default";
-    return `/api/agent/timeline/${encodeURIComponent(camera)}/hls/${profile}/index.m3u8?${qs}`;
+    // Strip any absolute Frigate prefix so we end up with a clean
+    // relative path. Anything after the last "/master.m3u8/" boundary
+    // is what we want; otherwise just take the basename-style tail.
+    const rel = stripUpstreamPrefix(trimmed);
+    return `/api/agent/timeline/${cam}/hls/${rel}?${qs}`;
   });
 }
 
-export function rewriteChildPlaylist(text, camera, start_ms, end_ms, profile) {
+export function rewriteChildPlaylist(text, camera, start_ms, end_ms) {
   const qs = `start_ms=${start_ms}&end_ms=${end_ms}`;
+  const cam = encodeURIComponent(camera);
   return text.replace(/^(?!#)(\S+\.(ts|m4s|mp4))\s*$/gm, (line) => {
     const trimmed = line.trim();
-    const segName = trimmed.split("/").pop();
-    return `/api/agent/timeline/${encodeURIComponent(camera)}/hls/${profile}/seg/${segName}?${qs}`;
+    const rel = stripUpstreamPrefix(trimmed);
+    return `/api/agent/timeline/${cam}/hls/${rel}?${qs}`;
   });
+}
+
+// If the playlist line is an absolute http(s) URL pointing at the
+// Frigate origin, drop the scheme+host so we keep a clean relative
+// path under the playlist's own location. For relative entries this
+// is a no-op.
+function stripUpstreamPrefix(line) {
+  try {
+    const u = new URL(line);
+    // Use the URL pathname minus its leading "/vod/<cam>/start/x/end/y/"
+    // so we land on the same relative path nginx-vod-module would have
+    // emitted on its own.
+    const m = u.pathname.match(/\/vod\/[^/]+\/start\/[^/]+\/end\/[^/]+\/(.*)$/);
+    return m ? m[1] : u.pathname.replace(/^\/+/, "");
+  } catch {
+    return line.replace(/^\/+/, "");
+  }
 }

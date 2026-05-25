@@ -83,20 +83,29 @@ function sanitizePathSegment(s) {
     .replace(/^\.+/, "");
 }
 
-export function buildHlsChildUrl(camera, startMs, endMs, profile) {
+/**
+ * Build the upstream URL for an arbitrary HLS sub-resource (child
+ * playlist, segment, init.mp4) referenced *relative* to master.m3u8.
+ *
+ * nginx-vod-module emits children + segments as flat siblings of
+ * master.m3u8, so the relative path is opaque to us. We split on "/",
+ * sanitize each segment defensively, and join back. A single trailing
+ * `.m3u8` / `.ts` / `.m4s` / `.mp4` extension is preserved.
+ */
+export function buildHlsSubUrl(camera, startMs, endMs, relPath) {
   assertWindow(startMs, endMs);
-  const prof = sanitizePathSegment(profile);
+  const cleaned = String(relPath)
+    .split("/")
+    .map((seg) => sanitizePathSegment(seg))
+    .filter((seg) => seg.length > 0)
+    .join("/");
+  if (!cleaned) {
+    const err = new RangeError("empty rel path");
+    err.code = "bad_path";
+    throw err;
+  }
   return frigateUrl(
-    `/vod/${encodeCam(camera)}/start/${unixSecondsWithMs(startMs)}/end/${unixSecondsWithMs(endMs)}/${prof}/index.m3u8`,
-  ).toString();
-}
-
-export function buildHlsSegmentUrl(camera, startMs, endMs, profile, segName) {
-  assertWindow(startMs, endMs);
-  const prof = sanitizePathSegment(profile);
-  const seg = sanitizePathSegment(segName);
-  return frigateUrl(
-    `/vod/${encodeCam(camera)}/start/${unixSecondsWithMs(startMs)}/end/${unixSecondsWithMs(endMs)}/${prof}/${seg}`,
+    `/vod/${encodeCam(camera)}/start/${unixSecondsWithMs(startMs)}/end/${unixSecondsWithMs(endMs)}/${cleaned}`,
   ).toString();
 }
 

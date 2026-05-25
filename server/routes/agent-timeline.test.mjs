@@ -228,7 +228,7 @@ test("/segments returns empty list when frigate not configured", async () => {
   assert.equal(body.frigate_configured, false);
 });
 
-test("/hls/master.m3u8 rewrites upstream child URIs", async () => {
+test("/hls/master.m3u8 rewrites nested rendition child URIs (legacy upstream)", async () => {
   const db = makeDb();
   const upstreamBody = [
     "#EXTM3U",
@@ -255,6 +255,37 @@ test("/hls/master.m3u8 rewrites upstream child URIs", async () => {
   assert.doesNotMatch(text, /frigate\.local/);
 });
 
+test("/hls/master.m3u8 preserves flat sibling child filenames (regression for #404)", async () => {
+  // Repro of the 24-May bug: nginx-vod-module emits variant playlists as
+  // FLAT siblings of master.m3u8 ("index-v1.m3u8"), not under a profile
+  // directory. The previous rewriter happily produced
+  // "/hls/index-v1/index.m3u8", which then 404'd at the proxy.
+  const db = makeDb();
+  const upstreamBody = [
+    "#EXTM3U",
+    "#EXT-X-STREAM-INF:BANDWIDTH=500000",
+    "index-v1.m3u8",
+  ].join("\n");
+  const vod = {
+    buildHlsMasterUrl: () => "https://frigate.local:3000/.../master.m3u8",
+    openRangeFetch: async () => ({
+      status: 200,
+      headers: { "content-type": "application/vnd.apple.mpegurl" },
+      stream: Readable.from([Buffer.from(upstreamBody)]),
+    }),
+  };
+  const { req, url } = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/master.m3u8",
+    query: { start_ms: 1000, end_ms: 2000 },
+  });
+  const res = new FakeRes();
+  await handle(req, res, url, { db, frigate: fakeFrigate(), vod });
+  assert.equal(res.statusCode, 200);
+  const text = res.body.toString("utf8");
+  assert.match(text, /\/api\/agent\/timeline\/Driveway\/hls\/index-v1\.m3u8\?/);
+  assert.doesNotMatch(text, /\/index-v1\/index\.m3u8/);
+});
+
 test("rewriteMasterPlaylist preserves header lines", () => {
   const out = rewriteMasterPlaylist(
     "#EXTM3U\n#EXT-X-VERSION:3\nrendition0/index.m3u8\n",
@@ -267,16 +298,104 @@ test("rewriteMasterPlaylist preserves header lines", () => {
   assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/rendition0\/index\.m3u8/);
 });
 
-test("rewriteChildPlaylist rewrites .ts and .m4s segments", () => {
-  const out = rewriteChildPlaylist(
-    "#EXTM3U\n#EXTINF:6.0,\nsegment-0000.ts\n#EXTINF:6.0,\nsegment-0001.m4s\n",
+test("rewriteMasterPlaylist preserves flat sibling .m3u8 filenames", () => {
+  const out = rewriteMasterPlaylist(
+    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\nindex-v1.m3u8\n",
     "Driveway",
     1000,
     2000,
-    "rendition0",
   );
-  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/rendition0\/seg\/segment-0000\.ts/);
-  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/rendition0\/seg\/segment-0001\.m4s/);
+  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/index-v1\.m3u8\?start_ms=1000&end_ms=2000/);
+  assert.doesNotMatch(out, /\/index-v1\/index\.m3u8/);
+});
+
+test("rewriteChildPlaylist rewrites flat .ts and .m4s segments", () => {
+  const out = rewriteChildPlaylist(
+    "#EXTM3U\n#EXTINF:6.0,\nseg-1-v1-a1.ts\n#EXTINF:6.0,\nseg-1-v1-a1.m4s\n",
+    "Driveway",
+    1000,
+    2000,
+  );
+  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/seg-1-v1-a1\.ts\?/);
+  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/seg-1-v1-a1\.m4s\?/);
+});
+
+test("/hls/<rel>.m3u8 proxies upstream and rewrites segment refs", async () => {
+  const db = makeDb();
+  const upstreamBody = [
+    "#EXTM3U",
+    "#EXTINF:6.0,",
+    "seg-1-v1-a1.ts",
+  ].join("\n");
+  let observedUpstream = null;
+  const vod = {
+    buildHlsSubUrl: (cam, start, end, rel) => {
+      observedUpstream = { cam, start, end, rel };
+      return `https://frigate.local:3000/vod/${cam}/start/${start}/end/${end}/${rel}`;
+    },
+    openRangeFetch: async () => ({
+      status: 200,
+      headers: { "content-type": "application/vnd.apple.mpegurl" },
+      stream: Readable.from([Buffer.from(upstreamBody)]),
+    }),
+  };
+  const { req, url } = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/index-v1.m3u8",
+    query: { start_ms: 1000, end_ms: 2000 },
+  });
+  const res = new FakeRes();
+  await handle(req, res, url, { db, frigate: fakeFrigate(), vod });
+  assert.equal(res.statusCode, 200);
+  assert.equal(observedUpstream.rel, "index-v1.m3u8");
+  const text = res.body.toString("utf8");
+  assert.match(text, /\/api\/agent\/timeline\/Driveway\/hls\/seg-1-v1-a1\.ts\?/);
+});
+
+test("/hls/<rel>.ts proxies as video/mp2t and pipes bytes", async () => {
+  const db = makeDb();
+  const vod = {
+    buildHlsSubUrl: (cam, start, end, rel) =>
+      `https://frigate.local:3000/vod/${cam}/start/${start}/end/${end}/${rel}`,
+    openRangeFetch: async (_u, range) => ({
+      status: range ? 206 : 200,
+      headers: { "content-type": "video/mp2t" },
+      stream: Readable.from([Buffer.from("TSBYTES")]),
+    }),
+  };
+  const { req, url } = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/seg-1-v1-a1.ts",
+    query: { start_ms: 1000, end_ms: 2000 },
+    range: "bytes=0-1000",
+  });
+  const res = new FakeRes();
+  await new Promise((resolve) => {
+    res.on("finish", resolve);
+    handle(req, res, url, { db, frigate: fakeFrigate(), vod });
+  });
+  assert.equal(res.statusCode, 206);
+  assert.equal(res.headers["Content-Type"], "video/mp2t");
+  assert.equal(res.body.toString("utf8"), "TSBYTES");
+});
+
+test("/hls/<rel> rejects path traversal attempts", async () => {
+  const db = makeDb();
+  const vod = {
+    buildHlsSubUrl: () => "https://nope",
+    openRangeFetch: async () => ({
+      status: 200,
+      headers: {},
+      stream: Readable.from([Buffer.from("")]),
+    }),
+  };
+  const { req, url } = makeReq({
+    path: "/api/agent/timeline/Driveway/hls/..%2F..%2Fetc%2Fpasswd",
+    query: { start_ms: 1000, end_ms: 2000 },
+  });
+  const res = new FakeRes();
+  await handle(req, res, url, { db, frigate: fakeFrigate(), vod });
+  // The catch-all only matches a stricter rest regex on the path; if any
+  // ".." survives URL decoding we drop the request as 400.
+  assert.ok([400, 404].includes(res.statusCode));
 });
 
 test("/clip.mp4 forwards Range and pipes upstream stream", async () => {

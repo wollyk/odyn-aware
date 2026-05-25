@@ -3,7 +3,8 @@
 // and asks the injected hls.js module to load the timeline manifest.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { VideoTile } from "./VideoTile";
 import { LIVE_MODE, type PlaybackMode } from "./playbackMode";
 import type { Camera } from "./types";
@@ -67,6 +68,82 @@ describe("VideoTile playback modes", () => {
       />,
     );
     expect(screen.getByTestId("past-video")).toBeInTheDocument();
+  });
+
+  // Regression: when the user drags the timeline to T but the video's
+  // currentTime is still 0 (seek in flight), an earlier version of
+  // VideoTile emitted that stale 0 back to the parent through
+  // onPastCursorAdvance, which then commanded a seek back to start.
+  // The fix is to ignore upward emits while past.status !== "playing"
+  // and while currentMs is behind the most recent seek target.
+  it("does NOT echo cursor backward while seek is pending (status != playing)", async () => {
+    // Mock fetch so the useHlsPlayer probe passes immediately.
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () =>
+      new Response("#EXTM3U\n", {
+        status: 200,
+        headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+      }),
+    ) as unknown as typeof fetch;
+
+    // Parent harness — the test that would have caught the snap-back
+    // bug. It records every emitted cursor so we can assert the video
+    // never told the parent to rewind.
+    const emitted: number[] = [];
+    function Harness() {
+      const [playback, setPlayback] = useState<PlaybackMode>({
+        kind: "past",
+        startMs: 1_000_000,
+        endMs: 1_000_000 + 60_000,
+        cursorMs: 1_000_000 + 30_000, // user dragged to T+30s
+        activeMatch: null,
+      });
+      return (
+        <VideoTile
+          cam={fakeCam}
+          mode="live"
+          agentStatus={null}
+          playback={playback}
+          onPastCursorAdvance={(ms) => {
+            emitted.push(ms);
+            if (playback.kind === "past") {
+              setPlayback({ ...playback, cursorMs: ms });
+            }
+          }}
+          hlsModule={fakeHlsModule as unknown as typeof import("hls.js")}
+        />
+      );
+    }
+
+    render(<Harness />);
+    const video = (await screen.findByTestId("past-video")) as HTMLVideoElement;
+
+    // Player is still "loading" (no play event yet). Fire a timeupdate
+    // that would naively read as currentMs=windowStartMs. If the
+    // emit guard is missing, the parent would record a backward move.
+    Object.defineProperty(video, "currentTime", { value: 0, configurable: true });
+    await act(async () => {
+      fireEvent.timeUpdate(video);
+    });
+    expect(emitted).toEqual([]);
+
+    try {
+      // Now simulate the player reporting it's actually playing and
+      // having caught up past the seek target. The emit MUST happen now.
+      Object.defineProperty(video, "currentTime", { value: 31, configurable: true });
+      await act(async () => {
+        fireEvent.play(video);
+        fireEvent.timeUpdate(video);
+      });
+      expect(emitted.length).toBeGreaterThan(0);
+      // And every emitted value should be at-or-after the seek target,
+      // not snapped back to windowStartMs.
+      for (const v of emitted) {
+        expect(v).toBeGreaterThanOrEqual(1_000_000 + 30_000 - 500);
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it("HUD chip changes from LIVE to PAST when playback flips", () => {

@@ -71,22 +71,46 @@ export function VideoTile({
     hlsModule,
   });
 
-  // Seek the HLS player when the parent's cursorMs changes. Debounced
-  // so a fast drag doesn't thrash segment loads (same trick the old
-  // PastPlayer used).
-  const cursorRef = useRef<number>(0);
+  // Cursor synchronization between parent state (playback.cursorMs)
+  // and the HLS <video> element. Two flows that must not feed back
+  // into each other:
+  //
+  //  Down (parent → video): when the user drags the scrubber, the
+  //    parent's cursorMs changes; we seek the video to match. Debounced
+  //    so a fast drag doesn't thrash segment loads.
+  //
+  //  Up (video → parent): during natural playback the video's
+  //    currentMs advances on its own; we emit those values back to the
+  //    parent so the scrubber follows the playhead.
+  //
+  // Earlier we shared a single `cursorRef` between the two effects and
+  // it produced a snap-back race: while a seek was still pending, the
+  // upward-emit effect saw `currentMs == windowStartMs` (way behind
+  // the seek target), reported THAT to the parent, and the parent
+  // promptly told us to seek BACK to the start. Fix is to keep the
+  // two refs separate AND only trust upward emits once the player
+  // reports `status === "playing"` past the most-recent seek target.
+  const lastSeekTargetRef = useRef<number | null>(null);
+  const lastEmittedMsRef = useRef<number>(0);
   const seekTimerRef = useRef<number | null>(null);
+
+  const targetCursorMs = playback.kind === "past" ? playback.cursorMs : null;
+
   useEffect(() => {
-    if (!isPast) return;
-    const target = playback.cursorMs;
-    if (Math.abs(cursorRef.current - target) < 50) return;
-    cursorRef.current = target;
+    if (!isPast || targetCursorMs == null) return;
+    if (
+      lastSeekTargetRef.current != null &&
+      Math.abs(lastSeekTargetRef.current - targetCursorMs) < 50
+    ) {
+      return;
+    }
+    lastSeekTargetRef.current = targetCursorMs;
     if (seekTimerRef.current != null) {
       window.clearTimeout(seekTimerRef.current);
     }
     seekTimerRef.current = window.setTimeout(() => {
       seekTimerRef.current = null;
-      past.seekToMs(target);
+      past.seekToMs(targetCursorMs);
     }, 120);
     return () => {
       if (seekTimerRef.current != null) {
@@ -94,17 +118,28 @@ export function VideoTile({
         seekTimerRef.current = null;
       }
     };
-  }, [isPast, playback, past.seekToMs]);
+  }, [isPast, targetCursorMs, past.seekToMs]);
 
-  // Emit cursor advance during natural playback so the timeline
-  // strip can follow along. We ignore the value while we're inside
-  // a debounced seek (the user just initiated movement).
   useEffect(() => {
     if (!isPast || !onPastCursorAdvance) return;
-    if (Math.abs(past.currentMs - cursorRef.current) < 250) return;
-    cursorRef.current = past.currentMs;
-    onPastCursorAdvance(past.currentMs);
-  }, [isPast, past.currentMs, onPastCursorAdvance]);
+    // Don't emit while the pipeline is loading or paused; the
+    // currentMs we'd read is stale (typically pinned to
+    // windowStartMs) and would yank the parent's cursor backwards.
+    if (past.status !== "playing") return;
+    const cur = past.currentMs;
+    if (Math.abs(cur - lastEmittedMsRef.current) < 250) return;
+    // Suppress upstream emits that would move the cursor BACKWARD
+    // past the user's most recent seek target. That's the exact
+    // signature of a not-yet-completed seek.
+    if (
+      lastSeekTargetRef.current != null &&
+      cur < lastSeekTargetRef.current - 500
+    ) {
+      return;
+    }
+    lastEmittedMsRef.current = cur;
+    onPastCursorAdvance(cur);
+  }, [isPast, past.currentMs, past.status, onPastCursorAdvance]);
 
   // Snapshot polling: 1Hz, cache-busted via ?t= (only in live snapshot mode)
   useEffect(() => {
