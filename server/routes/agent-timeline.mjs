@@ -428,27 +428,45 @@ function contentTypeForRel(rel) {
  * upstream. The proxy route is now a catch-all that accepts whatever
  * relative path was inside the playlist, so we have no reason to
  * second-guess it here.
+ *
+ * We also rewrite every `URI="..."` attribute (used by EXT-X-MEDIA on
+ * the master, EXT-X-MAP/KEY on children). The browser resolves those
+ * URIs as RELATIVE against the playlist URL and DROPS the playlist's
+ * query string, so without this rewrite the proxied URLs would be
+ * missing start_ms/end_ms and our route would 400 them.
  */
 export function rewriteMasterPlaylist(text, camera, start_ms, end_ms) {
   const qs = `start_ms=${start_ms}&end_ms=${end_ms}`;
   const cam = encodeURIComponent(camera);
-  return text.replace(/^(?!#)(\S+\.m3u8)\s*$/gm, (line) => {
-    const trimmed = line.trim();
-    // Strip any absolute Frigate prefix so we end up with a clean
-    // relative path. Anything after the last "/master.m3u8/" boundary
-    // is what we want; otherwise just take the basename-style tail.
-    const rel = stripUpstreamPrefix(trimmed);
+  const baseRewrite = text.replace(/^(?!#)(\S+\.m3u8)\s*$/gm, (line) => {
+    const rel = stripUpstreamPrefix(line.trim());
     return `/api/agent/timeline/${cam}/hls/${rel}?${qs}`;
   });
+  return rewriteUriAttributes(baseRewrite, cam, qs);
 }
 
 export function rewriteChildPlaylist(text, camera, start_ms, end_ms) {
   const qs = `start_ms=${start_ms}&end_ms=${end_ms}`;
   const cam = encodeURIComponent(camera);
-  return text.replace(/^(?!#)(\S+\.(ts|m4s|mp4))\s*$/gm, (line) => {
-    const trimmed = line.trim();
-    const rel = stripUpstreamPrefix(trimmed);
+  const baseRewrite = text.replace(/^(?!#)(\S+\.(ts|m4s|mp4))\s*$/gm, (line) => {
+    const rel = stripUpstreamPrefix(line.trim());
     return `/api/agent/timeline/${cam}/hls/${rel}?${qs}`;
+  });
+  return rewriteUriAttributes(baseRewrite, cam, qs);
+}
+
+// Rewrites every `URI="..."` attribute inside the playlist body to
+// an absolute proxy path with the window query string. This covers
+// EXT-X-MAP (fMP4 init segment), EXT-X-KEY (encryption key), and
+// EXT-X-MEDIA (alt audio) tags. Already-absolute URIs (http:// or
+// starting with "/") are left as-is so we don't double-rewrite.
+function rewriteUriAttributes(text, cam, qs) {
+  return text.replace(/(URI=")([^"]+)(")/g, (_, pre, uri, post) => {
+    if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(uri) || uri.startsWith("/")) {
+      return `${pre}${uri}${post}`;
+    }
+    const rel = stripUpstreamPrefix(uri);
+    return `${pre}/api/agent/timeline/${cam}/hls/${rel}?${qs}${post}`;
   });
 }
 

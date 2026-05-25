@@ -320,6 +320,63 @@ test("rewriteChildPlaylist rewrites flat .ts and .m4s segments", () => {
   assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/seg-1-v1-a1\.m4s\?/);
 });
 
+test("rewriteChildPlaylist rewrites EXT-X-MAP init segment URI (regression for #400)", () => {
+  // 25-May bug: nginx-vod-module emits fMP4 streams whose child
+  // playlist references the init segment via #EXT-X-MAP:URI="init-v1.mp4".
+  // The browser resolves that as relative to the playlist URL and DROPS
+  // the playlist's query string, so the resulting request hits our
+  // route without start_ms/end_ms and 400s. The rewriter has to
+  // pre-qualify URI attrs with the proxy path + window query.
+  const out = rewriteChildPlaylist(
+    [
+      "#EXTM3U",
+      "#EXT-X-VERSION:6",
+      "#EXT-X-MAP:URI=\"init-v1.mp4\"",
+      "#EXTINF:6.000,",
+      "seg-1-v1-a1.m4s",
+    ].join("\n"),
+    "Driveway",
+    1000,
+    2000,
+  );
+  assert.match(
+    out,
+    /URI="\/api\/agent\/timeline\/Driveway\/hls\/init-v1\.mp4\?start_ms=1000&end_ms=2000"/,
+  );
+  // And segments still get their absolute-path rewrite.
+  assert.match(out, /\/api\/agent\/timeline\/Driveway\/hls\/seg-1-v1-a1\.m4s\?/);
+});
+
+test("rewriteChildPlaylist leaves already-absolute URI attrs alone", () => {
+  const out = rewriteChildPlaylist(
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example.com/key.bin\"\n",
+    "Driveway",
+    1000,
+    2000,
+  );
+  assert.match(out, /URI="https:\/\/keys\.example\.com\/key\.bin"/);
+});
+
+test("rewriteMasterPlaylist rewrites EXT-X-MEDIA alt-audio URI attrs", () => {
+  // For HLS streams that split audio into a separate group the master
+  // references the alt-audio playlist via #EXT-X-MEDIA:URI="audio.m3u8".
+  const out = rewriteMasterPlaylist(
+    [
+      "#EXTM3U",
+      "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio-v1.m3u8\"",
+      "#EXT-X-STREAM-INF:BANDWIDTH=500000,AUDIO=\"aud\"",
+      "index-v1.m3u8",
+    ].join("\n"),
+    "Driveway",
+    1000,
+    2000,
+  );
+  assert.match(
+    out,
+    /URI="\/api\/agent\/timeline\/Driveway\/hls\/audio-v1\.m3u8\?start_ms=1000&end_ms=2000"/,
+  );
+});
+
 test("/hls/<rel>.m3u8 proxies upstream and rewrites segment refs", async () => {
   const db = makeDb();
   const upstreamBody = [
