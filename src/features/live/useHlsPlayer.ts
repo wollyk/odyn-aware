@@ -285,9 +285,23 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
       const video = videoRef.current;
       if (!video) return;
       const t = Math.max(0, (ms - windowStartMs) / 1000);
+      // A seek from the parent is an EXPLICIT play intent — the
+      // operator clicked the timeline or a match dot, so they want
+      // to watch from that point. Clear the soft-paused flag and
+      // kick play() now so we don't sit frozen waiting for the
+      // seeked-event tryPlay() (which is gated on userPausedRef).
+      //
+      // Without this, any prior pause (manual click, autoplay denial,
+      // even a transient buffer-underrun pause that ran outside a
+      // seek) locked the tile into pause-on-scrub for the rest of
+      // the session.
+      userPausedRef.current = false;
       video.currentTime = t;
+      if (autoPlay && video.paused) {
+        void video.play().catch(() => {});
+      }
     },
-    [windowStartMs],
+    [windowStartMs, autoPlay],
   );
 
   const setPlaying = useCallback((playing: boolean) => {
