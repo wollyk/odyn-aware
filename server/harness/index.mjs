@@ -443,18 +443,34 @@ export async function analyzeImageRouted({
   });
 
   // Step 3: optionally call T3.
+  //
+  // Note: t3Caller (server/agent.mjs::analyzeImage) does NOT throw on
+  // upstream rate-limit / malformed-JSON. It returns a result with
+  // status:"error" and a summary like "Vision error: 429". We must
+  // treat that as a non-result here — otherwise the error string ends
+  // up overwriting T2's perfectly good scene caption (the operator
+  // sees "▸ Vision error: 429" instead of the actual scene text) AND
+  // gets cached for 60s, so the bad caption persists past the rate
+  // limit. Only success results promote into t3Live + cache.
   let t3Live = null;
   let t3Error = null;
   if (decision.runT3) {
     try {
-      t3Live = await t3Caller({ imageBuffer, camera });
-      _t3Cache.set(camera, {
-        detections: t3Live.detections ?? [],
-        summary: t3Live.summary ?? "",
-        model: t3Live.model ?? null,
-        tookMs: t3Live.tookMs ?? null,
-        ts: Date.now(),
-      });
+      const t3 = await t3Caller({ imageBuffer, camera });
+      if (t3 && t3.status === "ok") {
+        t3Live = t3;
+        _t3Cache.set(camera, {
+          detections: t3.detections ?? [],
+          summary: t3.summary ?? "",
+          model: t3.model ?? null,
+          tookMs: t3.tookMs ?? null,
+          ts: Date.now(),
+        });
+      } else {
+        // Record the reason so escalation.reason can surface it without
+        // poisoning the user-facing summary.
+        t3Error = t3?.error ?? t3?.summary ?? "t3_unknown_error";
+      }
     } catch (err) {
       t3Error = err?.message ?? "t3_failed";
     }
@@ -527,11 +543,18 @@ export async function analyzeImageRouted({
     }
   }
 
+  // Overall status is driven by T2 (the always-on primary signal),
+  // never by T3. A T3 rate-limit / outage is non-fatal — we still
+  // have the local caption — so it goes into `t3_error` and leaves
+  // `status: "ok"`. Previously a T3 429 made the whole response
+  // status:"error", which hid T2's perfectly good scene caption in
+  // the UI.
+  const t2Ok = Boolean(t2Result?.ok) || Boolean(t3Live);
   const result = {
     tier,
     detections,
     summary,
-    status: t3Error ? "error" : "ok",
+    status: t2Ok ? "ok" : "error",
     model: t3Model,
     tookMs: Date.now() - wallStart,
     local_scene: t2Result?.scene ?? "",

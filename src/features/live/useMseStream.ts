@@ -11,6 +11,19 @@
 //   - Stall watchdog: forces reconnect if no frame for >8s after first frame.
 //   - Reset backoff on first frame after a reconnect.
 //
+// Buffer management (post-29-May fix):
+//   - On every updateend we trim media older than KEEP_BEHIND_S behind the
+//     current playhead. Chrome's per-SourceBuffer memory cap is ~100MB which
+//     a 3 Mbps stream blows through in ~5min — that QuotaExceededError'd the
+//     appendBuffer and put the tile into a reconnect loop every few minutes.
+//   - On every updateend we also seek forward toward the live edge if we
+//     drifted more than LIVE_GAP_MAX_S behind. Without this the video element
+//     plays through every buffered second at 1x (looks like slow motion) and
+//     never catches up to real-time.
+//   - If appendBuffer DOES throw QuotaExceededError (e.g. an unusually large
+//     keyframe arrived) we trim aggressively in place and let the next
+//     updateend retry the same chunk instead of tearing the WS down.
+//
 // Boundary guarantee: every internal state value besides "playing" and
 // "error" should be treated by the UI as a single "Connecting…" indicator.
 // Don't surface "idle", "negotiating", "reconnecting" etc as raw labels.
@@ -26,6 +39,17 @@ export type UseMseStreamResult = {
   retryAttempt: number;
   nextRetryMs: number;
 };
+
+// Keep ~30s of media behind the current playhead. Plenty for a frame
+// or two of decoder lookback, well clear of Chrome's per-SourceBuffer
+// memory cap.
+const KEEP_BEHIND_S = 30;
+// If the playhead drifts more than this far behind the buffer's leading
+// edge, seek forward to the live edge minus LIVE_GAP_TARGET_S. Without
+// this the tile decodes minutes-old footage at 1x and looks like it's
+// running in slow motion.
+const LIVE_GAP_MAX_S = 5;
+const LIVE_GAP_TARGET_S = 1.5;
 
 export function useMseStream(camera: string | null, enabled: boolean): UseMseStreamResult {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -59,14 +83,71 @@ export function useMseStream(camera: string | null, enabled: boolean): UseMseStr
       queue: ArrayBuffer[];
     } = { ws: null, mediaSource: null, sourceBuffer: null, queue: [] };
 
+    // Drop media older than KEEP_BEHIND_S behind the playhead. Called
+    // from updateend, and as a recovery step inside flushQueue on
+    // QuotaExceededError. Returns true if a remove() was started so
+    // the caller knows to wait for the next updateend before
+    // touching the buffer again.
+    const trimBuffer = (): boolean => {
+      const sb = conn.sourceBuffer;
+      if (!sb || sb.updating || !sb.buffered.length) return false;
+      const start = sb.buffered.start(0);
+      const ct = video.currentTime;
+      if (ct - start > KEEP_BEHIND_S + 5) {
+        try {
+          sb.remove(start, ct - KEEP_BEHIND_S);
+          return true;
+        } catch {
+          // Browser refused — fine, we'll try again next updateend.
+        }
+      }
+      return false;
+    };
+
+    // Pull the playhead toward the live edge if it has drifted. Setting
+    // currentTime to its current value is a no-op, so this is cheap to
+    // call frequently.
+    const seekToLiveIfBehind = () => {
+      const sb = conn.sourceBuffer;
+      if (!sb || !sb.buffered.length) return;
+      const last = sb.buffered.length - 1;
+      const end = sb.buffered.end(last);
+      if (end - video.currentTime > LIVE_GAP_MAX_S) {
+        try {
+          video.currentTime = end - LIVE_GAP_TARGET_S;
+        } catch {
+          // ignore — seek into unbuffered range, decoder will recover.
+        }
+      }
+    };
+
     const flushQueue = () => {
       const sb = conn.sourceBuffer;
-      if (!sb || sb.updating) return;
-      if (conn.queue.length === 0) return;
+      if (!sb || sb.updating || conn.queue.length === 0) return;
+      // Peek before shifting — if appendBuffer throws we want to keep
+      // the chunk at the head of the queue and let updateend retry.
+      const chunk = conn.queue[0];
       try {
-        sb.appendBuffer(conn.queue.shift()!);
+        sb.appendBuffer(chunk);
+        conn.queue.shift();
       } catch (err) {
         if (cancelled) return;
+        const name = (err as { name?: string } | null)?.name;
+        if (name === "QuotaExceededError" && sb.buffered.length && !sb.updating) {
+          // Free old media right now and let updateend retry the same
+          // chunk. Reconnect would lose the init segment + a few seconds
+          // of media, which is far more disruptive than a single trim.
+          const start = sb.buffered.start(0);
+          const ct = video.currentTime || start;
+          const trimEnd = Math.max(start + 1, ct - 1);
+          try {
+            sb.remove(start, trimEnd);
+            console.warn("[mse] sourcebuffer full — trimmed and will retry");
+            return;
+          } catch (innerErr) {
+            console.error("[mse] trim-on-quota failed", innerErr);
+          }
+        }
         console.error("[mse] appendBuffer", err);
         setError(err instanceof Error ? err.message : "appendBuffer failed");
         scheduleReconnect("append-error");
@@ -149,7 +230,14 @@ export function useMseStream(camera: string | null, enabled: boolean): UseMseStr
                 }
                 const sb = ms.addSourceBuffer(msg.value);
                 sb.mode = "segments";
-                sb.addEventListener("updateend", flushQueue);
+                sb.addEventListener("updateend", () => {
+                  if (cancelled || conn.sourceBuffer !== sb) return;
+                  // If we kicked off a trim, wait for THAT updateend
+                  // before doing anything else on the buffer.
+                  if (trimBuffer()) return;
+                  seekToLiveIfBehind();
+                  flushQueue();
+                });
                 conn.sourceBuffer = sb;
               }
             } catch (err) {
