@@ -12,6 +12,7 @@
 //   - server-side per-camera quota (returns 429)
 
 import { useEffect, useState } from "react";
+import { apiFetch } from "@/lib/apiFetch";
 import type {
   Camera,
   Detection,
@@ -109,9 +110,8 @@ export function useDetections(cam: Camera | null): UseDetectionsResult {
         return;
       }
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/agent/detections?camera=${encodeURIComponent(cam.name)}`,
-          { credentials: "include" },
         );
         if (cancelled) return;
         if (res.ok) {

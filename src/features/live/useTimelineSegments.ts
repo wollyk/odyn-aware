@@ -5,6 +5,7 @@
 // independently and merging would only complicate the abort logic.
 
 import { useEffect, useRef, useState } from "react";
+import { apiFetch } from "@/lib/apiFetch";
 import type { TimelineWindow } from "./useTimelineMatches";
 
 export type TimelineSegment = {
@@ -47,7 +48,8 @@ export function useTimelineSegments(
         end_ms: String(window.end_ms),
       });
       const url = `/api/agent/timeline/${encodeURIComponent(camera)}/segments?${qs}`;
-      fetch(url, { credentials: "include", signal: ac.signal })
+      // apiFetch raises the global session-expired event on 401.
+      apiFetch(url, { signal: ac.signal })
         .then(async (r) => {
           const ct = r.headers.get("content-type") ?? "";
           if (!ct.includes("application/json")) {

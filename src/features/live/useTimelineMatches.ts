@@ -8,6 +8,7 @@
 //   - Errors are sticky and surfaced for the UI; on retry-success they clear
 
 import { useEffect, useRef, useState } from "react";
+import { apiFetch } from "@/lib/apiFetch";
 
 export type TimelineMatch = {
   id: number;
@@ -58,7 +59,10 @@ export function useTimelineMatches(
       if (personFilter === "unknown") qs.set("person_id", "unknown");
       else if (typeof personFilter === "number") qs.set("person_id", String(personFilter));
       const url = `/api/agent/timeline/${encodeURIComponent(camera)}/matches?${qs}`;
-      fetch(url, { credentials: "include", signal: ac.signal })
+      // apiFetch dispatches the session-expired event on 401 so the
+      // SessionExpiredBanner picks it up — keeps this hook's local
+      // error string for the inline footer.
+      apiFetch(url, { signal: ac.signal })
         .then(async (r) => {
           const ct = r.headers.get("content-type") ?? "";
           if (!ct.includes("application/json")) {

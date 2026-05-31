@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { useHlsPlayer } from "./useHlsPlayer";
 import { installFetchMock, type FetchMock } from "../../test/fetch-mock";
+import { SESSION_EXPIRED_EVENT } from "@/lib/apiFetch";
 
 // Minimal fake mirroring the hls.js API surface we actually touch.
 class FakeHls {
@@ -176,6 +177,40 @@ describe("useHlsPlayer", () => {
       v.dispatchEvent(new Event("loadedmetadata"));
     });
     expect(result.current.status).toBe("paused");
+  });
+
+  // Regression: when the admin session silently expired, the master.m3u8
+  // probe returned 401 and the player surfaced an opaque "401:
+  // {\"error\":\"unauthenticated\"}" string. That looked like a generic
+  // playback fault and hid the actual recoverable root cause.
+  //
+  // Contract: 401 → error="session_expired" AND the global
+  // SESSION_EXPIRED_EVENT must fire so a banner can prompt re-login.
+  it("surfaces a 401 manifest as error=session_expired and dispatches the global event", async () => {
+    mock.on("GET", /master\.m3u8/, () =>
+      new Response('{"error":"unauthenticated"}', {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const evtSpy = vi.fn();
+    window.addEventListener(SESSION_EXPIRED_EVENT, evtSpy);
+    try {
+      const { result, rerender } = renderHook(
+        ({ src }: { src: string | null }) =>
+          useHlsPlayer({ src, windowStartMs: 0 }),
+        { initialProps: { src: null as string | null } },
+      );
+      attachVideo(result);
+      rerender({ src: "/x/master.m3u8" });
+      await waitFor(() => {
+        expect(result.current.status).toBe("error");
+        expect(result.current.error).toBe("session_expired");
+      });
+      expect(evtSpy).toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(SESSION_EXPIRED_EVENT, evtSpy);
+    }
   });
 
   it("loadedmetadata does not overwrite a 'playing' status", async () => {

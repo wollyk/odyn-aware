@@ -418,10 +418,16 @@ export function VideoTile({
   const showCenterOverlay = isPast
     ? past.status === "loading" || past.status === "error"
     : mode === "live" && live.status !== "playing";
+  // Session-expired is a SPECIAL playback error: it's recoverable with
+  // a single re-login, and we want to surface a clear CTA rather than
+  // the cryptic "session_expired" token.
+  const isPastSessionExpired = isPast && past.error === "session_expired";
   const overlayText = isPast
-    ? past.status === "error"
-      ? `Playback error${past.error ? `: ${past.error}` : ""}`
-      : "Loading recording…"
+    ? isPastSessionExpired
+      ? "Session expired — sign in to resume playback"
+      : past.status === "error"
+        ? `Playback error${past.error ? `: ${past.error}` : ""}`
+        : "Loading recording…"
     : live.status === "error"
       ? `Stream error${live.error ? `: ${live.error}` : ""}`
       : "Connecting…";
@@ -487,14 +493,25 @@ export function VideoTile({
           <div className="absolute inset-0 flex items-center justify-center">
             <div
               className={`max-w-[80%] px-4 py-3 font-mono text-xs tracking-widest ${
-                (isPast && past.status === "error") ||
-                (!isPast && live.status === "error")
-                  ? "bg-red-950/85 text-red-200 border border-red-500/60"
-                  : "bg-black/70 text-foreground/85"
+                isPastSessionExpired
+                  ? "bg-amber-950/90 text-amber-100 border border-amber-400/60"
+                  : (isPast && past.status === "error") ||
+                      (!isPast && live.status === "error")
+                    ? "bg-red-950/85 text-red-200 border border-red-500/60"
+                    : "bg-black/70 text-foreground/85"
               }`}
             >
               <div className="text-center uppercase">{overlayText}</div>
-              {isPast && past.status === "error" && diagnoseHref && (
+              {isPastSessionExpired && (
+                <a
+                  href="/admin/login"
+                  className="mt-2 block text-center text-[10px] underline-offset-2 hover:underline text-amber-100"
+                  data-testid="session-expired-signin"
+                >
+                  Sign in →
+                </a>
+              )}
+              {isPast && past.status === "error" && !isPastSessionExpired && diagnoseHref && (
                 <a
                   href={diagnoseHref}
                   target="_blank"

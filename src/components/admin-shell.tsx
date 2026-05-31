@@ -15,6 +15,7 @@
 
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
+import { SessionExpiredBanner } from "@/components/session-expired-banner";
 
 export type AdminUser = { email: string; role: string };
 export type AdminAuthState = "loading" | "ok" | "denied";
@@ -139,6 +140,9 @@ export function AdminHeader({
   maxWidthClass?: string;
 }) {
   return (
+    <>
+      {/* Sits above the header chrome so the operator can't miss it. */}
+      <SessionExpiredBanner />
     <header className="border-b border-border/60 bg-background/70 backdrop-blur-md">
       <div className={`mx-auto flex h-14 ${maxWidthClass} items-center justify-between px-6`}>
         <div className="flex items-center gap-3">
@@ -180,5 +184,6 @@ export function AdminHeader({
         </div>
       </div>
     </header>
+    </>
   );
 }

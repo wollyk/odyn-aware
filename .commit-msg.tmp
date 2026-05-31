@@ -1,0 +1,16 @@
+Detect expired admin sessions and prompt re-login
+
+When the av_session cookie outlives the server-side session row, every
+HTTP admin endpoint returns 401 while WebSocket panels keep running off
+their pre-existing upgrade-time auth. The UI used to show this as
+cryptic 'unauthenticated' / 'no playback stream' strings.
+
+apiFetch now dispatches a global auroraview:session-expired event on
+any 401 (with 1s burst-coalesce). A new SessionExpiredBanner mounted
+in the admin shell catches the event and surfaces a clear amber banner
+plus a 'Sign in' CTA. useHlsPlayer detects a 401 manifest probe
+directly and exposes error=session_expired, so the past-playback
+overlay shows a Sign-in link instead of a 401 dump.
+
+Routed through apiFetch: useTimelineMatches, useTimelineSegments,
+useDetections. All 76 client tests pass.

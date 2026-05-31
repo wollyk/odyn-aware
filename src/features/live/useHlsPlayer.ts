@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type Hls from "hls.js";
+import { SESSION_EXPIRED_EVENT } from "@/lib/apiFetch";
 
 export type HlsPlayerStatus =
   | "idle"
@@ -157,6 +158,19 @@ export function useHlsPlayer(args: Args): UseHlsPlayerResult {
       .then(async (r) => {
         if (cancelled) return { ok: false as const, reason: "cancelled" };
         if (!r.ok) {
+          // 401: the admin session has expired. Surface a clean,
+          // operator-facing message AND notify the rest of the app via
+          // the same global event apiFetch uses, so the
+          // SessionExpiredBanner shows up.
+          if (r.status === 401) {
+            if (typeof window !== "undefined") {
+              window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+            }
+            return {
+              ok: false as const,
+              reason: "session_expired",
+            };
+          }
           // Try to parse a JSON error body for detail; fall back to status.
           let detail: string = `${r.status}`;
           try {
